@@ -2,7 +2,7 @@ import pytest
 import numpy as np
 import pandas as pd
 
-from dtgfn.binning import BinConfig, Binner
+from src.binning import BinConfig, Binner
 
 
 @pytest.fixture
