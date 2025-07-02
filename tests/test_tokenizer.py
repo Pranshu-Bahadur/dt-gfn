@@ -77,7 +77,7 @@ def test_decode_one(tok):
     assert typ_l == "leaf" and idx_l == 1
 
 
-@ pytest.mark.parametrize("bad_tid", [-1, 0, 1, 2, len(SimpleTokenizer(**test_params))])
+@ pytest.mark.parametrize("bad_tid", [-1, 0, 1, 2, len(Tokenizer(**test_params))])
 def test_decode_one_invalid(tok, bad_tid):
     with pytest.raises(ValueError):
         tok.decode_one(bad_tid)
