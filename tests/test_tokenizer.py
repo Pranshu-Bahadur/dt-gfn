@@ -1,98 +1,92 @@
 import pytest
 
-from src.tokenizer import Vocab, Tokenizer, TokenType
+from src.tokenizer import Tokenizer
 
-
-test_vocab_params = {
-    "num_features": 4,
-    "num_thresholds": 6,
-    "num_leaves": 3,
+test_params = {
+    "num_features": 5,
+    "num_bins": 7,
+    "num_leaves": 2,
 }
 
+
 @ pytest.fixture
-def vocab_and_tok():
-    v = Vocab(**test_vocab_params)
-    tok = Tokenizer(vocab=v)
-    return v, tok
+def tok():
+    return Tokenizer(**test_params)
 
 
-def test_vocab_size_and_len(vocab_and_tok):
-    v, _ = vocab_and_tok
-    expected = (v.EOS + 1) + v.num_features + v.num_thresholds + v.num_leaves
-    assert v.size() == expected
-    assert len(v) == expected
+def test_vocab_size(tok):
+    # Specials: <pad>,<bos>,<eos>
+    expected = 3 + test_params["num_features"] + test_params["num_bins"] + test_params["num_leaves"]
+    assert len(tok) == expected
 
 
-def test_encode_ids(vocab_and_tok):
-    v, tok = vocab_and_tok
-    # Feature tokens
-    for i in range(v.num_features):
+def test_encode_feature_valid(tok):
+    for i in range(test_params["num_features"]):
         tid = tok.encode_feature(i)
-        assert tid == v.split_start + i
-    # Threshold tokens
-    for i in range(v.num_thresholds):
-        tid = tok.encode_threshold(i)
-        assert tid == v.split_start + v.num_features + i
-    # Leaf tokens
-    for i in range(v.num_leaves):
-        tid = tok.encode_leaf(i)
-        assert tid == v.split_start + v.num_features + v.num_thresholds + i
+        assert isinstance(tid, int)
+        assert tok.id2tok[tid] == f"F_{i}"
 
 
-def test_decode_one_and_decode(vocab_and_tok):
-    v, tok = vocab_and_tok
-    # Build a mixed list: [PAD, BOS, EOS, some tokens]
-    tokens = [v.PAD, v.BOS, v.EOS]
-    # Pick one of each category
-    f_idx = 1
-    t_idx = 2
-    l_idx = 0
-    tokens += [
-        tok.encode_feature(f_idx),
-        tok.encode_threshold(t_idx),
-        tok.encode_leaf(l_idx)
-    ]
-    # Test decode_one on non-special IDs
-    t1 = tok.decode_one(tok.encode_feature(f_idx))
-    assert t1 == (TokenType.FEATURE, f_idx)
-    t2 = tok.decode_one(tok.encode_threshold(t_idx))
-    assert t2 == (TokenType.THRESHOLD, t_idx)
-    t3 = tok.decode_one(tok.encode_leaf(l_idx))
-    assert t3 == (TokenType.LEAF, l_idx)
-    # Test decode skips special tokens and yields correct sequence
-    decoded = tok.decode(tokens)
-    assert decoded == [
-        (TokenType.FEATURE, f_idx),
-        (TokenType.THRESHOLD, t_idx),
-        (TokenType.LEAF, l_idx)
-    ]
-
-
-def test_invalid_decode_one_raises(vocab_and_tok):
-    v, tok = vocab_and_tok
-    # Below split_start
-    with pytest.raises(ValueError):
-        tok.decode_one(v.PAD)
-    # Above valid range
-    with pytest.raises(ValueError):
-        tok.decode_one(v.size())
-
-
-def test_invalid_encode_range_raises(vocab_and_tok):
-    v, tok = vocab_and_tok
-    # Feature index out of range
+def test_encode_feature_invalid(tok):
     with pytest.raises(IndexError):
         tok.encode_feature(-1)
     with pytest.raises(IndexError):
-        tok.encode_feature(v.num_features)
-    # Threshold index out of range
+        tok.encode_feature(test_params["num_features"])
+
+
+def test_encode_threshold_valid(tok):
+    for j in range(test_params["num_bins"]):
+        tid = tok.encode_threshold(j)
+        assert tok.id2tok[tid] == f"TH_{j}"
+
+
+def test_encode_threshold_invalid(tok):
     with pytest.raises(IndexError):
         tok.encode_threshold(-1)
     with pytest.raises(IndexError):
-        tok.encode_threshold(v.num_thresholds)
-    # Leaf index out of range
+        tok.encode_threshold(test_params["num_bins"])
+
+
+def test_encode_leaf_valid(tok):
+    # Two leaves: LEAF_0, LEAF_1
+    tid0 = tok.encode_leaf(0)
+    tid1 = tok.encode_leaf(1)
+    assert tok.id2tok[tid0].startswith("LEAF")
+    assert tok.id2tok[tid1].startswith("LEAF")
+
+
+def test_encode_leaf_invalid(tok):
     with pytest.raises(IndexError):
         tok.encode_leaf(-1)
     with pytest.raises(IndexError):
-        tok.encode_leaf(v.num_leaves)
+        tok.encode_leaf(test_params["num_leaves"])
 
+
+def test_decode_one(tok):
+    # Feature
+    tid_f = tok.encode_feature(2)
+    typ_f, idx_f = tok.decode_one(tid_f)
+    assert typ_f == "feature" and idx_f == 2
+    # Threshold
+    tid_t = tok.encode_threshold(3)
+    typ_t, idx_t = tok.decode_one(tid_t)
+    assert typ_t == "threshold" and idx_t == 3
+    # Leaf
+    tid_l = tok.encode_leaf(1)
+    typ_l, idx_l = tok.decode_one(tid_l)
+    assert typ_l == "leaf" and idx_l == 1
+
+
+@ pytest.mark.parametrize("bad_tid", [-1, 0, 1, 2, len(SimpleTokenizer(**test_params))])
+def test_decode_one_invalid(tok, bad_tid):
+    with pytest.raises(ValueError):
+        tok.decode_one(bad_tid)
+
+
+def test_decode_sequence(tok):
+    # Construct sequence: pad, bos, feature, threshold, leaf, eos
+    seq = [tok.PAD, tok.BOS,
+           tok.encode_feature(1), tok.encode_threshold(5), tok.encode_leaf(0),
+           tok.EOS]
+    decoded = tok.decode(seq)
+    assert decoded == [("feature",1),("threshold",5),("leaf",0)]
