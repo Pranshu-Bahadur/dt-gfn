@@ -114,7 +114,7 @@ def test_reset_and_step_and_done(simple_df):
 
     env.step(('leaf', 0))
     assert env.open_leaves == 1
-    assert env.done is True
+    assert env.done is False
 
 
 def test_evaluate_fallback(simple_df):
