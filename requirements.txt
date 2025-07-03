@@ -2,3 +2,5 @@ pytest
 numpy
 pandas
 torch==2.7.0
+scikit-learn
+tqdm
