@@ -247,7 +247,7 @@ def dE_split_gain(
         elif kind == "leaf":
             if row_stack:
                 row_stack.pop(); mse_stack.pop()
-
+    dE = torch.cat([torch.zeros(1, device=dE.device), dE])
     # shape (1, L-1) to match log_pf[:, :-1]
     return dE.unsqueeze(0)
 

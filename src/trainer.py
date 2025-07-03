@@ -197,7 +197,7 @@ class Trainer:
                 bwd = torch.flip(fwd, dims=[1])
                 log_pb = pb.log_prob(bwd)
 
-                dE = dE_split_gain(fwd_tokens, self.tokenizer, env)  # gain term can be added later
+                dE = dE_split_gain(fwd, self.tokenizer, env)  # gain term can be added later
 
                 l_tb = tb_loss(log_pf, log_pb, log_z, R.unsqueeze(0), prior)
                 l_fl = fl_loss(logF, log_pf, log_pb, dE)
