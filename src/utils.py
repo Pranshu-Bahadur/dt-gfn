@@ -3,6 +3,9 @@ import random
 
 import torch
 
+from typing import Callable, List, Optional
+import torch
+
 
 def sequence_to_predictor(
     traj: List[int],
@@ -11,106 +14,82 @@ def sequence_to_predictor(
     tokenizer,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """
-    Decode a token-ID trajectory into a tree predictor function.
+    Decode a token-ID trajectory into a callable predictor.
 
-    Args:
-        traj: Sequence of token IDs including BOS/EOS.
-        X_binned: Tensor of shape (N, F) with binned features.
-        y_target: Tensor of shape (N,) with true targets, or None for inference.
-        tokenizer: SimpleTokenizer with decode() method.
-
-    Returns:
-        A function f(X_new) -> Tensor of shape (X_new.size(0),)
+    • If `y_target` is given (training-time) each leaf = mean(y_target[rows]).
+    • At inference (`y_target is None`) unused / empty leaves get `default_val`
+      (the global mean seen at training time, passed in earlier).
     """
-    # Decode trajectory into (kind, idx) pairs, skipping special tokens.
-    actions = tokenizer.decode(traj)
+
+    # ------------------------------------------------------------------ #
+    # 1.  Parse trajectory -> tree dict
+    # ------------------------------------------------------------------ #
+    actions = tokenizer.decode(traj)           # skip PAD/BOS/EOS
     it = iter(actions)
 
-    # Recursive tree builder
-    def build_node():
+    def build():
         try:
             kind, idx = next(it)
         except StopIteration:
             return None
         if kind == "feature":
-            # Next action must be threshold
-            _, th = next(it)
-            left = build_node()
-            right = build_node()
-            return {"type": "split", "f": idx, "t": th, "L": left, "R": right}
-        # Leaf node
-        return {"type": "leaf", "value": None}
+            _, th = next(it)                   # consume TH_*
+            return dict(type="split", f=idx, t=th, L=build(), R=build())
+        return dict(type="leaf", value=None)
 
-    tree = build_node()
-    if tree is None:
-        # Return zero predictor
+    tree = build()
+    if tree is None:      # degenerate → constant zero predictor
         return lambda X: torch.zeros(X.size(0), dtype=torch.float32, device=X.device)
 
-    # Assign leaf values based on y_target
+    # ------------------------------------------------------------------ #
+    # 2.  Assign leaf values  (single DFS)
+    # ------------------------------------------------------------------ #
     N = X_binned.size(0)
     default_val = 0.0 if y_target is None else float(y_target.mean().item())
 
     stack = [(tree, torch.arange(N, device=X_binned.device))]
     while stack:
-        node, idxs = stack.pop()
-        if not idxs.numel() or node is None:
+        node, rows = stack.pop()
+        if node is None or rows.numel() == 0:
+            # Nothing reached this branch → set default later
+            if node and node["type"] == "leaf":
+                node["value"] = default_val
             continue
+
         if node["type"] == "split":
             f, t = node["f"], node["t"]
-            mask = X_binned[idxs, f] <= t
-            left_idxs = idxs[mask]
-            right_idxs = idxs[~mask]
-            if node.get("L"):
-                stack.append((node["L"], left_idxs))
-            if node.get("R"):
-                stack.append((node["R"], right_idxs))
-        else:
-            # Leaf: set value
-            if y_target is not None and idxs.numel() > 0:
-                node["value"] = float(y_target[idxs].mean().item())
-
-    # --- FIX STARTS HERE ---
-
-    # 1. Fill any unassigned leaf values with the default to prevent errors
-    def fill_missing_leaves(node):
-        if node is None:
-            return
-        if node["type"] == "leaf":
-            if node["value"] is None:
+            mask = X_binned[rows, f] <= t
+            stack.append((node["L"], rows[mask]))
+            stack.append((node["R"], rows[~mask]))
+        else:                              # leaf
+            if y_target is not None:
+                node["value"] = float(y_target[rows].mean().item())
+            else:
                 node["value"] = default_val
-        elif node["type"] == "split":
-            fill_missing_leaves(node.get("L"))
-            fill_missing_leaves(node.get("R"))
 
-    fill_missing_leaves(tree)
-
-    # Predictor function for new X
+    # ------------------------------------------------------------------ #
+    # 3.  Predictor closure
+    # ------------------------------------------------------------------ #
     def predict(X_new: torch.Tensor) -> torch.Tensor:
         M = X_new.size(0)
-        # 2. Initialize output tensor with a default value instead of garbage
         out = torch.full((M,), default_val, dtype=torch.float32, device=X_new.device)
-        
+
         stack2 = [(tree, torch.arange(M, device=X_new.device))]
         while stack2:
-            node, idxs = stack2.pop()
-            if not idxs.numel() or node is None:
+            node, rows = stack2.pop()
+            if node is None or rows.numel() == 0:
                 continue
             if node["type"] == "leaf":
-                out[idxs] = node["value"]
+                out[rows] = node["value"]
             else:
                 f, t = node["f"], node["t"]
-                mask = X_new[idxs, f] <= t
-                left_idxs = idxs[mask]
-                right_idxs = idxs[~mask]
-                if node.get("L"):
-                    stack2.append((node["L"], left_idxs))
-                if node.get("R"):
-                    stack2.append((node["R"], right_idxs))
+                mask = X_new[rows, f] <= t
+                stack2.append((node["L"], rows[mask]))
+                stack2.append((node["R"], rows[~mask]))
         return out
 
-    # --- FIX ENDS HERE ---
-
     return predict
+
 
 
 class ReplayBuffer:
