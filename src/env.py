@@ -96,18 +96,34 @@ class TabularEnv:
 
     def step(self, action: Tuple[str, int]) -> None:
         """
-        Take a split or leaf action (kind, index).
+        Advance the environment by one token action.
+
+        Args
+        ----
+        action : Tuple[str, int]
+            • ("feature", f_idx)   –– emit a feature token F_f  
+            • ("threshold", bin)   –– emit its threshold token TH_b  
+            • ("leaf", 0)          –– emit a leaf marker
+
+        Book-keeping (`open_leaves`):
+            • A fresh rollout starts with 1 open leaf.
+            • Emitting a THRESHOLD splits that leaf into two  →  +1.
+            • Emitting a LEAF closes the current leaf        →  −1.
+            • FEATURE tokens do **not** change the count; the split
+              happens only when its THRESHOLD arrives.
         """
         kind, _ = action
         self.paths.append(action)
 
-        if kind == "feature":
-            self.open_leaves += 1
-        else:
-            self.open_leaves -= 1
+        if kind == "threshold":
+            self.open_leaves += 1          # one leaf became two
+        elif kind == "leaf":
+            self.open_leaves -= 1          # closed a leaf
 
+        # rollout terminates when all leaves are closed
         if self.open_leaves == 0 or len(self.paths) > 8192:
             self.done = True
+ 
 
     def evaluate(
         self, current_beta: float
