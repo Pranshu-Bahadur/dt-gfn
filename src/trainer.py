@@ -218,7 +218,11 @@ class Trainer:
             if buf.data:
                 best = buf.data[: c.top_k_trees]
                 top_seqs = [t[1] for t in best]
-                self.ensemble.append(top_seqs)
+                predictors = [
+                    sequence_to_predictor(s, env.X_full, residuals, self.tokenizer)
+                    for s in top_seqs
+                ]
+                self.ensemble.append(predictors)
 
                 step_pred = torch.zeros_like(base_pred)
                 for s in top_seqs:
@@ -245,20 +249,26 @@ class Trainer:
         if self.tokenizer is None:
             raise RuntimeError("Call fit() first.")
 
-        # Bin or cast features
+        # ---- Get device from config ----
+        device = self.cfg.device
+
+        # ---- Bin features and move to the correct device ----
         if self.binner is None:
             X_arr = df[self.cfg.feature_cols].values.astype("int8")
         else:
             X_arr = self.binner.transform(df[self.cfg.feature_cols]).values.astype("int8")
-        X = torch.tensor(X_arr, dtype=torch.int8)
+        X = torch.tensor(X_arr, dtype=torch.int8, device=device)
 
-        preds = torch.full((len(df),), self.y_mean, dtype=torch.float32)
-        for seqs in self.ensemble:
+        # ---- Perform prediction on the correct device ----
+        preds = torch.full((len(df),), self.y_mean, dtype=torch.float32, device=device)
+        for pred_fns in self.ensemble:
             step = torch.zeros_like(preds)
-            for s in seqs:
-                step += sequence_to_predictor(s, X, None, self.tokenizer)(X)
-            preds += self.cfg.boosting_lr * step / max(1, len(seqs))
-        return preds.numpy()
+            for fn in pred_fns:
+                step += fn(X)                     # Now fn and X are on the same device
+            preds += self.cfg.boosting_lr * step / max(1, len(pred_fns))
+
+        # ---- Move final predictions to CPU for numpy conversion ----
+        return preds.cpu().numpy()
 
     # ------------------------------------------------------------------ #
     # sklearn helpers

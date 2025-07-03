@@ -68,13 +68,28 @@ def sequence_to_predictor(
             # Leaf: set value
             if y_target is not None and idxs.numel() > 0:
                 node["value"] = float(y_target[idxs].mean().item())
-            else:
+
+    # --- FIX STARTS HERE ---
+
+    # 1. Fill any unassigned leaf values with the default to prevent errors
+    def fill_missing_leaves(node):
+        if node is None:
+            return
+        if node["type"] == "leaf":
+            if node["value"] is None:
                 node["value"] = default_val
+        elif node["type"] == "split":
+            fill_missing_leaves(node.get("L"))
+            fill_missing_leaves(node.get("R"))
+
+    fill_missing_leaves(tree)
 
     # Predictor function for new X
     def predict(X_new: torch.Tensor) -> torch.Tensor:
         M = X_new.size(0)
-        out = torch.empty(M, dtype=torch.float32, device=X_new.device)
+        # 2. Initialize output tensor with a default value instead of garbage
+        out = torch.full((M,), default_val, dtype=torch.float32, device=X_new.device)
+        
         stack2 = [(tree, torch.arange(M, device=X_new.device))]
         while stack2:
             node, idxs = stack2.pop()
@@ -92,6 +107,8 @@ def sequence_to_predictor(
                 if node.get("R"):
                     stack2.append((node["R"], right_idxs))
         return out
+
+    # --- FIX ENDS HERE ---
 
     return predict
 
@@ -167,4 +184,5 @@ def _safe_sample(
     # softmax & sample
     probs = torch.softmax(masked, dim=-1)
     return torch.multinomial(probs, 1).item()
+
 
