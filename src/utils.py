@@ -3,8 +3,6 @@ import random
 
 import torch
 
-from typing import Callable, List, Optional
-import torch
 
 
 def sequence_to_predictor(
@@ -14,17 +12,17 @@ def sequence_to_predictor(
     tokenizer,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """
-    Decode a token-ID trajectory into a callable predictor.
+    Turn a token-ID trajectory into a callable predictor.
 
-    • If `y_target` is given (training-time) each leaf = mean(y_target[rows]).
-    • At inference (`y_target is None`) unused / empty leaves get `default_val`
-      (the global mean seen at training time, passed in earlier).
+    • If `y_target` is provided (training-time) each leaf = mean(y_target[rows]).
+    • If `y_target` is None (inference) or a branch receives zero rows,
+      the leaf takes `default_val` (global mean if available, else 0.0).
     """
 
     # ------------------------------------------------------------------ #
-    # 1.  Parse trajectory -> tree dict
+    # 1. Decode token sequence → tree dictionary
     # ------------------------------------------------------------------ #
-    actions = tokenizer.decode(traj)           # skip PAD/BOS/EOS
+    actions = tokenizer.decode(traj)          # skip PAD/BOS/EOS
     it = iter(actions)
 
     def build():
@@ -33,27 +31,27 @@ def sequence_to_predictor(
         except StopIteration:
             return None
         if kind == "feature":
-            _, th = next(it)                   # consume TH_*
+            # next token must be TH_*
+            _, th = next(it)
             return dict(type="split", f=idx, t=th, L=build(), R=build())
         return dict(type="leaf", value=None)
 
     tree = build()
-    if tree is None:      # degenerate → constant zero predictor
+    if tree is None:
         return lambda X: torch.zeros(X.size(0), dtype=torch.float32, device=X.device)
 
     # ------------------------------------------------------------------ #
-    # 2.  Assign leaf values  (single DFS)
+    # 2. Assign numeric values to every leaf
     # ------------------------------------------------------------------ #
     N = X_binned.size(0)
-    default_val = 0.0 if y_target is None else float(y_target.mean().item())
+    default_val: float = (
+        0.0 if y_target is None else float(y_target.mean().item())
+    )
 
     stack = [(tree, torch.arange(N, device=X_binned.device))]
     while stack:
         node, rows = stack.pop()
-        if node is None or rows.numel() == 0:
-            # Nothing reached this branch → set default later
-            if node and node["type"] == "leaf":
-                node["value"] = default_val
+        if node is None:
             continue
 
         if node["type"] == "split":
@@ -61,14 +59,14 @@ def sequence_to_predictor(
             mask = X_binned[rows, f] <= t
             stack.append((node["L"], rows[mask]))
             stack.append((node["R"], rows[~mask]))
-        else:                              # leaf
-            if y_target is not None:
+        else:  # leaf
+            if y_target is not None and rows.numel() > 0:
                 node["value"] = float(y_target[rows].mean().item())
             else:
                 node["value"] = default_val
 
     # ------------------------------------------------------------------ #
-    # 3.  Predictor closure
+    # 3. Predictor closure (works on CPU or CUDA tensors)
     # ------------------------------------------------------------------ #
     def predict(X_new: torch.Tensor) -> torch.Tensor:
         M = X_new.size(0)
@@ -79,16 +77,21 @@ def sequence_to_predictor(
             node, rows = stack2.pop()
             if node is None or rows.numel() == 0:
                 continue
+
             if node["type"] == "leaf":
-                out[rows] = node["value"]
+                # final guard: if value somehow still None, use default_val
+                value = default_val if node["value"] is None else node["value"]
+                out[rows] = value
             else:
                 f, t = node["f"], node["t"]
                 mask = X_new[rows, f] <= t
                 stack2.append((node["L"], rows[mask]))
                 stack2.append((node["R"], rows[~mask]))
+
         return out
 
     return predict
+
 
 
 
