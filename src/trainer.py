@@ -185,7 +185,7 @@ class Trainer:
 
                 # Reward & prior
                 R, prior, _, _ = env.evaluate(current_beta=0.1)
-                R = torch.tensor(R)
+                R = torch.tensor([R], device=device)
                 completed += 1
 
                 # --- losses ---
@@ -196,7 +196,7 @@ class Trainer:
                 bwd = torch.flip(fwd, dims=[1])
                 log_pb = pb.log_prob(bwd)
 
-                dE = torch.zeros_like(log_pf)  # gain term can be added later
+                dE = torch.zeros_like(log_pf, device=device)  # gain term can be added later
 
                 l_tb = tb_loss(log_pf, log_pb, log_z, R.unsqueeze(0), prior)
                 l_fl = fl_loss(logF, log_pf, log_pb, dE)
@@ -270,4 +270,5 @@ class Trainer:
         for k, v in params.items():
             setattr(self.cfg, k, v)
         return self
+
 
