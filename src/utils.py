@@ -168,3 +168,86 @@ def _safe_sample(
     return torch.multinomial(probs, 1).item()
 
 
+import torch
+from typing import Tuple
+
+
+@torch.no_grad()
+def dE_split_gain(
+    token_ids: torch.Tensor,          # shape (1, L) int64
+    tokenizer,                        # our Simple Tokenizer
+    env,                              # TabularEnv (must have .X_full, .y, .idxs)
+) -> torch.Tensor:
+    """
+    Compute ΔE (negative split gain) for every TRANSITION in the trajectory.
+    Returned tensor has shape (1, L-1) so you can align it with
+    log_pf[:, :-1] when computing FL loss.
+
+    • Only positions *immediately after* a THRESHOLD token get non-zero ΔE.
+      All other positions are zero.
+    • Gain =  MSE(parent) – [ w_L * MSE(L) + w_R * MSE(R) ]
+    • We negate the gain so *reducing* MSE → negative energy difference.
+    """
+    assert token_ids.dim() == 2 and token_ids.size(0) == 1, "Expect (1, L)"
+    seq = token_ids[0].tolist()[1:-1]  # strip BOS/EOS
+    decoded = tokenizer.decode(seq)
+
+    y = env.y[env.idxs]                # (B,)
+    X = env.X_full[env.idxs]           # (B, F)
+    n = y.numel()
+
+    # parent statistics
+    y2 = y * y
+    full_mse = (y2.mean() - y.mean().pow(2)).item()
+
+    # stacks emulate recursive traversal
+    row_stack   = [torch.arange(n, device=y.device)]
+    mse_stack   = [full_mse]
+    dE          = torch.zeros(len(seq), device=y.device)   # per token
+
+    it = iter(decoded)
+    t_idx = -1  # running position in seq
+    while True:
+        try:
+            kind, idx = next(it)
+            t_idx += 1
+        except StopIteration:
+            break
+
+        if kind == "feature":
+            # consume threshold
+            th_kind, th_idx = next(it); t_idx += 1
+            assert th_kind == "threshold", "Feature must be followed by TH"
+
+            parent_rows = row_stack.pop()
+            parent_mse  = mse_stack.pop()
+
+            # partition rows
+            mask = X[parent_rows, idx] <= th_idx
+            L_rows = parent_rows[mask]
+            R_rows = parent_rows[~mask]
+
+            def mse(rows):
+                if rows.numel() < 2:
+                    return 0.0
+                yy = y[rows]
+                return ( (yy * yy).mean() - yy.mean().pow(2) ).item()
+
+            mse_L, mse_R = mse(L_rows), mse(R_rows)
+            row_stack.extend([R_rows, L_rows])
+            mse_stack.extend([mse_R, mse_L])
+
+            wL, wR = L_rows.numel(), R_rows.numel()
+            parent_N = wL + wR
+            if parent_N > 0:
+                gain = parent_mse - (wL / parent_N * mse_L + wR / parent_N * mse_R)
+                # dE aligns with the THRESHOLD position (t_idx)
+                dE[t_idx] = -gain   # negative gain = energy drop
+
+        elif kind == "leaf":
+            if row_stack:
+                row_stack.pop(); mse_stack.pop()
+
+    # shape (1, L-1) to match log_pf[:, :-1]
+    return dE.unsqueeze(0)
+

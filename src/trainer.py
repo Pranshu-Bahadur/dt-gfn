@@ -19,6 +19,7 @@ from src.utils import (
     fl_loss,
     _safe_sample,
     sequence_to_predictor,
+    dE_split_gain
 )
 
 
@@ -196,7 +197,7 @@ class Trainer:
                 bwd = torch.flip(fwd, dims=[1])
                 log_pb = pb.log_prob(bwd)
 
-                dE = torch.zeros_like(log_pf, device=device)  # gain term can be added later
+                dE = dE_split_gain(fwd_tokens, self.tokenizer, env)  # gain term can be added later
 
                 l_tb = tb_loss(log_pf, log_pb, log_z, R.unsqueeze(0), prior)
                 l_fl = fl_loss(logF, log_pf, log_pb, dE)
