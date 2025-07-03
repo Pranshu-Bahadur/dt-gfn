@@ -22,9 +22,9 @@ from src.utils import (
 )
 
 
-# -----------------------------------------------------------------------------#
-# 1.  Hyper-parameter bundle
-# -----------------------------------------------------------------------------#
+# --------------------------------------------------------------------------- #
+# 1.  Hyper-parameters
+# --------------------------------------------------------------------------- #
 @dataclass
 class Config:
     feature_cols: List[str]
@@ -41,66 +41,64 @@ class Config:
     top_k_trees: int = 10
     boosting_lr: float = 0.1
 
-    # Policy network
+    # Policy net
     lstm_hidden: int = 512
     mlp_layers: int = 8
     mlp_width: int = 256
     lr: float = 5e-5
 
 
-# -----------------------------------------------------------------------------#
-# 2.  Trainer  (scikit-learn style: fit + predict)
-# -----------------------------------------------------------------------------#
+# --------------------------------------------------------------------------- #
+# 2.  Trainer (fit + predict)
+# --------------------------------------------------------------------------- #
 class Trainer:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-
-        # Populated in fit()
         self.tokenizer: Optional[Tokenizer] = None
         self.binner: Optional[Binner] = None
         self.ensemble: list[list[list[int]]] = []
         self.y_mean: float = 0.0
 
-    # ---------------------------------------------------------------------#
+    # --------------------------------------------------------------------- #
     # fit
-    # ---------------------------------------------------------------------#
+    # --------------------------------------------------------------------- #
     def fit(self, df_train: pd.DataFrame) -> "Trainer":
-        cfg = self.cfg
-        device = cfg.device
+        c = self.cfg
+        device = c.device
 
-        # --- Tokenizer & Binner ------------------------------------------------
+        # ---- Tokenizer & Binner ------------------------------------------
         self.tokenizer = Tokenizer(
-            num_features=len(cfg.feature_cols), num_bins=cfg.n_bins
+            num_features=len(c.feature_cols),
+            num_bins=c.n_bins,
+            num_leaves=2**c.max_depth - 1,
         )
-        bin_cfg = BinConfig(cfg.n_bins, cfg.bin_strategy)
+        bin_cfg = BinConfig(c.n_bins, c.bin_strategy)
         self.binner = Binner(bin_cfg)
 
-        # --- Environment ------------------------------------------------------
+        # ---- Environment --------------------------------------------------
         env = TabularEnv(
             df_train,
-            feature_cols=cfg.feature_cols,
-            target_col=cfg.target_col,
+            feature_cols=c.feature_cols,
+            target_col=c.target_col,
             bin_config=bin_cfg,
             tokenizer=self.tokenizer,
             device=device,
         )
 
-        # --- Policy networks --------------------------------------------------
+        # ---- Policy Nets --------------------------------------------------
         vocab_size = len(self.tokenizer)
-        pf = PolicyPaperMLP(vocab_size, cfg.lstm_hidden, cfg.mlp_layers, cfg.mlp_width).to(device)
-        pb = PolicyPaperMLP(vocab_size, cfg.lstm_hidden, cfg.mlp_layers, cfg.mlp_width).to(device)
-        pf = torch.jit.script(pf)
-        pb = torch.jit.script(pb)
+        pf = PolicyPaperMLP(vocab_size, c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
+        pb = PolicyPaperMLP(vocab_size, c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
+        pf, pb = torch.jit.script(pf), torch.jit.script(pb)
 
         log_z = torch.zeros((), device=device, requires_grad=True)
-
-        opt_pf = torch.optim.AdamW(pf.parameters(), lr=cfg.lr)
-        opt_pb = torch.optim.AdamW(pb.parameters(), lr=cfg.lr)
-        opt_z  = torch.optim.Adam([log_z], lr=cfg.lr / 10)
+        opt_pf = torch.optim.AdamW(pf.parameters(), lr=c.lr)
+        opt_pb = torch.optim.AdamW(pb.parameters(), lr=c.lr)
+        opt_z = torch.optim.Adam([log_z], lr=c.lr / 10)
         optimizers = [opt_pf, opt_pb, opt_z]
 
-        # Cosine schedule with warm-up
-        warm, total = 10, cfg.updates
+        # LR schedulers
+        warm, total = 10, c.updates
         scheds = []
         for opt in optimizers:
             scheds.append(
@@ -114,15 +112,20 @@ class Trainer:
                 )
             )
 
-        # --- Replay buffer & bookkeeping --------------------------------------
+        # ---- Replay buffer & baseline ------------------------------------
         buf = ReplayBuffer(capacity=10_000)
         base_pred = torch.full_like(env.y_full, env.y_full.mean())
         self.y_mean = env.y_full.mean().item()
 
-        # ------------------------------------------------------------------#
-        # Main Boost Loop
-        # ------------------------------------------------------------------#
-        for upd in range(1, cfg.updates + 1):
+        # ---- Pre-compute ID ranges for masks -----------------------------
+        FEAT_START = 3  # pad,bos,eos = 0,1,2
+        TH_START   = FEAT_START + self.tokenizer.num_features
+        LEAF_START = TH_START + self.tokenizer.num_bins
+
+        # ------------------------------------------------------------------ #
+        # Boost loop
+        # ------------------------------------------------------------------ #
+        for upd in range(1, c.updates + 1):
             residuals = env.y_full - base_pred
             env.y = residuals.clone()
 
@@ -130,13 +133,13 @@ class Trainer:
             for opt in optimizers:
                 opt.zero_grad()
 
-            pbar = tqdm(range(cfg.rollouts), desc=f"Upd {upd:02d}", leave=False)
+            pbar = tqdm(range(c.rollouts), desc=f"Upd {upd:02d}", leave=False)
             for _ in pbar:
-                env.reset(cfg.batch_size)
+                env.reset(c.batch_size)
                 seq_ids = [self.tokenizer.BOS]
                 open_depths = [0]
 
-                # ------------ rollout ------------
+                # -------- rollout sampling --------
                 with torch.no_grad():
                     while not env.done and open_depths:
                         x = torch.tensor([seq_ids], device=device)
@@ -145,14 +148,11 @@ class Trainer:
 
                         mask = torch.zeros_like(logits, dtype=torch.bool)
                         cur_depth = open_depths[-1]
-                        if env.open_leaves > 0 and cur_depth < cfg.max_depth:
-                            # allow feature splits
-                            mask[self.tokenizer.split_start:
-                                 self.tokenizer.split_start + self.tokenizer.num_features] = True
+
+                        if env.open_leaves > 0 and cur_depth < c.max_depth:
+                            mask[FEAT_START:TH_START] = True      # features
                         if env.open_leaves > 0:
-                            # allow leaf tokens
-                            mask[self.tokenizer.split_start + self.tokenizer.num_features +
-                                 self.tokenizer.num_bins:] = True
+                            mask[LEAF_START:] = True              # leaves
 
                         if not mask.any():
                             break
@@ -162,13 +162,12 @@ class Trainer:
                         env.step((kind, idx))
                         seq_ids.append(tok_id)
 
-                        # If feature, immediately sample threshold
+                        # if feature → immediately sample threshold
                         if kind == "feature":
                             logits2, _ = pf(torch.tensor([seq_ids], device=device))
                             logits_th = logits2[0, -1]
                             th_mask = torch.zeros_like(logits_th, dtype=torch.bool)
-                            th_mask[self.tokenizer.split_start + self.tokenizer.num_features:
-                                    self.tokenizer.split_start + self.tokenizer.num_features + self.tokenizer.num_bins] = True
+                            th_mask[TH_START:LEAF_START] = True
                             th_id = _safe_sample(logits_th, th_mask, temperature=1.0)
                             env.step(self.tokenizer.decode_one(th_id))
                             seq_ids.append(th_id)
@@ -179,76 +178,66 @@ class Trainer:
                             open_depths.pop()
 
                 seq_ids.append(self.tokenizer.EOS)
-
                 if env.open_leaves != 0:
                     continue  # incomplete tree
 
-                # Evaluate reward & prior
+                # Reward & prior
                 R, prior, _, _ = env.evaluate(current_beta=0.1)
                 completed += 1
 
-                # ----------------- losses -----------------
-                fwd_tokens = torch.tensor([seq_ids], device=device)
-                log_pf = pf.log_prob(fwd_tokens)
-                logF = pf.log_F(fwd_tokens)
+                # --- losses ---
+                fwd = torch.tensor([seq_ids], device=device)
+                log_pf = pf.log_prob(fwd)
+                logF = pf.log_F(fwd)
 
-                bwd_tokens = torch.flip(fwd_tokens, dims=[1])
-                log_pb = pb.log_prob(bwd_tokens)
+                bwd = torch.flip(fwd, dims=[1])
+                log_pb = pb.log_prob(bwd)
 
-                dE = torch.zeros_like(log_pf)  # placeholder (gain term optional)
+                dE = torch.zeros_like(log_pf)  # gain term can be added later
 
                 l_tb = tb_loss(log_pf, log_pb, log_z, R.unsqueeze(0), prior)
                 l_fl = fl_loss(logF, log_pf, log_pb, dE)
-                loss = l_tb + 0.1 * l_fl
-                loss.backward()
-
+                (l_tb + 0.1 * l_fl).backward()
                 tb_acc += l_tb.item()
                 fl_acc += l_fl.item()
 
                 buf.add(R.item(), seq_ids, prior.item(), env.idxs.clone())
 
-            # Gradient update
+            # optimise
             if completed:
                 for opt in optimizers:
-                    torch.nn.utils.clip_grad_norm_(opt.param_groups[0]['params'], 1.0)
+                    torch.nn.utils.clip_grad_norm_(opt.param_groups[0]["params"], 1.0)
                     opt.step()
                 for sch in scheds:
                     sch.step()
 
-            # ---------------- Boosting update ----------------
+            # ---- Boosting update ----
             if buf.data:
-                top_k = buf.data[: cfg.top_k_trees]
-                top_sequences = [t[1] for t in top_k]
-                self.ensemble.append(top_sequences)
+                best = buf.data[: c.top_k_trees]
+                top_seqs = [t[1] for t in best]
+                self.ensemble.append(top_seqs)
 
                 step_pred = torch.zeros_like(base_pred)
-                for s in top_sequences:
-                    pred_fn = sequence_to_predictor(
-                        s,
-                        env.X_full,
-                        residuals,
-                        self.tokenizer,
-                    )
-                    step_pred += pred_fn(env.X_full)
+                for s in top_seqs:
+                    f = sequence_to_predictor(s, env.X_full, residuals, self.tokenizer)
+                    step_pred += f(env.X_full)
+                step_pred /= len(top_seqs)
+                base_pred += c.boosting_lr * step_pred
 
-                step_pred /= len(top_sequences)
-                base_pred += cfg.boosting_lr * step_pred
-
-                corr = torch.corrcoef(torch.stack([base_pred, env.y_full]))[0, 1].item()
+                rho = torch.corrcoef(torch.stack([base_pred, env.y_full]))[0, 1].item()
                 print(
-                    f"Update {upd:02d} | comps {completed}/{cfg.rollouts} "
+                    f"Update {upd:02d} | comps {completed}/{c.rollouts} "
                     f"| TB {tb_acc / max(1, completed):.4f} "
                     f"| FL {fl_acc / max(1, completed):.4f} "
-                    f"| ρ_train {corr:+.3f}"
+                    f"| ρ_train {rho:+.3f}"
                 )
-
                 buf.data.clear()
 
-        return self  # sklearn expects .fit to return self
+        return self  # sklearn expects self
 
-    # ---------------------------------------------------------------------#
+    # ------------------------------------------------------------------ #
     # predict
-    # ---------------------------------------------------------------------#
+    # ------------------------------------------------------------------ #
     def predict(self, df: pd.DataFrame) -> np.ndarray:
         if self.tokenizer is None:
             raise RuntimeError("Call fit() first.")
@@ -257,24 +246,21 @@ class Trainer:
         if self.binner is None:
             X_arr = df[self.cfg.feature_cols].values.astype("int8")
         else:
-            X_df = self.binner.transform(df[self.cfg.feature_cols])
-            X_arr = X_df.values.astype("int8")
+            X_arr = self.binner.transform(df[self.cfg.feature_cols]).values.astype("int8")
         X = torch.tensor(X_arr, dtype=torch.int8)
 
         preds = torch.full((len(df),), self.y_mean, dtype=torch.float32)
-        for seq_list in self.ensemble:
+        for seqs in self.ensemble:
             step = torch.zeros_like(preds)
-            for s in seq_list:
-                f = sequence_to_predictor(s, X, None, self.tokenizer)
-                step += f(X)
-            preds += self.cfg.boosting_lr * step / max(1, len(seq_list))
-
+            for s in seqs:
+                step += sequence_to_predictor(s, X, None, self.tokenizer)(X)
+            preds += self.cfg.boosting_lr * step / max(1, len(seqs))
         return preds.numpy()
 
-    # ---------------------------------------------------------------------#
+    # ------------------------------------------------------------------ #
     # sklearn helpers
-    # ---------------------------------------------------------------------#
-    def get_params(self, deep: bool = True):
+    # ------------------------------------------------------------------ #
+    def get_params(self, deep=True):
         return asdict(self.cfg)
 
     def set_params(self, **params):
