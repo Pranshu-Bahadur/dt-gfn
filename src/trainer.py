@@ -183,6 +183,7 @@ class Trainer:
 
                 # Reward & prior
                 R, prior, _, _ = env.evaluate(current_beta=0.1)
+                R = torch.tensor(R)
                 completed += 1
 
                 # --- losses ---
@@ -195,7 +196,7 @@ class Trainer:
 
                 dE = torch.zeros_like(log_pf)  # gain term can be added later
 
-                l_tb = tb_loss(log_pf, log_pb, log_z, torch.tensor([R]).unsqueeze(0), prior)
+                l_tb = tb_loss(log_pf, log_pb, log_z, R.unsqueeze(0), prior)
                 l_fl = fl_loss(logF, log_pf, log_pb, dE)
                 (l_tb + 0.1 * l_fl).backward()
                 tb_acc += l_tb.item()
