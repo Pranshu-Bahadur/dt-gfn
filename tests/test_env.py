@@ -104,16 +104,16 @@ def test_reset_and_step_and_done(simple_df):
     # step a split
     env.reset(batch_size=2)
     env.step(('feature', 0))
-    assert env.open_leaves == 2
-    assert env.done is False
-
-    # step leaf twice to close all leaves
-    env.step(('leaf', 0))
     assert env.open_leaves == 1
     assert env.done is False
 
+    # step leaf twice to close all leaves
+    env.step(('threshold', 1))
+    assert env.open_leaves == 2
+    assert env.done is False
+
     env.step(('leaf', 0))
-    assert env.open_leaves == 0
+    assert env.open_leaves == 1
     assert env.done is True
 
 
