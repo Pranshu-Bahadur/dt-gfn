@@ -85,6 +85,8 @@ class Trainer:
             device=device,
         )
 
+        self.binner = env.binner
+
         # ---- Policy Nets --------------------------------------------------
         vocab_size = len(self.tokenizer)
         pf = PolicyPaperMLP(vocab_size, c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
