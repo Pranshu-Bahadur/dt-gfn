@@ -4,6 +4,7 @@ import torch
 
 from src.env import TabularEnv
 from src.binning import BinConfig
+from src.tokenizer import Tokenizer
 
 
 @pytest.fixture
@@ -29,7 +30,14 @@ def prebinned_df():
 def test_prebinned_detection(prebinned_df):
     df = prebinned_df
     cfg = BinConfig(n_bins=10)  # bin_config is ignored for prebinned
-    env = TabularEnv(df, feature_cols=['f1','f2'], target_col='label', bin_config=cfg)
+    tok = Tokenizer(num_features=2, num_bins=cfg.n_bins)
+    env = TabularEnv(
+        df,
+        feature_cols=['f1', 'f2'],
+        target_col='label',
+        bin_config=cfg,
+        tokenizer=tok,
+    )
 
     # Binner is skipped
     assert env.binner is None
@@ -37,21 +45,28 @@ def test_prebinned_detection(prebinned_df):
     assert env.num_bins == 4
 
     # X_full matches original and is int8
-    expected = torch.tensor(df[['f1','f2']].values, dtype=torch.int8)
+    expected = torch.tensor(df[['f1', 'f2']].values, dtype=torch.int8)
     assert torch.equal(env.X_full.cpu(), expected)
     assert env.X_full.dtype == torch.int8
 
     # featurise also skips binning
-    df2 = pd.DataFrame({'f1':[2,0],'f2':[1,3],'label':[7.0,7.0]})
+    df2 = pd.DataFrame({'f1': [2, 0], 'f2': [1, 3], 'label': [7.0, 7.0]})
     feat = env.featurise(df2)
-    expected2 = torch.tensor(df2[['f1','f2']].values, dtype=torch.int8)
+    expected2 = torch.tensor(df2[['f1', 'f2']].values, dtype=torch.int8)
     assert torch.equal(feat.cpu(), expected2)
 
 
 def test_non_prebinned_behavior(simple_df):
     df = simple_df
     cfg = BinConfig(n_bins=3, strategy='global_uniform')
-    env = TabularEnv(df, feature_cols=['f1','f2'], target_col='label', bin_config=cfg)
+    tok = Tokenizer(num_features=2, num_bins=cfg.n_bins)
+    env = TabularEnv(
+        df,
+        feature_cols=['f1', 'f2'],
+        target_col='label',
+        bin_config=cfg,
+        tokenizer=tok,
+    )
 
     # Binner should be active
     assert env.binner is not None
@@ -69,7 +84,14 @@ def test_non_prebinned_behavior(simple_df):
 def test_reset_and_step_and_done(simple_df):
     df = simple_df
     cfg = BinConfig(n_bins=3)
-    env = TabularEnv(df, ['f1','f2'], 'label', bin_config=cfg)
+    tok = Tokenizer(num_features=2, num_bins=cfg.n_bins)
+    env = TabularEnv(
+        df,
+        feature_cols=['f1', 'f2'],
+        target_col='label',
+        bin_config=cfg,
+        tokenizer=tok,
+    )
 
     # reset
     env.reset(batch_size=2)
@@ -98,7 +120,14 @@ def test_reset_and_step_and_done(simple_df):
 def test_evaluate_fallback(simple_df):
     df = simple_df
     cfg = BinConfig(n_bins=3)
-    env = TabularEnv(df, ['f1','f2'], 'label', bin_config=cfg)
+    tok = Tokenizer(num_features=2, num_bins=cfg.n_bins)
+    env = TabularEnv(
+        df,
+        feature_cols=['f1', 'f2'],
+        target_col='label',
+        bin_config=cfg,
+        tokenizer=tok,
+    )
 
     # fallback with no paths
     env.reset(batch_size=2)
