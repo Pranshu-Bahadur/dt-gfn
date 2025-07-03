@@ -86,7 +86,7 @@ class Trainer:
         )
 
         # --- Policy networks --------------------------------------------------
-        vocab_size = self.tokenizer.vocab_size
+        vocab_size = len(self.tokenizer)
         pf = PolicyPaperMLP(vocab_size, cfg.lstm_hidden, cfg.mlp_layers, cfg.mlp_width).to(device)
         pb = PolicyPaperMLP(vocab_size, cfg.lstm_hidden, cfg.mlp_layers, cfg.mlp_width).to(device)
         pf = torch.jit.script(pf)
