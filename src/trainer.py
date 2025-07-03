@@ -12,7 +12,7 @@ from tqdm import tqdm
 from src.binning import BinConfig, Binner
 from src.env import TabularEnv
 from src.tokenizer import Tokenizer
-from src.trees.policy import PolicyPaperMLP
+from src.policy import PolicyPaperMLP
 from src.utils import (
     ReplayBuffer,
     tb_loss,
