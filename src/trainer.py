@@ -92,11 +92,11 @@ class Trainer:
         vocab_size = len(self.tokenizer)
         #pf = PolicyPaperMLP(vocab_size, c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
         #pb = PolicyPaperMLP(vocab_size, c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
-        pf = PolicyTransformer(vocab_size=len(tokenizer), d_model=384,
-                       n_layers=4, n_heads=6, d_ff=1536).to(device)
-        pb = PolicyTransformer(vocab_size=len(tokenizer), d_model=384,
-                       n_layers=4, n_heads=6, d_ff=1536).to(device)
-        print(len(tokenizer))
+        pf = PolicyTransformer(vocab_size=len(self.tokenizer), d_model=256,
+                       n_layers=12, n_heads=4, d_ff=512).to(device)
+        pb = PolicyTransformer(vocab_size=len(self.tokenizer), d_model=256,
+                       n_layers=12, n_heads=4, d_ff=512).to(device)
+        print(len(self.tokenizer))
         pf, pb = torch.jit.script(pf), torch.jit.script(pb)
 
         log_z = torch.zeros((), device=device, requires_grad=True)
@@ -202,11 +202,11 @@ class Trainer:
                 bwd = torch.flip(fwd, dims=[1])
                 log_pb = pb.log_prob(bwd)
 
-                dE = dE_split_gain(fwd, self.tokenizer, env)  # gain term can be added later
+                dE = dE_split_gain(fwd, self.tokenizer, env)  # torch.zeros_like(log_pf) gain term can be added later
 
                 l_tb = tb_loss(log_pf, log_pb, log_z, R.unsqueeze(0), prior)
                 l_fl = fl_loss(logF, log_pf, log_pb, dE)
-                (0.5 * l_tb + 0.5 * l_fl).backward()
+                (l_tb + 0.1 * l_fl).backward()
                 tb_acc += l_tb.item()
                 fl_acc += l_fl.item()
 

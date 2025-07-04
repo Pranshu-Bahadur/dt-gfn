@@ -38,16 +38,16 @@ class DTGFNRegressor(BaseEstimator, RegressorMixin):
             df_train["__y__"] = y
             target_col = "__y__"
         else:
-            if "label" not in X.columns:
+            if "target" not in X.columns:
                 raise ValueError(
                     "If `y` is not provided, X must contain a 'label' column."
                 )
             df_train = X
-            target_col = "label"
+            target_col = "target"
 
         # Build Config from kwargs + derived fields
         cfg = Config(
-            feature_cols=[c for c in df_train.columns if c != target_col],
+            #feature_cols=[c for c in df_train.columns if c != target_col],
             target_col=target_col,
             **self._cfg_kwargs,
         )

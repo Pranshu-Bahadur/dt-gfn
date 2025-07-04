@@ -2,6 +2,11 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from typing import Tuple
+import math
+import torch
+import torch.nn as nn
+from typing import Tuple
+
 
 
 class PolicyBase(nn.Module):
@@ -88,11 +93,6 @@ class PolicyPaperMLP(PolicyBase):
 
     # src/trees/policy.py  (add after PolicyPaperMLP)
 
-from __future__ import annotations
-import math
-import torch
-import torch.nn as nn
-from typing import Tuple
 
 
 class PolicyTransformer(PolicyBase):
@@ -121,8 +121,8 @@ class PolicyTransformer(PolicyBase):
         n_layers: int = 6,
         n_heads: int = 8,
         d_ff: int = 2048,
-        dropout: float = 0.1,
-        max_len: int = 1024,
+        dropout: float = 0.3,
+        max_len: int = 4*1024,
     ):
         super().__init__()
 

@@ -85,14 +85,28 @@ class TabularEnv:
 
     def reset(self, batch_size: int) -> None:
         """
-        Start a new rollout: sample `batch_size` examples uniformly.
+        Grab the next contiguous block of rows instead of shuffling.
+        A circular pointer wraps around when we hit the end.
         """
+        if not hasattr(self, "_ptr"):
+            self._ptr = 0                         # initialise once
+
         n = self.y_full.size(0)
-        idxs = torch.randperm(n, device=self.device)[:batch_size]
+        end = self._ptr + batch_size
+        if end <= n:
+            idxs = torch.arange(self._ptr, end, device=self.device)
+        else:                                    # wrap-around
+            first = torch.arange(self._ptr, n,  device=self.device)
+            second = torch.arange(0, end - n, device=self.device)
+            idxs = torch.cat([first, second])
+
+        self._ptr = end % n                      # advance pointer
+
         self.idxs = idxs
         self.paths = []
         self.open_leaves = 1
         self.done = False
+
 
     def step(self, action: Tuple[str, int]) -> None:
         """
@@ -121,7 +135,7 @@ class TabularEnv:
             self.open_leaves -= 1          # closed a leaf
 
         # rollout terminates when all leaves are closed
-        if self.open_leaves == 0 or len(self.paths) > 8192:
+        if self.open_leaves == 0:
             self.done = True
  
 
