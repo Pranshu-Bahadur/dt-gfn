@@ -12,7 +12,7 @@ from tqdm import tqdm
 from src.binning import BinConfig, Binner
 from src.env import TabularEnv
 from src.tokenizer import Tokenizer
-from src.policy import PolicyPaperMLP
+from src.policy import PolicyPaperMLP, PolicyTransformer
 from src.utils import (
     ReplayBuffer,
     tb_loss,
@@ -90,8 +90,13 @@ class Trainer:
 
         # ---- Policy Nets --------------------------------------------------
         vocab_size = len(self.tokenizer)
-        pf = PolicyPaperMLP(vocab_size, c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
-        pb = PolicyPaperMLP(vocab_size, c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
+        #pf = PolicyPaperMLP(vocab_size, c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
+        #pb = PolicyPaperMLP(vocab_size, c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
+        pf = PolicyTransformer(vocab_size=len(tokenizer), d_model=384,
+                       n_layers=4, n_heads=6, d_ff=1536).to(device)
+        pb = PolicyTransformer(vocab_size=len(tokenizer), d_model=384,
+                       n_layers=4, n_heads=6, d_ff=1536).to(device)
+        print(len(tokenizer))
         pf, pb = torch.jit.script(pf), torch.jit.script(pb)
 
         log_z = torch.zeros((), device=device, requires_grad=True)
@@ -185,7 +190,7 @@ class Trainer:
                     continue  # incomplete tree
 
                 # Reward & prior
-                R, prior, _, _ = env.evaluate(current_beta=0.1)
+                R, prior, _, _ = env.evaluate(current_beta=0.0)
                 R = torch.tensor([R], device=device)
                 completed += 1
 
@@ -201,7 +206,7 @@ class Trainer:
 
                 l_tb = tb_loss(log_pf, log_pb, log_z, R.unsqueeze(0), prior)
                 l_fl = fl_loss(logF, log_pf, log_pb, dE)
-                (l_tb + 0.1 * l_fl).backward()
+                (0.5 * l_tb + 0.5 * l_fl).backward()
                 tb_acc += l_tb.item()
                 fl_acc += l_fl.item()
 
