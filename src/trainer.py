@@ -6,6 +6,7 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 import torch
+import random
 from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, SequentialLR
 from tqdm import tqdm
 
@@ -14,7 +15,8 @@ from src.env import TabularEnv
 from src.tokenizer import Tokenizer
 from src.policy import PolicyPaperMLP, PolicyTransformer
 from src.utils import (
-    ReplayBuffer,
+    PrioritizedReplayBuffer,  # <-- Use PrioritizedReplayBuffer
+    ExplorationScheduler,   # <-- Import ExplorationScheduler
     tb_loss,
     fl_loss,
     _safe_sample,
@@ -47,6 +49,11 @@ class Config:
     mlp_layers: int = 8
     mlp_width: int = 256
     lr: float = 5e-5
+
+    # Exploration Strategy
+    initial_epsilon: float = 1.0
+    min_epsilon: float = 0.05
+    epsilon_decay: float = 0.99
 
 
 # --------------------------------------------------------------------------- #
@@ -90,13 +97,12 @@ class Trainer:
 
         # ---- Policy Nets --------------------------------------------------
         vocab_size = len(self.tokenizer)
-        #pf = PolicyPaperMLP(vocab_size, c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
-        #pb = PolicyPaperMLP(vocab_size, c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
-        pf = PolicyTransformer(vocab_size=len(self.tokenizer), d_model=256,
-                       n_layers=12, n_heads=4, d_ff=512).to(device)
-        pb = PolicyTransformer(vocab_size=len(self.tokenizer), d_model=256,
-                       n_layers=12, n_heads=4, d_ff=512).to(device)
-        print(len(self.tokenizer))
+        #pf = PolicyTransformer(vocab_size=len(self.tokenizer), d_model=256,
+        #               n_layers=12, n_heads=4, d_ff=512).to(device)
+        #pb = PolicyTransformer(vocab_size=len(self.tokenizer), d_model=256,
+        #               n_layers=12, n_heads=4, d_ff=512).to(device)
+        pf = PolicyPaperMLP(vocab_size, c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
+        pb = PolicyPaperMLP(vocab_size, c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
         pf, pb = torch.jit.script(pf), torch.jit.script(pb)
 
         log_z = torch.zeros((), device=device, requires_grad=True)
@@ -105,7 +111,7 @@ class Trainer:
         opt_z = torch.optim.Adam([log_z], lr=c.lr / 10)
         optimizers = [opt_pf, opt_pb, opt_z]
 
-        # LR schedulers
+        # ---- LR Schedulers ------------------------------------------------
         warm, total = 10, c.updates
         scheds = []
         for opt in optimizers:
@@ -120,13 +126,16 @@ class Trainer:
                 )
             )
 
-        # ---- Replay buffer & baseline ------------------------------------
-        buf = ReplayBuffer(capacity=10_000)
+        # ---- Replay Buffer, Scheduler, & Baseline -------------------------
+        buf = PrioritizedReplayBuffer(capacity=10_000)
+        scheduler = ExplorationScheduler(
+            c.initial_epsilon, c.min_epsilon, c.epsilon_decay
+        )
         base_pred = torch.full_like(env.y_full, env.y_full.mean())
         self.y_mean = env.y_full.mean().item()
 
         # ---- Pre-compute ID ranges for masks -----------------------------
-        FEAT_START = 3  # pad,bos,eos = 0,1,2
+        FEAT_START = 3
         TH_START   = FEAT_START + self.tokenizer.num_features
         LEAF_START = TH_START + self.tokenizer.num_bins
 
@@ -142,12 +151,15 @@ class Trainer:
                 opt.zero_grad()
 
             pbar = tqdm(range(c.rollouts), desc=f"Upd {upd:02d}", leave=False)
+            epsilon = scheduler.get_epsilon(upd)
+            pbar.set_postfix({"eps": f"{epsilon:.3f}"})
+
             for _ in pbar:
                 env.reset(c.batch_size)
                 seq_ids = [self.tokenizer.BOS]
                 open_depths = [0]
 
-                # -------- rollout sampling --------
+                # -------- Rollout Sampling with Dynamic Exploration --------
                 with torch.no_grad():
                     while not env.done and open_depths:
                         x = torch.tensor([seq_ids], device=device)
@@ -158,19 +170,28 @@ class Trainer:
                         cur_depth = open_depths[-1]
 
                         if env.open_leaves > 0 and cur_depth < c.max_depth:
-                            mask[FEAT_START:TH_START] = True      # features
+                            mask[FEAT_START:TH_START] = True
                         if env.open_leaves > 0:
-                            mask[LEAF_START:] = True              # leaves
+                            mask[LEAF_START:] = True
 
                         if not mask.any():
                             break
 
-                        tok_id = _safe_sample(logits, mask, temperature=1.0)
+                        # Use random actions for exploration
+                        if random.random() < epsilon:
+                            # Create a tensor of possible actions from the mask
+                            possible_actions = torch.where(mask)[0]
+                            if len(possible_actions) > 0:
+                                tok_id = random.choice(possible_actions).item()
+                            else:
+                                break # No valid actions
+                        else:
+                            tok_id = _safe_sample(logits, mask, temperature=1.0)
+
                         kind, idx = self.tokenizer.decode_one(tok_id)
                         env.step((kind, idx))
                         seq_ids.append(tok_id)
 
-                        # if feature → immediately sample threshold
                         if kind == "feature":
                             logits2, _ = pf(torch.tensor([seq_ids], device=device))
                             logits_th = logits2[0, -1]
@@ -187,14 +208,14 @@ class Trainer:
 
                 seq_ids.append(self.tokenizer.EOS)
                 if env.open_leaves != 0:
-                    continue  # incomplete tree
+                    continue
 
                 # Reward & prior
                 R, prior, _, _ = env.evaluate(current_beta=0.0)
                 R = torch.tensor([R], device=device)
                 completed += 1
 
-                # --- losses ---
+                # --- Losses ---
                 fwd = torch.tensor([seq_ids], device=device)
                 log_pf = pf.log_prob(fwd)
                 logF = pf.log_F(fwd)
@@ -202,7 +223,7 @@ class Trainer:
                 bwd = torch.flip(fwd, dims=[1])
                 log_pb = pb.log_prob(bwd)
 
-                dE = dE_split_gain(fwd, self.tokenizer, env)  # torch.zeros_like(log_pf) gain term can be added later
+                dE = dE_split_gain(fwd, self.tokenizer, env)
 
                 l_tb = tb_loss(log_pf, log_pb, log_z, R.unsqueeze(0), prior)
                 l_fl = fl_loss(logF, log_pf, log_pb, dE)
@@ -212,7 +233,7 @@ class Trainer:
 
                 buf.add(R.item(), seq_ids, prior.item(), env.idxs.clone())
 
-            # optimise
+            # Optimise
             if completed:
                 for opt in optimizers:
                     torch.nn.utils.clip_grad_norm_(opt.param_groups[0]["params"], 1.0)
@@ -220,9 +241,9 @@ class Trainer:
                 for sch in scheds:
                     sch.step()
 
-            # ---- Boosting update ----
-            if buf.data:
-                best = buf.data[: c.top_k_trees]
+            # ---- Boosting Update ----
+            if len(buf) > 0:
+                best = buf.sample(c.top_k_trees) # Sample best trees from prioritized buffer
                 top_seqs = [t[1] for t in best]
                 predictors = [
                     sequence_to_predictor(s, env.X_full, residuals, self.tokenizer)
@@ -244,9 +265,9 @@ class Trainer:
                     f"| FL {fl_acc / max(1, completed):.4f} "
                     f"| ρ_train {rho:+.3f}"
                 )
-                buf.data.clear()
+                buf.buffer.clear() # Clear the buffer for the next boosting iteration
 
-        return self  # sklearn expects self
+        return self
 
     # ------------------------------------------------------------------ #
     # predict
@@ -255,25 +276,21 @@ class Trainer:
         if self.tokenizer is None:
             raise RuntimeError("Call fit() first.")
 
-        # ---- Get device from config ----
         device = self.cfg.device
 
-        # ---- Bin features and move to the correct device ----
         if self.binner is None:
             X_arr = df[self.cfg.feature_cols].values.astype("int8")
         else:
             X_arr = self.binner.transform(df[self.cfg.feature_cols]).values.astype("int8")
         X = torch.tensor(X_arr, dtype=torch.int8, device=device)
 
-        # ---- Perform prediction on the correct device ----
         preds = torch.full((len(df),), self.y_mean, dtype=torch.float32, device=device)
         for pred_fns in self.ensemble:
             step = torch.zeros_like(preds)
             for fn in pred_fns:
-                step += fn(X)                     # Now fn and X are on the same device
+                step += fn(X)
             preds += self.cfg.boosting_lr * step / max(1, len(pred_fns))
 
-        # ---- Move final predictions to CPU for numpy conversion ----
         return preds.cpu().numpy()
 
     # ------------------------------------------------------------------ #
@@ -286,5 +303,3 @@ class Trainer:
         for k, v in params.items():
             setattr(self.cfg, k, v)
         return self
-
-
