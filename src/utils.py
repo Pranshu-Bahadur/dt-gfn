@@ -7,77 +7,6 @@ import heapq
 from typing import Callable, List, Optional, Tuple
 from collections import deque
 
-# --------------------------------------------------------------------- #
-# Helper: build a flat “heap” representation of the tree
-# --------------------------------------------------------------------- #
-def _build_flat_tree(
-    actions: List[Tuple[str, int]],
-) -> Tuple[torch.LongTensor, torch.LongTensor,
-           torch.LongTensor, torch.LongTensor]:
-    """
-    Convert (kind, idx) action list to 4 parallel tensors describing a
-    binary tree in breadth-first order.
-
-    Returns
-    -------
-    feat   : (S,) int64   feature index  (−1 for leaf)
-    thresh : (S,) int64   threshold bin  (arbitrary for leaf)
-    left   : (S,) int64   left-child index (−1 if none)
-    right  : (S,) int64   right-child index (−1 if none)
-    """
-    if not actions:
-        # Handle empty trajectory gracefully
-        return (torch.tensor([-1], dtype=torch.long),) * 4
-
-    feat, thr, L, R = [-1], [-1], [-1], [-1]
-    nodes_to_process = deque([0])
-    next_node_idx = 1
-    it = iter(actions)
-
-    def grow(n: int):
-        # Pre-allocate space in our lists if needed
-        while n >= len(feat):
-            feat.extend([-1, -1]); thr.extend([-1, -1])
-            L.extend([-1, -1]);   R.extend([-1, -1])
-
-    while nodes_to_process:
-        current_node_idx = nodes_to_process.popleft()
-        
-        try:
-            kind, idx = next(it)
-        except StopIteration:
-            continue # No more actions, this is a leaf
-
-        if kind == "feature":
-            try:
-                # A feature must be followed by a threshold
-                th_kind, th_idx = next(it)
-                assert th_kind == "threshold"
-            except (StopIteration, AssertionError):
-                # Incomplete action, treat as a leaf
-                continue
-
-            grow(next_node_idx + 1)
-            feat[current_node_idx] = idx
-            thr[current_node_idx] = th_idx
-            L[current_node_idx] = next_node_idx
-            R[current_node_idx] = next_node_idx + 1
-
-            nodes_to_process.append(next_node_idx)
-            nodes_to_process.append(next_node_idx + 1)
-            next_node_idx += 2
-
-    return (
-        torch.tensor(feat, dtype=torch.long),
-        torch.tensor(thr,  dtype=torch.long),
-        torch.tensor(L,    dtype=torch.long),
-        torch.tensor(R,    dtype=torch.long),
-    )
-
-
-# --------------------------------------------------------------------- #
-# Main factory for creating a tree predictor
-# --------------------------------------------------------------------- #
 def sequence_to_predictor(
     traj: List[int],
     X_binned: torch.Tensor,
@@ -85,77 +14,104 @@ def sequence_to_predictor(
     tokenizer,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """
-    Build a fast, vectorized predictor from a token trajectory.
+    Decode a token-ID trajectory into a tree predictor function.
+
+    Args:
+        traj: Sequence of token IDs including BOS/EOS.
+        X_binned: Tensor of shape (N, F) with binned features.
+        y_target: Tensor of shape (N,) with true targets, or None for inference.
+        tokenizer: SimpleTokenizer with decode() method.
+
+    Returns:
+        A function f(X_new) -> Tensor of shape (X_new.size(0),)
     """
+    # Decode trajectory into (kind, idx) pairs, skipping special tokens.
     actions = tokenizer.decode(traj)
-    feat, thr, left, right = _build_flat_tree(actions)
+    it = iter(actions)
 
-    device = X_binned.device
-    feat, thr, left, right = feat.to(device), thr.to(device), left.to(device), right.to(device)
+    # Recursive tree builder
+    def build_node():
+        try:
+            kind, idx = next(it)
+        except StopIteration:
+            return None
+        if kind == "feature":
+            # Next action must be threshold
+            _, th = next(it)
+            left = build_node()
+            right = build_node()
+            return {"type": "split", "f": idx, "t": th, "L": left, "R": right}
+        # Leaf node
+        return {"type": "leaf", "value": None}
 
-    # Compute leaf values by propagating data down the tree
-    default_val = 0.0 if y_target is None else y_target.mean().item()
-    leaf_values = torch.full(feat.shape, default_val, dtype=torch.float32, device=device)
+    tree = build_node()
+    if tree is None:
+        # Return zero predictor
+        return lambda X: torch.zeros(X.size(0), dtype=torch.float32, device=X.device)
 
-    if y_target is not None and feat[0] != -1:
-        N = X_binned.size(0)
-        node_indices = torch.arange(N, device=device)
-        stack = [(0, node_indices)] # (tree_node_idx, data_row_indices)
+    # Assign leaf values based on y_target
+    N = X_binned.size(0)
+    default_val = 0.0 if y_target is None else float(y_target.mean().item())
 
-        while stack:
-            node_idx, row_indices = stack.pop()
-            if row_indices.numel() == 0:
-                continue
+    stack = [(tree, torch.arange(N, device=X_binned.device))]
+    while stack:
+        node, idxs = stack.pop()
+        if not idxs.numel() or node is None:
+            continue
+        if node["type"] == "split":
+            f, t = node["f"], node["t"]
+            mask = X_binned[idxs, f] <= t
+            left_idxs = idxs[mask]
+            right_idxs = idxs[~mask]
+            if node.get("L"):
+                stack.append((node["L"], left_idxs))
+            if node.get("R"):
+                stack.append((node["R"], right_idxs))
+        else:
+            # Leaf: set value
+            if y_target is not None and idxs.numel() > 0:
+                node["value"] = float(y_target[idxs].mean().item())
 
-            if feat[node_idx] == -1: # Is a leaf node
-                leaf_values[node_idx] = y_target[row_indices].mean().item()
-            else: # Is a split node
-                f, t = feat[node_idx].item(), thr[node_idx].item()
-                mask = X_binned[row_indices, f] <= t
-                
-                left_child, right_child = left[node_idx].item(), right[node_idx].item()
-                if left_child != -1:
-                    stack.append((left_child, row_indices[mask]))
-                if right_child != -1:
-                    stack.append((right_child, row_indices[~mask]))
+    # --- FIX STARTS HERE ---
 
-    @torch.no_grad() # Ensure no gradients are computed during prediction
+    # 1. Fill any unassigned leaf values with the default to prevent errors
+    def fill_missing_leaves(node):
+        if node is None:
+            return
+        if node["type"] == "leaf":
+            if node["value"] is None:
+                node["value"] = default_val
+        elif node["type"] == "split":
+            fill_missing_leaves(node.get("L"))
+            fill_missing_leaves(node.get("R"))
+
+    fill_missing_leaves(tree)
+
+    # Predictor function for new X
     def predict(X_new: torch.Tensor) -> torch.Tensor:
-        B = X_new.size(0)
-        node_idx = torch.zeros(B, dtype=torch.long, device=device)
-        active_mask = torch.ones(B, dtype=torch.bool, device=device)
-
-        # Loop until all samples have reached a leaf
-        while active_mask.any():
-            active_indices = active_mask.nonzero(as_tuple=True)[0]
-            current_nodes = node_idx[active_indices]
-            
-            # Check which are leaves
-            is_leaf_mask = (feat[current_nodes] == -1)
-            # Update the main active mask to deactivate leaf rows
-            active_mask[active_indices[is_leaf_mask]] = False
-
-            # For non-leaf nodes, decide which child to visit next
-            split_mask = ~is_leaf_mask
-            if not split_mask.any():
-                break # All have reached leaves
-            
-            active_split_indices = active_indices[split_mask]
-            active_split_nodes = node_idx[active_split_indices]
-            
-            f = feat[active_split_nodes]
-            t = thr[active_split_nodes]
-
-            values = X_new.gather(1, f.unsqueeze(1)).squeeze(1)
-            go_left = values <= t
-
-            node_idx[active_split_indices] = torch.where(
-                go_left,
-                left[active_split_nodes],
-                right[active_split_nodes]
-            )
+        M = X_new.size(0)
+        # 2. Initialize output tensor with a default value instead of garbage
+        out = torch.full((M,), default_val, dtype=torch.float32, device=X_new.device)
         
-        return leaf_values[node_idx]
+        stack2 = [(tree, torch.arange(M, device=X_new.device))]
+        while stack2:
+            node, idxs = stack2.pop()
+            if not idxs.numel() or node is None:
+                continue
+            if node["type"] == "leaf":
+                out[idxs] = node["value"]
+            else:
+                f, t = node["f"], node["t"]
+                mask = X_new[idxs, f] <= t
+                left_idxs = idxs[mask]
+                right_idxs = idxs[~mask]
+                if node.get("L"):
+                    stack2.append((node["L"], left_idxs))
+                if node.get("R"):
+                    stack2.append((node["R"], right_idxs))
+        return out
+
+    # --- FIX ENDS HERE ---
 
     return predict
 
