@@ -97,7 +97,7 @@ def get_tree_predictor(traj, X_binned, y_target, tok):
             node, indices = q.popleft()
             if not indices.numel() or not node: continue
             if node['type'] == 'leaf':
-                leaf_indices[indices] = node['leaf_idx']
+                leaf_indices[indices] = node.get('leaf_idx', -1)
             else:
                 mask = X_test[indices, node['f']] <= node['t']
                 if node.get('L'): q.append((node['L'], indices[mask]))
