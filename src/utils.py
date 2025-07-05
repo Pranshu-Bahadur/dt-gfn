@@ -1,11 +1,8 @@
-from __future__ import annotations
-
+from typing import List, Callable, Optional, Tuple
 import random
-import math
+
 import torch
-import heapq
-from typing import Callable, List, Optional, Tuple
-from collections import deque
+
 
 def sequence_to_predictor(
     traj: List[int],
@@ -115,173 +112,77 @@ def sequence_to_predictor(
 
     return predict
 
-# --------------------------------------------------------------------- #
-# Exploration Strategy
-# --------------------------------------------------------------------- #
-class PrioritizedReplayBuffer:
+
+class ReplayBuffer:
     """
-    A memory-efficient prioritized replay buffer that stores trajectories
-    based on reward, using a min-heap. Only lightweight Python types are stored.
+    Simple replay buffer storing top trajectories by reward.
     """
-    def __init__(self, capacity: int = 50_000):
+    def __init__(self, capacity: int = 10000):
         self.capacity = capacity
-        self.buffer = []
-        self._counter = 0
+        self.data: List[Tuple[float, List[int], float, torch.Tensor]] = []
 
-    def add(self, reward: float, traj: List[int], prior: float, idxs: Optional[torch.Tensor] = None) -> None:
-        """Saves a trajectory to the buffer."""
-        priority = -reward # Use negative reward for max-heap behavior with a min-heap
-        
-        # Store only lightweight data, not tensors
-        data = (reward, traj, prior, None) 
-        
-        if len(self.buffer) < self.capacity:
-            heapq.heappush(self.buffer, (priority, self._counter, data))
-        else:
-            # Replace the smallest-reward element
-            heapq.heappushpop(self.buffer, (priority, self._counter, data))
-        self._counter += 1
+    def add(self, reward: float, traj: List[int], prior: float, idxs: torch.Tensor) -> None:
+        """
+        Add a new rollout to the buffer.
+        Keeps only top-`capacity` by reward.
+        """
+        self.data.append((reward, traj, prior, idxs))
+        # sort descending by reward
+        self.data.sort(key=lambda x: x[0], reverse=True)
+        if len(self.data) > self.capacity:
+            self.data.pop()
 
-    def sample(self, k: int) -> List[Tuple[float, List[int], float, None]]:
-        """Samples k trajectories with the highest rewards."""
-        k = min(k, len(self.buffer))
-        return [item[2] for item in heapq.nlargest(k, self.buffer)]
-
-    def __len__(self) -> int:
-        return len(self.buffer)
+    def sample(self, k: int):
+        """
+        Uniformly sample up to k trajectories.
+        """
+        return random.sample(self.data, min(k, len(self.data)))
 
 
-class ExplorationScheduler:
-    """
-    Calculates an exponentially decaying exploration rate (ε).
-    """
-    def __init__(self, initial_epsilon: float, min_epsilon: float, decay_rate: float):
-        self.initial_epsilon = initial_epsilon
-        self.min_epsilon = min_epsilon
-        self.decay_rate = decay_rate
-
-    def get_epsilon(self, current_step: int) -> float:
-        """Calculates the current exploration rate."""
-        return self.min_epsilon + \
-            (self.initial_epsilon - self.min_epsilon) * \
-            math.exp(-1. * current_step * self.decay_rate)
-
-# --------------------------------------------------------------------- #
-# Loss Functions
-# --------------------------------------------------------------------- #
 @torch.jit.script
 def tb_loss(
-    log_pf: torch.Tensor, log_pb: torch.Tensor, log_z: torch.Tensor,
-    R: torch.Tensor, prior: torch.Tensor,
+    log_pf: torch.Tensor,
+    log_pb: torch.Tensor,
+    log_z: torch.Tensor,
+    R: torch.Tensor,
+    prior: torch.Tensor,
 ) -> torch.Tensor:
-    """Trajectory Balance Loss, batched."""
-    # Ensure tensors have the correct shape for broadcasting
-    if R.dim() == 1: R = R.unsqueeze(1)
-    if prior.dim() == 1: prior = prior.unsqueeze(1)
+    """
+    Trajectory balance loss:
+      (log_Z + sum log_pf - (log R + prior + sum log_pb))^2
+    """
+    return ((log_z + log_pf.sum(1) - (torch.log(R) + prior + log_pb.sum(1)))**2).mean()
 
-    traj_p_fwd = log_pf.sum(1, keepdim=True)
-    traj_p_bwd = log_pb.sum(1, keepdim=True)
-    
-    return ((log_z + traj_p_fwd - (torch.log(R) + prior + traj_p_bwd))**2).mean()
 
 @torch.jit.script
 def fl_loss(
-    logF: torch.Tensor, log_pf: torch.Tensor,
-    log_pb: torch.Tensor, dE: torch.Tensor,
+    logF: torch.Tensor,
+    log_pf: torch.Tensor,
+    log_pb: torch.Tensor,
+    dE: torch.Tensor,
 ) -> torch.Tensor:
-    """Flow Matching Loss, batched."""
+    """
+    Flow matching loss:
+      (logF_t + log_pf_t - (logF_{t+1} + log_pb_t - dE_t))^2
+    """
     return ((logF[:, :-1] + log_pf - (logF[:, 1:] + log_pb - dE))**2).mean()
 
-def _safe_sample(logits: torch.Tensor, mask: torch.Tensor, temperature: float) -> int:
-    """Masked, temperature-controlled sampling from logits."""
-    scaled_logits = logits / temperature
-    masked_logits = torch.where(mask, scaled_logits, torch.tensor(-1e9, device=logits.device))
-    probs = torch.softmax(masked_logits, dim=-1)
+
+def _safe_sample(
+    logits: torch.Tensor,
+    mask: torch.Tensor,
+    temperature: float,
+) -> int:
+    """
+    Masked sampling at given temperature.
+    """
+    # scale logits
+    scaled = logits / temperature
+    # apply mask
+    neg_inf = torch.tensor(-1e9, device=logits.device)
+    masked = torch.where(mask, scaled, neg_inf)
+    # softmax & sample
+    probs = torch.softmax(masked, dim=-1)
     return torch.multinomial(probs, 1).item()
 
-# --------------------------------------------------------------------- #
-# Energy Change Calculation
-# --------------------------------------------------------------------- #
-@torch.no_grad()
-def dE_split_gain(
-    token_ids: torch.Tensor, tokenizer, env
-) -> torch.Tensor:
-    """
-    Compute ΔE (negative split gain) for every transition in a batch of trajectories.
-    This version is designed to be more robust and clear.
-    """
-    batch_size, max_len = token_ids.shape
-    dE = torch.zeros(batch_size, max_len - 1, device=token_ids.device)
 
-    for i in range(batch_size):
-        seq = token_ids[i].tolist()
-        # Find the actual end of the sequence (before padding)
-        try:
-            end_idx = seq.index(tokenizer.EOS)
-        except ValueError:
-            end_idx = max_len
-        
-        decoded_actions = tokenizer.decode(seq[1:end_idx])
-
-        if not decoded_actions: continue
-
-        y = env.y[env.idxs]
-        X = env.X_full[env.idxs]
-        n_rows = y.numel()
-
-        def get_mse(rows):
-            if rows.numel() < 2: return 0.0
-            subset_y = y[rows]
-            return (subset_y.var(unbiased=False)).item()
-
-        parent_mse = get_mse(torch.arange(n_rows, device=y.device))
-        
-        # Stacks for traversing the tree being built
-        row_indices_stack = [torch.arange(n_rows, device=y.device)]
-        mse_stack = [parent_mse]
-        action_idx = 0
-
-        it = iter(decoded_actions)
-        while action_idx < len(decoded_actions):
-            kind, idx = decoded_actions[action_idx]
-            
-            if kind == "feature":
-                if not row_indices_stack: break
-                
-                parent_rows = row_indices_stack.pop()
-                parent_mse = mse_stack.pop()
-                
-                # Consume the subsequent threshold token
-                action_idx += 1
-                if action_idx >= len(decoded_actions): break
-                th_kind, th_val = decoded_actions[action_idx]
-                if th_kind != "threshold": continue
-
-                # Partition data
-                mask = X[parent_rows, idx] <= th_val
-                L_rows = parent_rows[mask]
-                R_rows = parent_rows[~mask]
-
-                mse_L = get_mse(L_rows)
-                mse_R = get_mse(R_rows)
-
-                # Push children's data and MSE onto stacks for future splits
-                # Note: Order is R, L because pop() will get L first
-                row_indices_stack.extend([R_rows, L_rows])
-                mse_stack.extend([mse_R, mse_L])
-
-                wL, wR = L_rows.numel(), R_rows.numel()
-                parent_N = wL + wR
-                if parent_N > 0:
-                    gain = parent_mse - (wL / parent_N * mse_L + wR / parent_N * mse_R)
-                    # The energy drop corresponds to the transition *ending* with the threshold token
-                    dE[i, action_idx] = -gain # Negative gain = energy drop
-            
-            elif kind == "leaf":
-                if row_indices_stack:
-                    row_indices_stack.pop()
-                    mse_stack.pop()
-            
-            action_idx += 1
-    
-    return dE
