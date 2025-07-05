@@ -2,20 +2,18 @@
 
 from __future__ import annotations
 from typing import List, Tuple
-
+import numpy as np
 import pandas as pd
 import torch
 
-from src.binning import Binner, BinConfig
-from src.utils import sequence_to_predictor
-from src.tokenizer import Tokenizer
-
-
 class TabularEnv:
     """
-    A tabular decision‐tree environment for GFN rollouts, with optional
-    pre-binned input support (skips fitting/transform) and int8 storage.
-    Now uses sequence_to_predictor() for both reward and inference.
+    A tabular decision-tree environment for GFN rollouts, updated to match
+    the production pipeline for Numerai data.
+
+    - Features are binned using quantile-based method.
+    - Reward is 1 / (1 + MSE).
+    - Step logic correctly handles open leaves.
     """
 
     def __init__(
@@ -23,44 +21,18 @@ class TabularEnv:
         df_train: pd.DataFrame,
         feature_cols: List[str],
         target_col: str,
-        bin_config: BinConfig,
-        tokenizer: Tokenizer,
+        n_bins: int,
         device: str = "cpu",
     ):
         self.device = device
         self.feature_cols = feature_cols
         self.target_col = target_col
-        self.tokenizer = tokenizer
+        self.n_bins = n_bins
 
-        # Prepare features
-        df_feat = df_train[self.feature_cols]
-
-        # Detect prebinned: all integer dtypes
-        if df_feat.dtypes.apply(pd.api.types.is_integer_dtype).all():
-            # Pre-binned: skip Binner entirely
-            arr = df_feat.values
-            max_idx = int(arr.max())
-            self.num_bins = max_idx + 1
-
-            # store X_full as int8
-            X_arr = arr.astype("int8")
-            self.X_full = torch.tensor(X_arr, dtype=torch.int8, device=self.device)
-
-            self.binner = None
-        else:
-            # Fit a Binner then transform
-            self.binner = Binner(bin_config)
-            X_df = self.binner.fit_transform(df_feat)
-            self.num_bins = bin_config.n_bins
-
-            X_arr = X_df.values.astype("int8")
-            self.X_full = torch.tensor(X_arr, dtype=torch.int8, device=self.device)
-
-        # Targets
+        # Featurization is now handled internally
+        self.X_full = self._featurise(df_train, df_train, feature_cols, n_bins)
         self.y_full = torch.tensor(
-            df_train[self.target_col].values,
-            dtype=torch.float32,
-            device=self.device,
+            df_train[target_col].values, dtype=torch.float32, device=device
         )
         self.y = self.y_full.clone()
 
@@ -68,115 +40,137 @@ class TabularEnv:
         self.paths: List[Tuple[str, int]]
         self.open_leaves: int
         self.done: bool
+        self.idxs: torch.Tensor
 
-    def featurise(self, df: pd.DataFrame) -> torch.Tensor:
+    def _featurise(
+        self,
+        df_target: pd.DataFrame,
+        df_source: pd.DataFrame,
+        feats: List[str],
+        bins: int
+    ) -> torch.Tensor:
         """
-        Bin a new DataFrame using the same edges as training, or
-        if prebinned, just cast to int8.
+        Bins features using quantiles from the source dataframe.
+        Skips binning if the data is already of integer type.
         """
-        df_feat = df[self.feature_cols]
-        if self.binner is None:
-            arr = df_feat.values.astype("int8")
-            return torch.tensor(arr, dtype=torch.int8, device=self.device)
+        # --- Check if data is already binned ---
+        if all(pd.api.types.is_integer_dtype(df_source[f]) for f in feats):
+            return torch.tensor(
+                df_target[feats].values.astype(np.int8), device=self.device
+            )
 
-        X_df = self.binner.transform(df_feat)
-        arr = X_df.values.astype("int8")
-        return torch.tensor(arr, dtype=torch.int8, device=self.device)
+        # --- If not binned, proceed with quantile binning ---
+        X_binned = []
+        for f in feats:
+            # Get series from source and target dataframes
+            s_source = df_source[f].replace([np.inf, -np.inf], np.nan).fillna(df_source[f].median()).values
+            s_eval = df_target[f].replace([np.inf, -np.inf], np.nan).fillna(df_source[f].median()).values
 
-    def reset(self, batch_size: int) -> None:
+            # Create quantile-based bin edges from the source data
+            quantiles = np.linspace(0, 1, bins + 1)
+            edges = np.quantile(s_source, quantiles)
+            edges = np.unique(edges)
+            edges[0] -= 1e-9  # Ensure the lowest values are included
+            edges[-1] += 1e-9 # Ensure the highest values are included
+
+            # Bin the target data using the calculated edges
+            binned_eval = np.searchsorted(edges, s_eval, side="right") - 1
+            X_binned.append(binned_eval)
+
+        return torch.tensor(
+            np.stack(X_binned, 1).astype(np.int32), device=self.device
+        )
+
+    def reset(self, batch_size: int):
         """
-        Grab the next contiguous block of rows instead of shuffling.
-        A circular pointer wraps around when we hit the end.
+        Resets the environment for a new rollout, using a non-shuffling,
+        circular pointer to select a contiguous block of data.
         """
         if not hasattr(self, "_ptr"):
-            self._ptr = 0                         # initialise once
+            self._ptr = 0  # Initialise the pointer on the first call
 
-        n = self.y_full.size(0)
+        n = len(self.y_full)
         end = self._ptr + batch_size
-        if end <= n:
-            idxs = torch.arange(self._ptr, end, device=self.device)
-        else:                                    # wrap-around
-            first = torch.arange(self._ptr, n,  device=self.device)
-            second = torch.arange(0, end - n, device=self.device)
-            idxs = torch.cat([first, second])
 
-        self._ptr = end % n                      # advance pointer
+        if end <= n:
+            # Standard case: the batch fits within the remaining data
+            idxs = torch.arange(self._ptr, end, device=self.device)
+        else:
+            # Wrap-around case: the batch goes beyond the end of the data
+            first_part = torch.arange(self._ptr, n, device=self.device)
+            second_part = torch.arange(0, end - n, device=self.device)
+            idxs = torch.cat([first_part, second_part])
+
+        self._ptr = end % n  # Move the pointer for the next batch
 
         self.idxs = idxs
-        self.paths = []
-        self.open_leaves = 1
-        self.done = False
+        self.paths, self.open_leaves, self.done = [], 1, False
 
-
-    def step(self, action: Tuple[str, int]) -> None:
+    def step(self, action: Tuple[str, int]):
         """
         Advance the environment by one token action.
-
-        Args
-        ----
-        action : Tuple[str, int]
-            • ("feature", f_idx)   –– emit a feature token F_f  
-            • ("threshold", bin)   –– emit its threshold token TH_b  
-            • ("leaf", 0)          –– emit a leaf marker
-
-        Book-keeping (`open_leaves`):
-            • A fresh rollout starts with 1 open leaf.
-            • Emitting a THRESHOLD splits that leaf into two  →  +1.
-            • Emitting a LEAF closes the current leaf        →  −1.
-            • FEATURE tokens do **not** change the count; the split
-              happens only when its THRESHOLD arrives.
+        Updates open_leaves based on the action taken.
         """
-        kind, _ = action
         self.paths.append(action)
-
-        if kind == "threshold":
-            self.open_leaves += 1          # one leaf became two
+        kind, _ = action
+        if kind == "feat":
+            self.open_leaves += 1
         elif kind == "leaf":
-            self.open_leaves -= 1          # closed a leaf
+            self.open_leaves -= 1
 
-        # rollout terminates when all leaves are closed
-        if self.open_leaves == 0:
-            self.done = True
- 
+        # A trajectory is done if all leaves are closed or if it's too long
+        self.done = (self.open_leaves == 0 or len(self.paths) > 8192)
 
-    def evaluate(
-        self, current_beta: float
-    ) -> Tuple[float, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def evaluate(self, current_beta: float):
         """
-        Compute (R, prior, pred, y_t) for the current rollout using
-        sequence_to_predictor so the env matches inference exactly.
+        Computes the reward for a completed trajectory using 1 / (1 + MSE).
         """
-        # Prior penalty
-        num_splits = sum(1 for kind, _ in self.paths if kind == "feature")
-        prior = -current_beta * num_splits
+        prior = -current_beta * sum(1 for k, _ in self.paths if k == "feat")
+        y_t = self.y[self.idxs]
 
-        # Gather batch
-        y_t = self.y_full[self.idxs]
+        if y_t.numel() == 0:
+            return 0.0, torch.tensor([prior], device=self.device), None, None
+
         X_batch = self.X_full[self.idxs]
+        base_mse = ((y_t - y_t.mean()) ** 2).mean()
 
-        # If rollout not complete, fallback to base MSE
-        if not self.paths or self.open_leaves != 0:
-            mse = ((y_t - y_t.mean()) ** 2).mean().item()
-            R = 1.0 / (1.0 + mse)
-            return R, torch.tensor([prior], device=self.device), None, y_t
+        # For incomplete trees, reward is based on the baseline MSE
+        if not self.done:
+            return 1 / (1 + base_mse), torch.tensor([prior], device=self.device), None, y_t
 
-        # Reconstruct token-ID trajectory: [BOS, feat, th, feat, th, ..., EOS]
-        tok = self.tokenizer
-        traj_ids: List[int] = [tok.BOS]
-        for kind, idx in self.paths:
-            if kind == "feature":
-                traj_ids.append(tok.encode_feature(idx))
-            elif kind == "threshold":
-                traj_ids.append(tok.encode_threshold(idx))
-            else:  # leaf
-                traj_ids.append(tok.encode_leaf(idx))
-        traj_ids.append(tok.EOS)
+        path_iter = iter(self.paths)
 
-        # Build predictor and get predictions for this batch
-        pred_fn = sequence_to_predictor(traj_ids, X_batch, y_t, tok)
-        pred = pred_fn(X_batch)
+        def build():
+            try:
+                k, i = next(path_iter)
+            except StopIteration:
+                return None
+            if k == "feat":
+                return {"f": i, "t": next(path_iter)[1], "L": build(), "R": build()}
+            return "leaf_node"
 
-        # Compute reward
-        mse = ((pred - y_t) ** 2).mean().item()
-        R = 1.0 / (1.0 + mse)
-        return R, torch.tensor([prior], device=self.device), pred, y_t
+        tree = build()
+
+        # If the tree is empty, use baseline MSE
+        if not tree:
+            return 1 / (1 + base_mse), torch.tensor([prior], device=self.device), None, y_t
+
+        pred = torch.empty_like(y_t)
+        stack = [(tree, torch.arange(y_t.numel(), device=self.device))]
+
+        while stack:
+            node, idx = stack.pop()
+            if not idx.numel() or node is None:
+                continue
+            if isinstance(node, dict):
+                f, t, L, R = node['f'], node['t'], node['L'], node['R']
+                mask = X_batch[idx, f] <= t
+                stack.extend([(R, idx[~mask]), (L, idx[mask])])
+            else:
+                pred[idx] = y_t[idx].mean() if idx.numel() > 0 else y_t.mean()
+
+        # MSE-based Reward Calculation
+        mse = ((pred - y_t)**2).mean()
+        reward = 1 / (1 + mse)
+
+        return reward.item(), torch.tensor([prior], device=self.device), pred, y_t

@@ -11,40 +11,38 @@ from src.trainer import Trainer, Config
 
 class DTGFNRegressor(BaseEstimator, RegressorMixin):
     """
-    Scikit-learn compatible wrapper around DT-GFN Trainer.
-
-    Parameters
-    ----------
-    All keyword arguments are forwarded directly into `Config(...)`.
-    Anything not recognised by Config will raise a TypeError.
+    Scikit-learn compatible wrapper around the updated DT-GFN Trainer.
     """
 
     def __init__(self, **config_kwargs):
         # Store kwargs so get_params works
         self._cfg_kwargs: Dict[str, Any] = config_kwargs
         self._trainer: Optional[Trainer] = None
+        self.df_train_: Optional[pd.DataFrame] = None
 
     # ------------------------------------------------------------------ #
     # scikit-learn API
     # ------------------------------------------------------------------ #
     def fit(self, X: pd.DataFrame, y=None):
         """
-        Fit the model.  `X` must be a pandas DataFrame; `y` may be a Series/
+        Fit the model. `X` must be a pandas DataFrame; `y` may be a Series/
         array, or you may include the target column in `X` and omit `y`.
         """
         # Build training DataFrame with target column present
         if y is not None:
             df_train = X.copy()
-            df_train["__y__"] = y
-            target_col = "__y__"
+            df_train["target"] = y
+            target_col = "target"
         else:
             if "target" not in X.columns:
                 raise ValueError(
-                    "If `y` is not provided, X must contain a 'label' column."
+                    "If `y` is not provided, X must contain a 'target' column."
                 )
             df_train = X
             target_col = "target"
 
+        self.df_train_ = df_train.copy()
+        
         # Build Config from kwargs + derived fields
         cfg = Config(
             #feature_cols=[c for c in df_train.columns if c != target_col],
@@ -57,9 +55,9 @@ class DTGFNRegressor(BaseEstimator, RegressorMixin):
         return self  # sklearn convention
 
     def predict(self, X: pd.DataFrame):
-        if self._trainer is None:
+        if self._trainer is None or self.df_train_ is None:
             raise RuntimeError("DTGFNRegressor has not been fitted yet.")
-        return self._trainer.predict(X)
+        return self._trainer.predict(X, self.df_train_)
 
     # ------------------------------------------------------------------ #
     # Parameter handling for GridSearchCV / cloning
@@ -70,4 +68,3 @@ class DTGFNRegressor(BaseEstimator, RegressorMixin):
     def set_params(self, **params):
         self._cfg_kwargs.update(params)
         return self
-
