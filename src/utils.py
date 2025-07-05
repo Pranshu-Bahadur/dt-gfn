@@ -58,7 +58,7 @@ def deltaE_split_gain(tokens, tok, env):
 
 def get_tree_predictor(traj, X_binned, y_target, tok):
     """
-    Decode a token-ID trajectory into a tree predictor function.
+    Decode a token-ID trajectory into a tree predictor function (vectorized version).
     """
     path_iter = iter(tok.decode(traj[1:-1]))
     def build_recursive():
@@ -66,29 +66,49 @@ def get_tree_predictor(traj, X_binned, y_target, tok):
         except StopIteration: return None
         if k == 'feat': return {'type': 'split', 'f': i, 't': next(path_iter)[1], 'L': build_recursive(), 'R': build_recursive()}
         return {'type': 'leaf', 'value': 0}
+
     tree_structure = build_recursive()
     if tree_structure is None: return lambda X: torch.zeros(X.size(0), device=X.device)
-    q = [(tree_structure, torch.arange(X_binned.size(0), device=X_binned.device))]
+
+    # Get leaf values from the training data
+    leaf_values = {}
+    q = deque([(tree_structure, torch.arange(X_binned.size(0), device=X_binned.device))])
+    leaf_idx = 0
     while q:
-        node, indices = q.pop(0)
+        node, indices = q.popleft()
         if node['type'] == 'split':
             if not indices.numel() or node.get('L') is None: continue
             mask = X_binned[indices, node['f']] <= node['t']
             q.append((node['L'], indices[mask])); q.append((node['R'], indices[~mask]))
         else:
-            node['value'] = y_target[indices].mean().item() if indices.numel() > 0 else y_target.mean().item()
+            node['leaf_idx'] = leaf_idx
+            leaf_values[leaf_idx] = y_target[indices].mean().item() if indices.numel() > 0 else y_target.mean().item()
+            leaf_idx += 1
+
     def predict(X_test):
-        out = torch.empty(X_test.size(0), device=X_test.device)
-        stack = [(tree_structure, torch.arange(X_test.size(0), device=X_test.device))]
-        while stack:
-            node, indices = stack.pop()
+        # Vectorized prediction
+        out = torch.zeros(X_test.size(0), device=X_test.device)
+        
+        # Get the leaf index for each sample in a vectorized way
+        leaf_indices = torch.zeros(X_test.size(0), dtype=torch.long, device=X_test.device)
+        
+        q = deque([(tree_structure, torch.arange(X_test.size(0), device=X_test.device))])
+        while q:
+            node, indices = q.popleft()
             if not indices.numel() or not node: continue
-            if node['type'] == 'leaf': out[indices] = node['value']
+            if node['type'] == 'leaf':
+                leaf_indices[indices] = node['leaf_idx']
             else:
                 mask = X_test[indices, node['f']] <= node['t']
-                if node.get('L'): stack.append((node['L'], indices[mask]))
-                if node.get('R'): stack.append((node['R'], indices[~mask]))
+                if node.get('L'): q.append((node['L'], indices[mask]))
+                if node.get('R'): q.append((node['R'], indices[~mask]))
+        
+        # Map leaf indices to leaf values
+        for l_idx, l_val in leaf_values.items():
+            out[leaf_indices == l_idx] = l_val
+            
         return out
+        
     return predict
 
 class ReplayBuffer:
