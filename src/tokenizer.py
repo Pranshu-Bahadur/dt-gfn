@@ -1,101 +1,161 @@
+"""tokenizer.py – Minimal, fast, and extensible tokenizer for DT‑GFN
+-------------------------------------------------------------------------
+Token layout
+  0  : <pad>
+  1  : <bos>
+  2  : <eos>
+  3‑(3+F‑1)           : feature IDs        (F = num_features)
+  …                   : threshold IDs      (T = num_bins)
+  …                   : leaf IDs           (L = num_leaves)
+-------------------------------------------------------------------------
+The class is deliberately *stateless* apart from vocabulary sizes so it can
+be shared across workers / processes without pickling overhead.
+The design allows a future drop‑in BPE or SentencePiece tokenizer by only
+changing the encode/decode helpers while keeping token IDs stable.
 """
-Simple tokenizer for DT-GFN: dictionary-based, no external deps.
 
-Vocab layout:
-  <pad>, <bos>, <eos>, F_0…F_{num_features-1}, TH_0…TH_{num_bins-1}, LEAF
-
-Methods mirror a typical HF tokenizer: encode_* → IDs, decode_one/decode → (type, index).
-"""
 from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import lru_cache
 from typing import List, Tuple
+
+__all__ = ["Tokenizer", "Vocab"]
+
+
+@dataclass(frozen=True, slots=True)
+class Vocab:
+    """Holds the offset of each token block."""
+
+    num_features: int
+    num_bins: int
+    num_leaves: int
+
+    PAD: int = 0
+    BOS: int = 1
+    EOS: int = 2
+
+    @property
+    def feature_start(self) -> int:  # 3
+        return 3
+
+    @property
+    def threshold_start(self) -> int:
+        return self.feature_start + self.num_features
+
+    @property
+    def leaf_start(self) -> int:
+        return self.threshold_start + self.num_bins
+
+    @property
+    def size(self) -> int:
+        return self.leaf_start + self.num_leaves
 
 
 class Tokenizer:
+    """Fast int‑token encoder/decoder with O(1) conversions.
+
+    >>> tok = Tokenizer(num_features=5, num_bins=7, num_leaves=2)
+    >>> ids = [
+    ...     tok.BOS,
+    ...     tok.encode_feature(3),
+    ...     tok.encode_threshold(6),
+    ...     tok.encode_leaf(1),
+    ...     tok.EOS,
+    ... ]
+    >>> tok.decode(ids)
+    [('feature', 3), ('threshold', 6), ('leaf', 1)]
     """
-    Tokenizer with a pure-Python dict, minimal dependencies.
 
-    Attributes:
-        PAD, BOS, EOS: special token IDs
-        id2tok: List[str] mapping ID → token
-        tok2id: Dict[str, int] mapping token → ID
-        num_features: number of feature tokens
-        num_bins: number of shared threshold tokens
-        num_leaves: number of leaf tokens
-    """
+    __slots__ = ("v",)
 
-    def __init__(
-        self,
-        num_features: int,
-        num_bins: int,
-        num_leaves: int = 1,
-    ):
-        # store counts
-        self.num_features = num_features
-        self.num_bins = num_bins
-        self.num_leaves = num_leaves
-
-        # special tokens
-        specials = ["<pad>", "<bos>", "<eos>"]
-        self.PAD, self.BOS, self.EOS = 0, 1, 2
-
-        # build token lists
-        feature_tokens = [f"F_{i}" for i in range(num_features)]
-        thresh_tokens = [f"TH_{j}" for j in range(num_bins)]
-        leaf_tokens = (
-            ["LEAF"] if num_leaves == 1 else [f"LEAF_{k}" for k in range(num_leaves)]
+    def __init__(self, *, num_features: int, num_bins: int, num_leaves: int = 1):
+        self.v = Vocab(
+            num_features=int(num_features),
+            num_bins=int(num_bins),
+            num_leaves=int(num_leaves),
         )
 
-        # full vocabulary
-        self.id2tok = specials + feature_tokens + thresh_tokens + leaf_tokens
-        self.tok2id = {tok: idx for idx, tok in enumerate(self.id2tok)}
+    # ------------------------------------------------------------------ #
+    # Public helpers
+    # ------------------------------------------------------------------ #
 
+    # shorthand aliases
+    @property
+    def PAD(self) -> int:  # noqa: N802
+        return self.v.PAD
+
+    @property
+    def BOS(self) -> int:  # noqa: N802
+        return self.v.BOS
+
+    @property
+    def EOS(self) -> int:  # noqa: N802
+        return self.v.EOS
+
+    # encode helpers ---------------------------------------------------- #
     def encode_feature(self, idx: int) -> int:
-        """Encode a feature split token F_idx."""
-        self._check(idx, self.num_features, "feature index")
-        return self.tok2id[f"F_{idx}"]
+        self._check_bounds(idx, self.v.num_features, "feature")
+        return self.v.feature_start + idx
 
     def encode_threshold(self, idx: int) -> int:
-        """Encode a shared threshold bin token TH_idx."""
-        self._check(idx, self.num_bins, "threshold index")
-        return self.tok2id[f"TH_{idx}"]
+        self._check_bounds(idx, self.v.num_bins, "threshold")
+        return self.v.threshold_start + idx
 
-    def encode_leaf(self, idx: int = 0) -> int:
-        """Encode a leaf marker token."""
-        self._check(idx, self.num_leaves, "leaf index")
-        key = "LEAF" if self.num_leaves == 1 else f"LEAF_{idx}"
-        return self.tok2id[key]
+    def encode_leaf(self, idx: int) -> int:
+        self._check_bounds(idx, self.v.num_leaves, "leaf")
+        return self.v.leaf_start + idx
 
+    # decode helpers ---------------------------------------------------- #
+    @lru_cache(maxsize=4096)
     def decode_one(self, tid: int) -> Tuple[str, int]:
-        """Convert a non-special token ID to its (type, index)."""
-        if tid <= self.EOS or tid >= len(self.id2tok):
-            raise ValueError(f"Invalid token ID: {tid}")
-        tok = self.id2tok[tid]
-        if tok.startswith("F_"):
-            return "feature", int(tok.split("_")[1])
-        if tok.startswith("TH_"):
-            return "threshold", int(tok.split("_")[1])
-        if tok.startswith("LEAF"):
-            # for both LEAF and LEAF_k
-            parts = tok.split("_")
-            idx = int(parts[1]) if len(parts) > 1 else 0
-            return "leaf", idx
-        # should not reach here
-        raise ValueError(f"Unknown token string: {tok}")
+        """Inverse of the *encode_* helpers.
+
+        Returns
+        -------
+        (kind, index) where kind ∈ {"feature", "threshold", "leaf"}
+        """
+        if tid < 0 or tid >= len(self):
+            raise ValueError(f"Invalid token id: {tid}")
+
+        if tid in (self.PAD, self.BOS, self.EOS):
+            raise ValueError("Special tokens do not decode to (kind, index).")
+
+        if tid < self.v.threshold_start:
+            return "feature", tid - self.v.feature_start
+        if tid < self.v.leaf_start:
+            return "threshold", tid - self.v.threshold_start
+        return "leaf", tid - self.v.leaf_start
 
     def decode(self, ids: List[int]) -> List[Tuple[str, int]]:
-        """Decode a sequence of IDs, skipping PAD/BOS/EOS."""
-        out: List[Tuple[str,int]] = []
-        for tid in ids:
-            if tid in (self.PAD, self.BOS, self.EOS):
-                continue
-            out.append(self.decode_one(tid))
-        return out
+        """Decodes a *sequence* of token IDs, skipping special tokens."""
+        return [
+            self.decode_one(i)
+            for i in ids
+            if i not in (self.PAD, self.BOS, self.EOS)
+        ]
 
-    def _check(self, idx: int, size: int, name: str) -> None:
-        """Ensure 0 <= idx < size."""
-        if idx < 0 or idx >= size:
-            raise IndexError(f"{name} {idx} out of range [0, {size}).")
+    # ------------------------------------------------------------------ #
+    # Dunder methods
+    # ------------------------------------------------------------------ #
+    def __len__(self) -> int:  # `len(tok)` == vocab size
+        return self.v.size
 
-    def __len__(self) -> int:
-        """Vocabulary size."""
-        return len(self.id2tok)
+    def __repr__(self) -> str:  # pragma: no cover
+        return (
+            "Tokenizer(vocab_size={v}, features={f}, bins={b}, leaves={l})".format(
+                v=len(self),
+                f=self.v.num_features,
+                b=self.v.num_bins,
+                l=self.v.num_leaves,
+            )
+        )
+
+    # ------------------------------------------------------------------ #
+    # Private utilities
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _check_bounds(idx: int, upper: int, label: str) -> None:
+        if not (0 <= idx < upper):
+            raise ValueError(f"{label} index {idx} out of range [0, {upper})")
+
