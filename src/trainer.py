@@ -66,6 +66,7 @@ class Trainer:
         self.tokenizer: Optional[Tokenizer] = None
         self.ensemble: list[list[list[int]]] = []
         self.y_mean: float = 0.0
+        self.pf: Optional[PolicyPaperMLP] = None # Policy network
 
     # --------------------------------------------------------------------- #
     # fit
@@ -96,6 +97,7 @@ class Trainer:
         pf = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
         pb = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
         pf = torch.jit.script(pf); pb = torch.jit.script(pb)
+        self.pf = pf # Store policy network
         with torch.no_grad():
             pf.head_tok.bias.copy_(prior_bias)
             pb.head_tok.bias.copy_(prior_bias)
@@ -262,6 +264,116 @@ class Trainer:
             inference_residuals -= self.cfg.boosting_lr * avg_train_preds_for_round
             
         return final_test_preds.cpu().numpy()
+
+    # ------------------------------------------------------------------ #
+    # NEW: Policy-Based Inference
+    # ------------------------------------------------------------------ #
+    def _generate_tree_from_policy(self, env: TabularEnv, temperature: float = 1.0) -> Optional[List[int]]:
+        """
+        Generates a single tree sequence by sampling from the policy network (pf).
+        """
+        c = self.cfg
+        v = self.tokenizer.v
+        device = c.device
+
+        env.reset(c.batch_size)
+        seq = [v.BOS]
+        open_leaf_depths = deque([0])
+
+        with torch.no_grad():
+            while not env.done:
+                if not open_leaf_depths:
+                    break  # Should not happen if logic is correct
+
+                x = torch.tensor([seq], device=device)
+                logits, _ = self.pf.forward(x)
+                logits = logits[0, -1]
+
+                mask = torch.zeros_like(logits, dtype=torch.bool)
+                current_depth = open_leaf_depths[-1]
+
+                if env.open_leaves > 0 and current_depth < c.max_depth:
+                    mask[v.split_start : v.split_start + v.num_feat] = True
+                
+                if env.open_leaves > 0:
+                    mask[v.split_start + v.num_feat + v.num_th:] = True
+
+                if not mask.any():
+                    break
+
+                tok1 = _safe_sample(logits, mask, temperature)
+                kind, idx = self.tokenizer.decode_one(tok1)
+
+                if kind == 'feat':
+                    d = open_leaf_depths.pop()
+                    open_leaf_depths.append(d + 1)
+                    open_leaf_depths.append(d + 1)
+                else: # leaf
+                    open_leaf_depths.pop()
+                
+                env.step((kind, idx))
+                seq.append(tok1)
+
+                if kind == 'feat':
+                    x2, _ = self.pf.forward(torch.tensor([seq], device=device))
+                    logits_th = x2[0, -1]
+                    th_mask = torch.zeros_like(logits_th, dtype=torch.bool)
+                    th_mask[v.split_start + v.num_feat : v.split_start + v.num_feat + v.num_th] = True
+                    tok2 = _safe_sample(logits_th, th_mask, temperature)
+                    env.step(self.tokenizer.decode_one(tok2))
+                    seq.append(tok2)
+
+        seq.append(v.EOS)
+
+        if env.open_leaves == 0:
+            return seq
+        return None
+
+    def predict_from_policy(self, df_test: pd.DataFrame, df_train: pd.DataFrame, n_trees: int) -> np.ndarray:
+        """
+        Generates `n_trees` directly from the policy network at inference time to make predictions.
+        """
+        if self.tokenizer is None or self.pf is None:
+            raise RuntimeError("The trainer has not been fitted, or the policy network (pf) is missing.")
+
+        c = self.cfg
+        device = c.device
+
+        # This env is just for featurizing data and getting original targets.
+        env = TabularEnv(
+            df_train, feature_cols=c.feature_cols, target_col=c.target_col, n_bins=c.n_bins, device=device
+        )
+        
+        X_te_binned = env._featurise(df_test, df_train, c.feature_cols, c.n_bins)
+        final_test_preds = torch.zeros(len(df_test), device=device)
+        
+        X_tr_binned = env.X_full.clone()
+        y_tr_true = env.y_full.clone()
+        
+        print(f"\n--- Generating {n_trees} trees from policy network for inference. ---")
+        
+        generated_trees = 0
+        with tqdm(total=n_trees, desc="Generating Trees") as pbar:
+            while generated_trees < n_trees:
+                # Create a clean environment for each tree generation to ensure a reset state
+                tree_gen_env = TabularEnv(
+                    df_train, feature_cols=c.feature_cols, target_col=c.target_col, n_bins=c.n_bins, device=device
+                )
+                tree_seq = self._generate_tree_from_policy(tree_gen_env)
+                if tree_seq:
+                    # For policy inference, we predict on the original target values, not residuals
+                    predictor = get_tree_predictor(tree_seq, X_tr_binned, y_tr_true, self.tokenizer)
+                    final_test_preds += predictor(X_te_binned)
+                    generated_trees += 1
+                    pbar.update(1)
+
+        if generated_trees > 0:
+            final_test_preds /= generated_trees
+        
+        final_test_preds += self.y_mean
+
+        return final_test_preds.cpu().numpy()
+
 
     # ------------------------------------------------------------------ #
     # sklearn helpers
