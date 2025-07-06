@@ -1,240 +1,267 @@
-"""trainer.py – Core DT‑GFN trainer (library mode, multi‑tree ensemble)
-====================================================================
-A **library‑style** DT‑GFN implementation that learns a GFlowNet over
-partial tree paths and can *sample* full decision trees for inference on
-Numerai regression targets.
+"""trainer.py – Core DT-GFN trainer with stabilized loss and per-epoch scoring.
+==============================================================================
+This module implements the main training and inference logic for DT-GFN.
 
-Key points
-----------
-* Gaussian‑NIG closed‑form reward (see `reward.py`).
-* Off‑policy Trajectory Balance with replay buffer.
-* **True tree inference** – each tree routes every row to exactly one
-  leaf and uses the leaf’s posterior mean; an ensemble averages across
-  trees.
-
-This file intentionally omits a CLI; import `DTGFNTrainer` in your own
-wrapper (e.g. a scikit‑learn `Estimator`).
+Key Enhancements:
+- Stabilized Trajectory Balance (TB) loss with a learnable log-partition
+  function (log_z) and robust reward normalization.
+- Live correlation scoring on the training set after each epoch.
+- Correct reward integration using exact leaf statistics.
+- Fully vectorized `_calculate_tb_loss` for high performance.
 """
 from __future__ import annotations
-
-from dataclasses import dataclass, field
-from typing import List, Sequence
+from dataclasses import dataclass
+from typing import List, Sequence, Tuple
 import random
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
-from .binner import Binner
 from .tokenizer import Tokenizer
 from .tree import DecisionRule, PartialTree, Tree
-from .reward import (
-    RewardConfig,
-    precompute_stats,
-    partial_tree_log_reward,
-)
-
-# ---------------------------------------------------------------------------
-# 0.  Config dataclasses
-# ---------------------------------------------------------------------------
+from .reward import RewardConfig, partial_tree_log_reward
 
 autocast_device = "cuda" if torch.cuda.is_available() else "cpu"
 
-
-@dataclass(slots=True)
+@dataclass
 class TrainerConfig:
-    hidden_dim: int = 128
-    depth_limit: int = 6
-    epochs: int = 3
-    batch_size: int = 1024  # gradient steps per epoch = replay_size / batch_size
-    replay_size: int = 4096
-    lr: float = 1e-3
-    epsilon: float = 0.2  # exploration prob for ε‑greedy
-    leaves_per_tree: int = 8
+    """Configuration for the DT-GFN Trainer."""
+    hidden_dim: int = 256
+    depth_limit: int = 8
+    epochs: int = 50
+    batch_size: int = 1024
+    replay_size: int = 16384
+    lr: float = 3e-4
+    epsilon: float = 0.1
+    rollouts_per_epoch: int = 4096
     device: str = autocast_device
 
-
-# ---------------------------------------------------------------------------
-# 1.  Policy network
-# ---------------------------------------------------------------------------
-
 class PolicyNet(nn.Module):
-    """Tiny 2‑head MLP that predicts next‑action logits + stop logit."""
-
+    """Predicts next-action logits and a stop logit from a sequence of tokens."""
     def __init__(self, vocab_size: int, hidden_dim: int):
         super().__init__()
-        self.embed = nn.Embedding(vocab_size, hidden_dim)
-        self.body = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim)
-        )
-        self.rule_head = nn.Linear(hidden_dim, vocab_size)  # for choosing next token
-        self.stop_head = nn.Linear(hidden_dim, 1)  # for deciding to terminate
+        self.embedding = nn.Embedding(vocab_size, hidden_dim, padding_idx=0)
+        self.lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True, num_layers=2, dropout=0.1)
+        self.action_head = nn.Linear(hidden_dim, vocab_size)
+        self.stop_head = nn.Linear(hidden_dim, 1)
 
-    def forward(self, tokens: torch.LongTensor):
-        # tokens: [B, L]
-        x = self.embed(tokens).mean(dim=1)  # simple bag‑of‑tokens pooling
-        h = self.body(x)
-        return self.rule_head(h), self.stop_head(h).squeeze(-1)
-
-
-# ---------------------------------------------------------------------------
-# 2.  Replay buffer util
-# ---------------------------------------------------------------------------
+    def forward(self, tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        embedded = self.embedding(tokens)
+        lstm_out, _ = self.lstm(embedded)
+        last_hidden_state = lstm_out[:, -1, :]
+        action_logits = self.action_head(last_hidden_state)
+        stop_logit = self.stop_head(last_hidden_state).squeeze(-1)
+        return action_logits, stop_logit
 
 @dataclass(slots=True)
 class ReplaySample:
-    state_tokens: torch.LongTensor  # [L]
-    action_token: int  # the token chosen at this state
+    """A single state-action-reward transition stored in the replay buffer."""
+    state_tokens: torch.Tensor
+    action_token: int
     log_reward: float
-
+    is_terminal: bool
 
 class ReplayBuffer:
+    """A simple circular buffer for storing off-policy experience."""
     def __init__(self, capacity: int):
         self.capacity = capacity
-        self.mem: List[ReplaySample] = []
+        self.memory: List[ReplaySample] = []
+        self.position = 0
 
     def add(self, sample: ReplaySample):
-        if len(self.mem) >= self.capacity:
-            self.mem.pop(0)
-        self.mem.append(sample)
+        if len(self.memory) < self.capacity:
+            self.memory.append(sample)
+        else:
+            self.memory[self.position] = sample
+        self.position = (self.position + 1) % self.capacity
 
-    def sample_batch(self, batch_size: int) -> List[ReplaySample]:
-        return random.sample(self.mem, min(batch_size, len(self.mem)))
+    def sample(self, batch_size: int) -> List[ReplaySample]:
+        return random.sample(self.memory, min(batch_size, len(self.memory)))
 
-
-# ---------------------------------------------------------------------------
-# 3.  Main trainer class
-# ---------------------------------------------------------------------------
+    def __len__(self) -> int:
+        return len(self.memory)
 
 class DTGFNTrainer:
     def __init__(
         self,
-        X_bin: torch.LongTensor,
+        X_bin: torch.Tensor,
         y: torch.Tensor,
         tokenizer: Tokenizer,
         reward_cfg: RewardConfig,
         t_cfg: TrainerConfig | None = None,
-    ) -> None:
-        self.X_bin = X_bin.to(reward_cfg.device)
-        self.y = y.to(reward_cfg.device)
-        self.tok = tokenizer
-        self.rcfg = reward_cfg
+    ):
         self.cfg = t_cfg or TrainerConfig()
         self.device = torch.device(self.cfg.device)
-
-        self.stats = precompute_stats(self.X_bin, self.y, self.tok.n_bins())
-        self.policy = PolicyNet(self.tok.vocab_size, self.cfg.hidden_dim).to(self.device)
-        self.opt = AdamW(self.policy.parameters(), lr=self.cfg.lr)
+        self.X_bin = X_bin.to(self.device)
+        self.y = y.to(self.device)
+        self.tok = tokenizer
+        self.rcfg = reward_cfg
+        
+        self.policy = PolicyNet(len(self.tok), self.cfg.hidden_dim).to(self.device)
+        # CRUCIAL FIX: Add a learnable log-partition function `log_z`
+        self.log_z = nn.Parameter(torch.zeros(1, device=self.device))
+        
+        # Combine parameters for the optimizer
+        params = list(self.policy.parameters()) + [self.log_z]
+        self.optimizer = AdamW(params, lr=self.cfg.lr)
+        
         self.buffer = ReplayBuffer(self.cfg.replay_size)
+        self.trained_ensemble: List[Tree] | None = None
 
-    # --------------------------- rollouts --------------------------- #
+    def _sample_action(self, pt: PartialTree, is_feature_step: bool, use_epsilon: bool = True) -> int:
+        """Samples the next action token using epsilon-greedy strategy."""
+        if use_epsilon and (random.random() < self.cfg.epsilon or pt.is_terminal()):
+            return self.tok.EOS
 
-    def _sample_action(self, pt: PartialTree) -> int:
-        """ε‑greedy pick of next token (or EOS)."""
-        if random.random() < self.cfg.epsilon or pt.is_terminal(self.cfg.depth_limit):
-            return self.tok.eos_id
-        # model‑based
-        tokens = pt.to_tokens(self.tok).unsqueeze(0).to(self.device)
-        rule_logits, stop_logit = self.policy(tokens)
-        # concat rule+stop into one categorical distribution
-        logits = torch.cat([stop_logit, rule_logits.squeeze(0)], dim=0)  # [1+V]
-        probs = torch.softmax(logits, dim=0)
-        action_idx = torch.multinomial(probs, 1).item()
-        if action_idx == 0:
-            return self.tok.eos_id
-        return action_idx - 1  # shift because of stop logit at 0
-
-    def rollout(self):
-        pt = PartialTree(())
-        while True:
-            a_token = self._sample_action(pt)
-            log_r = partial_tree_log_reward(pt, self.stats, self.rcfg)
-            self.buffer.add(
-                ReplaySample(state_tokens=pt.to_tokens(self.tok), action_token=a_token, log_reward=log_r)
-            )
-            if a_token == self.tok.eos_id or pt.is_terminal(self.cfg.depth_limit):
-                break
-            # decode action token to feature,threshold tuple
-            f_id, thr_id = self.tok.decode_rule(a_token)
-            pt = PartialTree(pt.rules + (DecisionRule(f_id, thr_id),))
-
-    # --------------------------- training --------------------------- #
-
-    def train(self):
-        pbar = tqdm(range(self.cfg.epochs), desc="epoch", position=0)
-        for _ in pbar:
-            # generate new rollouts
-            for _ in range(self.cfg.batch_size):
-                self.rollout()
-            # gradient steps
-            batch = self.buffer.sample_batch(self.cfg.batch_size)
-            if not batch:
-                continue
-            loss = self._tb_loss(batch)
-            self.opt.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
-            self.opt.step()
-            pbar.set_postfix({"TB_loss": loss.item(), "corr": f"{self.score_corr():.4f}"})
-
-    def _tb_loss(self, batch: Sequence[ReplaySample]):
-        # simple TB: log P_F – log P_B – log R  => minimise squared error
-        losses = []
-        for sample in batch:
-            tokens = sample.state_tokens.unsqueeze(0).to(self.device)
-            rule_logits, stop_logit = self.policy(tokens)
-            if sample.action_token == self.tok.eos_id:
-                log_pf = stop_logit.squeeze(0)
+        with torch.no_grad():
+            tokens = pt.to_tokens(self.tok, add_special=True).unsqueeze(0).to(self.device)
+            action_logits, stop_logit = self.policy(tokens)
+            
+            valid_mask = torch.zeros_like(action_logits, dtype=torch.bool)
+            if is_feature_step:
+                valid_mask[:, self.tok.v.feature_start:self.tok.v.threshold_start] = True
             else:
-                log_pf = rule_logits.squeeze(0)[sample.action_token]
-            log_pb = -np.log(len(sample.state_tokens))  # uniform backward
-            losses.append((log_pf + log_pb - sample.log_reward) ** 2)
-        return torch.stack(losses).mean()
+                valid_mask[:, self.tok.v.threshold_start:self.tok.v.leaf_start] = True
+            
+            masked_logits = action_logits.masked_fill(~valid_mask, -float('inf'))
+            all_logits = torch.cat([stop_logit.unsqueeze(-1), masked_logits], dim=-1)
+            probs = torch.softmax(all_logits, dim=-1)
+            
+            action_idx = torch.multinomial(probs, 1).item()
+            return self.tok.EOS if action_idx == 0 else (action_idx - 1)
 
-    # --------------------------- inference helpers --------------------------- #
+    def _rollout(self):
+        """Performs a single trajectory rollout to generate training samples."""
+        pt = PartialTree(rules=(), depth_limit=self.cfg.depth_limit)
+        
+        while not pt.is_terminal():
+            feature_token = self._sample_action(pt, is_feature_step=True)
+            log_r = partial_tree_log_reward(pt, self.X_bin, self.y, self.rcfg)
+            self.buffer.add(ReplaySample(pt.to_tokens(self.tok, add_special=True), feature_token, log_r, pt.is_terminal()))
+            if feature_token == self.tok.EOS: break
+            
+            threshold_token = self._sample_action(pt, is_feature_step=False)
+            self.buffer.add(ReplaySample(pt.to_tokens(self.tok, add_special=True), threshold_token, log_r, pt.is_terminal()))
+            if threshold_token == self.tok.EOS: break
+            
+            feature_idx = self.tok.decode_one(feature_token)[1]
+            threshold_idx = self.tok.decode_one(threshold_token)[1]
+            rule = DecisionRule(feature=feature_idx, threshold_id=threshold_idx)
+            pt = PartialTree(rules=pt.rules + (rule,), depth_limit=self.cfg.depth_limit)
 
-    def _predict_tree(self, tree: Tree) -> torch.Tensor:
-        """Vectorised prediction for *one* Tree on stored X_bin."""
-        preds = torch.zeros_like(self.y)
-        assigned = torch.zeros_like(self.y, dtype=torch.bool)
-        for leaf in tree.leaves:
-            mask = leaf.apply(self.X_bin)
-            sum_y = self.y[mask].sum()
-            n = mask.sum()
-            mu = (sum_y / max(n, 1)).item() if n > 0 else 0.0
-            preds[mask] = mu * tree.weight
-            assigned |= mask
-        # optional: if any rows not assigned (shouldn't happen), keep 0.0
-        return preds
+    def train(self, num_ensemble_trees=200, leaves_per_tree=16):
+        """Main training loop with per-epoch correlation scoring."""
+        pbar = tqdm(range(self.cfg.epochs), desc="Epoch", leave=True)
+        for epoch in pbar:
+            self.policy.train()
+            for _ in range(self.cfg.rollouts_per_epoch):
+                self._rollout()
+            
+            if len(self.buffer) < self.cfg.batch_size:
+                continue
 
-    def sample_ensemble(self, num_trees: int, leaves_per_tree: int | None = None) -> List[Tree]:
-        leaves_per_tree = leaves_per_tree or self.cfg.leaves_per_tree
+            batch = self.buffer.sample(self.cfg.batch_size)
+            loss = self._calculate_tb_loss(batch)
+            
+            # Stability check before backpropagation
+            if torch.isfinite(loss):
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+                self.optimizer.step()
+            
+            self.policy.eval()
+            train_corr = self.score_correlation(num_probe_trees=10, leaves_per_tree=leaves_per_tree)
+            pbar.set_postfix({"TB Loss": f"{loss.item():.4f}", "Train Corr": f"{train_corr:.4f}"})
+        
+        self.trained_ensemble = self.sample_ensemble(num_ensemble_trees, leaves_per_tree)
+
+    def _calculate_tb_loss(self, batch: Sequence[ReplaySample]) -> torch.Tensor:
+        """Calculates the stabilized Trajectory Balance loss."""
+        
+        max_len = max(s.state_tokens.size(0) for s in batch) if batch else 1
+        states = torch.full((len(batch), max_len), self.tok.PAD, dtype=torch.long, device=self.device)
+        for i, s in enumerate(batch):
+            states[i, :s.state_tokens.size(0)] = s.state_tokens
+
+        actions = torch.tensor([s.action_token for s in batch], dtype=torch.long, device=self.device)
+        log_rewards = torch.tensor([s.log_reward for s in batch], dtype=torch.float32, device=self.device)
+
+        # CRUCIAL FIX: Normalize log_rewards to be zero-mean, unit-variance.
+        # This prevents the scale of rewards from dominating the loss.
+        if len(log_rewards) > 1:
+            log_rewards = (log_rewards - log_rewards.mean()) / (log_rewards.std() + 1e-8)
+
+        action_logits, stop_logits = self.policy(states)
+        
+        all_logits = torch.cat([stop_logits.unsqueeze(-1), action_logits], dim=-1)
+        log_probs = torch.log_softmax(all_logits, dim=-1)
+        action_indices = torch.where(actions == self.tok.EOS, 0, actions + 1).unsqueeze(-1)
+        log_pf = torch.gather(log_probs, 1, action_indices).squeeze(-1)
+        
+        # A safer log_pb calculation
+        num_parents = (states != self.tok.PAD).sum(dim=1).float()
+        log_pb = -torch.log(num_parents.clamp(min=1.0))
+        
+        # CRUCIAL FIX: Use the full Trajectory Balance objective with the learnable log_z
+        squared_error = (self.log_z + log_pf - log_rewards - log_pb).pow(2)
+        
+        return squared_error.mean()
+
+    def sample_ensemble(self, num_trees: int, leaves_per_tree: int) -> List[Tree]:
+        """Samples an ensemble of full trees from the trained policy."""
+        self.policy.eval()
         ensemble: List[Tree] = []
-        for _ in range(num_trees):
-            leaves = []
-            pt = PartialTree(())
+        pbar = tqdm(range(num_trees), desc="Sampling Final Ensemble", leave=False)
+        for _ in pbar:
+            leaves: List[PartialTree] = []
             for _ in range(leaves_per_tree):
-                # simple random rollout to get a leaf
-                while not pt.is_terminal(self.cfg.depth_limit):
-                    a_tok = self._sample_action(pt)
-                    if a_tok == self.tok.eos_id:
-                        break
-                    f, thr = self.tok.decode_rule(a_tok)
-                    pt = PartialTree(pt.rules + (DecisionRule(f, thr),))
+                pt = PartialTree(rules=(), depth_limit=self.cfg.depth_limit)
+                while not pt.is_terminal():
+                    feature_token = self._sample_action(pt, is_feature_step=True, use_epsilon=False)
+                    if feature_token == self.tok.EOS: break
+                    threshold_token = self._sample_action(pt, is_feature_step=False, use_epsilon=False)
+                    if threshold_token == self.tok.EOS: break
+
+                    feature_idx = self.tok.decode_one(feature_token)[1]
+                    threshold_idx = self.tok.decode_one(threshold_token)[1]
+                    rule = DecisionRule(feature=feature_idx, threshold_id=threshold_idx)
+                    pt = PartialTree(rules=pt.rules + (rule,), depth_limit=self.cfg.depth_limit)
                 leaves.append(pt)
-            ensemble.append(Tree(tuple(leaves), weight=1.0 / num_trees))
+            
+            if leaves:
+                unique_leaves = tuple(sorted(list(set(leaves)), key=lambda p: str(p.rules)))
+                ensemble.append(Tree(leaves=unique_leaves, weight=1.0))
         return ensemble
 
-    def score_corr(self, probe_trees: int = 5):
-        """Returns Pearson correlation on the stored training set."""
-        ensemble = self.sample_ensemble(num_trees=probe_trees)
-        agg_preds = torch.zeros_like(self.y, dtype=torch.float32)
-        for t in ensemble:
-            agg_preds += self._predict_tree(t)
-        # normalise: mean 0, std 1 to mimic Numerai rank corr≈
-        preds = (agg_preds - agg_preds.mean()) / (agg_preds.std() + 1e-8)
-        target = (self.y - self.y.mean()) / (self.y.std() + 1e-8)
-        corr = torch.matmul(preds, target) / len(target)
-        return corr.item()
+    def _predict_tree(self, tree: Tree, X_data: torch.Tensor) -> torch.Tensor:
+        """Makes predictions for a single tree on a given dataset."""
+        leaf_values = []
+        for leaf in tree.leaves:
+            train_mask = leaf.apply(self.X_bin)
+            leaf_values.append(self.y[train_mask].mean() if train_mask.any() else self.y.mean())
+        
+        preds = torch.zeros(X_data.size(0), device=self.device)
+        for mask, value in zip([leaf.apply(X_data) for leaf in tree.leaves], leaf_values):
+            preds[mask] = value
+        return preds * tree.weight
 
+    def score_correlation(self, num_probe_trees: int, leaves_per_tree: int) -> float:
+        """Calculates Pearson correlation of a small probe ensemble on the training data."""
+        probe_ensemble = self.sample_ensemble(num_probe_trees, leaves_per_tree)
+        if not probe_ensemble: return 0.0
+
+        agg_preds = torch.zeros_like(self.y, dtype=torch.float32)
+        for tree in probe_ensemble:
+            agg_preds += self._predict_tree(tree, self.X_bin)
+
+        preds_mean, preds_std = agg_preds.mean(), agg_preds.std()
+        target_mean, target_std = self.y.mean(), self.y.std()
+
+        if preds_std < 1e-8 or target_std < 1e-8: return 0.0
+
+        preds_z = (agg_preds - preds_mean) / preds_std
+        target_z = (self.y - target_mean) / target_std
+        
+        return torch.dot(preds_z, target_z).item() / len(self.y)

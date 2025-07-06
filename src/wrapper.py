@@ -1,123 +1,78 @@
-"""wrapper.py – scikit-learn-compatible DT-GFN regressor
-   (dynamic-sampling version: a new ensemble is drawn on every predict)
-"""
+"""wrapper.py – scikit-learn-compatible DT-GFN regressor."""
 from __future__ import annotations
-
 import numpy as np
+import pandas as pd
 import torch
 from sklearn.base import BaseEstimator, RegressorMixin
 
-from .binner     import Binner
-from .tokenizer  import Tokenizer
-from .reward     import RewardConfig
-from .trainer    import DTGFNTrainer, TrainerConfig, Tree
-
+from src.binner import Binner
+from src.tokenizer import Tokenizer
+from src.reward import RewardConfig
+from src.trainer import DTGFNTrainer, TrainerConfig, Tree
 
 class DTGFNRegressor(BaseEstimator, RegressorMixin):
-    # ---------- constructor hyper-params -------------------------------------------------
-    def __init__(
-        self,
-        n_bins: int = 64,
-        hidden_dim: int = 128,
-        depth_limit: int = 6,
-        epochs: int = 5,
-        replay_size: int = 4096,
-        batch_size: int = 1024,
-        lr: float = 1e-3,
-        epsilon: float = 0.2,
-        # ► sampling parameters (used every predict / score call)
-        num_trees: int = 400,
-        leaves_per_tree: int = 8,
-        device: str | None = None,
-        beta: float | None = None,
-    ):
-        # training
-        self.n_bins = n_bins
-        self.hidden_dim = hidden_dim
-        self.depth_limit = depth_limit
-        self.epochs = epochs
-        self.replay_size = replay_size
-        self.batch_size = batch_size
-        self.lr = lr
-        self.epsilon = epsilon
-        # inference-time sampling
-        self.num_trees = num_trees
-        self.leaves_per_tree = leaves_per_tree
-        # misc
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.beta = beta  # tree size penalty
+    def __init__(self, **kwargs):
+        self.config_kwargs = kwargs
+        self._trainer: DTGFNTrainer | None = None
+        self._binner: Binner | None = None
+        self._tokenizer: Tokenizer | None = None
 
-        # objects populated by fit()
-        self._binner:    Binner      | None = None
-        self._tokenizer: Tokenizer   | None = None
-        self._trainer:   DTGFNTrainer| None = None
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        """Fits the DT-GFN model."""
+        # 1. Binner
+        self._binner = Binner(n_bins=self.get_params().get('n_bins', 64))
+        X_bin_tensor = self._binner.fit(X).transform(X)
+        y_tensor = torch.from_numpy(y.to_numpy(dtype=np.float32))
 
-    # ---------- sklearn API --------------------------------------------------------------
-    def fit(self, X: np.ndarray, y: np.ndarray):
-        # ----- numpy → tensors -----
-        X = np.asarray(X, dtype=np.float32)
-        y = np.asarray(y, dtype=np.float32)
-        # ----- binning -----
-        self._binner = Binner(n_bins=self.n_bins)
-        X_bin = self._binner.fit_transform(X)
-        X_bin_t = torch.as_tensor(X_bin, dtype=torch.long)
-        y_t     = torch.as_tensor(y,     dtype=torch.float32)
-        # ----- tokenizer -----
+        # 2. Tokenizer
         self._tokenizer = Tokenizer(
-            n_features = X_bin.shape[1],
-            n_bins     = int(X_bin.max()) + 1,
+            num_features=X.shape[1],
+            num_bins=self._binner.n_bins
         )
-        # ----- configs -----
-        r_cfg = RewardConfig(beta=self.beta or float(np.log(4)))
-        t_cfg = TrainerConfig(
-            hidden_dim      = self.hidden_dim,
-            depth_limit     = self.depth_limit,
-            epochs          = self.epochs,
-            batch_size      = self.batch_size,
-            replay_size     = self.replay_size,
-            lr              = self.lr,
-            epsilon         = self.epsilon,
-            leaves_per_tree = self.leaves_per_tree,
-            device          = self.device,
-        )
-        # ----- train -----
+        
+        # 3. Configs
+        reward_cfg = RewardConfig(beta=self.get_params().get('beta', 2.0))
+        trainer_cfg = TrainerConfig(**{k: v for k, v in self.get_params().items() if k in TrainerConfig.__annotations__})
+
+        # 4. Trainer
         self._trainer = DTGFNTrainer(
-            X_bin_t, y_t, self._tokenizer, r_cfg, t_cfg
+            X_bin=X_bin_tensor,
+            y=y_tensor,
+            tokenizer=self._tokenizer,
+            reward_cfg=reward_cfg,
+            t_cfg=trainer_cfg
         )
         self._trainer.train()
         return self
 
-    # ---------- internal helpers ---------------------------------------------------------
-    def _sample_ensemble(self) -> list[Tree]:
-        assert self._trainer is not None, "Model not fitted yet"
-        return self._trainer.sample_ensemble(
-            num_trees        = self.num_trees,
-            leaves_per_tree  = self.leaves_per_tree
-        )
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        """Generates predictions for new data."""
+        if not all([self._trainer, self._binner]):
+            raise RuntimeError("Model has not been fitted yet. Call fit() first.")
 
-    def _predict_on_bin(self, X_bin_t: torch.LongTensor) -> torch.Tensor:
-        """Average prediction over a freshly-sampled ensemble."""
-        ensemble = self._sample_ensemble()
-        preds = torch.zeros(
-            X_bin_t.shape[0], dtype=torch.float32, device=self.device
-        )
+        X_bin_tensor = self._binner.transform(X).to(self._trainer.device)
+        
+        # Sample a new ensemble for each prediction call
+        num_trees = self.get_params().get('num_trees', 100)
+        leaves_per_tree = self.get_params().get('leaves_per_tree', 8)
+        ensemble = self._trainer.sample_ensemble(num_trees, leaves_per_tree)
+        
+        if not ensemble:
+            # Fallback to mean prediction if no valid trees are sampled
+            return np.full(X.shape[0], self._trainer.y.mean().item())
+
+        total_preds = torch.zeros(X.shape[0], device=self._trainer.device)
         for tree in ensemble:
-            preds += self._trainer._predict_tree(tree, X_bin_t)
-        return preds / len(ensemble)
+            total_preds += self._trainer._predict_tree(tree, X_bin_tensor)
+            
+        return total_preds.cpu().numpy()
 
-    # ---------- public predict / score ---------------------------------------------------
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        if self._binner is None:
-            raise RuntimeError("DTGFNRegressor must be fitted first")
-        X_bin = self._binner.transform(X)
-        X_bin_t = torch.as_tensor(X_bin, dtype=torch.long, device=self.device)
-        preds_t = self._predict_on_bin(X_bin_t).cpu()
-        return preds_t.numpy()
+    def get_params(self, deep=True):
+        return self.config_kwargs
 
-    def score_corr(self, X: np.ndarray, y: np.ndarray) -> float:
-        """Numerai-style Pearson (z-scored) correlation."""
-        y_pred = self.predict(X)
-        y_pred = (y_pred - y_pred.mean()) / (y_pred.std() + 1e-8)
-        y      = (y      - y.mean()     ) / (y     .std() + 1e-8)
-        return float(np.dot(y_pred, y) / len(y))
-
+    def set_params(self, **params):
+        self.config_kwargs.update(params)
+        # Re-create config objects if trainer exists, to reflect changes
+        if self._trainer:
+            self._trainer.cfg = TrainerConfig(**{k:v for k,v in self.get_params().items() if k in TrainerConfig.__annotations__})
+        return self

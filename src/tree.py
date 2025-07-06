@@ -1,155 +1,75 @@
 """tree.py – Core tree data models for DT‑GFN
 =========================================================
-This single module contains *all* immutable, data‑only objects that
-represent decision trees at three granularities:
-
-* **DecisionRule** – atomic split (`feature ≤ threshold_id`).
-* **PartialTree**  – one *root→leaf* path (state in the GFlowNet MDP).
-* **Tree**         – a *set* of mutually‑exclusive PartialTrees (i.e. the
-  full decision tree seen by downstream inference / ensembling).
-
-They are intentionally lightweight: no training logic, no global
-singletons, and zero dependencies on Numerai‑specific code.  This makes
-unit‑testing trivial and keeps the objects reusable in other projects.
+This module contains immutable data objects representing decision trees.
 """
 from __future__ import annotations
-
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import Tuple
-
+from functools import cached_property
+from typing import Tuple, TYPE_CHECKING
 import torch
 
-# ---------------------------------------------------------------------------
-# 1. Atomic split
-# ---------------------------------------------------------------------------
-
+if TYPE_CHECKING:
+    from src.tokenizer import Tokenizer
 
 @dataclass(frozen=True, slots=True)
 class DecisionRule:
-    """Binary feature split represented *after binning*.
-
-    Parameters
-    ----------
-    feature : int
-        Column index in the *binned* feature matrix ``X_bin``.
-    threshold_id : int
-        Integer threshold in the same bin space (0 ≤ thr < n_bins).
-    """
-
+    """A binary split on a feature based on a binned threshold."""
     feature: int
     threshold_id: int
 
-    # Fast predicate --------------------------------------------------------
-    def apply(self, X_bin: torch.LongTensor) -> torch.BoolTensor:  # shape: [N, F]
-        """Return a Bool mask of rows that satisfy the rule."""
-
+    def apply(self, X_bin: torch.Tensor) -> torch.Tensor:
+        """Returns a boolean mask of rows satisfying the rule."""
         return X_bin[:, self.feature] <= self.threshold_id
 
-
-# ---------------------------------------------------------------------------
-# 2. Single path (MDP state)
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True) # <-- Fix: removed slots=True
 class PartialTree:
-    """Immutable root→leaf path used as a *state* inside DT‑GFN."""
-
+    """An immutable root-to-leaf path, representing a state in the GFN."""
     rules: Tuple[DecisionRule, ...]
     depth_limit: int = 6
 
-    # --- Convenience properties -------------------------------------------
+    @cached_property
     def n_nodes(self) -> int:
         return len(self.rules)
 
     def is_terminal(self) -> bool:
-        return self.n_nodes() >= self.depth_limit
+        return self.n_nodes >= self.depth_limit
 
-    # --- Tokenisation ------------------------------------------------------
-    def to_tokens(self, tokenizer: "Tokenizer", *, add_special: bool = True) -> torch.LongTensor:  # noqa: F821 – Tokenizer is imported at runtime
-        """Encode the path into a sequence of token IDs ready for the policy.
-
-        Special tokens ``<bos>`` and ``<eos>`` are optionally added so the
-        returned tensor can be fed directly to an autoregressive model.
-        """
-
-        ids = []
+    def to_tokens(self, tokenizer: "Tokenizer", *, add_special: bool = True) -> torch.Tensor:
+        """Encodes the path into a sequence of token IDs."""
+        tokens = []
         if add_special:
-            ids.append(tokenizer.BOS)
-        for r in self.rules:
-            ids.append(tokenizer.encode_feature(r.feature))
-            ids.append(tokenizer.encode_threshold(r.threshold_id))
+            tokens.append(tokenizer.BOS)
+        for rule in self.rules:
+            tokens.append(tokenizer.encode_feature(rule.feature))
+            tokens.append(tokenizer.encode_threshold(rule.threshold_id))
         if add_special:
-            ids.append(tokenizer.EOS)
-        return torch.as_tensor(ids, dtype=torch.long)
+            tokens.append(tokenizer.EOS)
+        return torch.tensor(tokens, dtype=torch.long)
 
-    # --- Vectorised mask ---------------------------------------------------
-    @lru_cache(maxsize=1024)
-    def _mask_fn(self) -> callable[[torch.LongTensor], torch.BoolTensor]:
-        """Return a *cached* function that applies all rules in order."""
+    def apply(self, X_bin: torch.Tensor) -> torch.Tensor:
+        """Applies all rules to a batch of binned features."""
+        if not self.rules:
+            return torch.ones(X_bin.size(0), dtype=torch.bool, device=X_bin.device)
 
-        def _apply(X_bin: torch.LongTensor) -> torch.BoolTensor:
-            mask = torch.ones(X_bin.size(0), dtype=torch.bool, device=X_bin.device)
-            for rule in self.rules:
-                mask &= rule.apply(X_bin)
-            return mask
+        mask = self.rules[0].apply(X_bin)
+        for i in range(1, len(self.rules)):
+            mask.logical_and_(self.rules[i].apply(X_bin))
+        return mask
 
-        return _apply
-
-    def apply(self, X_bin: torch.LongTensor) -> torch.BoolTensor:
-        """Apply all rules to a batch of *binned* features.
-
-        Parameters
-        ----------
-        X_bin : torch.LongTensor, shape = [N, F]
-            Pre‑binned feature matrix.
-
-        Returns
-        -------
-        torch.BoolTensor, shape = [N]
-            Mask of rows that reach this leaf.
-        """
-
-        return self._mask_fn()(X_bin)
-
-
-# ---------------------------------------------------------------------------
-# 3. Full tree (collection of leaves)
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True) # <-- Fix: removed slots=True
 class Tree:
-    """A *complete* decision tree assembled from PartialTrees.
-
-    Notes
-    -----
-    * Immutability allows safe sharing across processes & replay buffers.
-    * ``weight`` can store importance in an ensemble; default 1.0.
-    """
-
+    """A complete decision tree, assembled from a set of leaves."""
     leaves: Tuple[PartialTree, ...]
     weight: float = 1.0
 
-    # --- Inference ---------------------------------------------------------
-    def predict_bin(self, X_bin: torch.LongTensor) -> torch.Tensor:
-        """Vectorised prediction in the *binned* space.
-
-        Each leaf votes +1 for rows that fall into it; votes are summed and
-        multiplied by ``weight``.  Downstream neutralisation rescales anyway
-        so we keep it simple (binary margin).
-        """
-
-        # Allocate on device once
+    def predict_bin(self, X_bin: torch.Tensor) -> torch.Tensor:
+        """Vectorized prediction on binned features."""
         scores = torch.zeros(X_bin.size(0), dtype=torch.float32, device=X_bin.device)
         for leaf in self.leaves:
             mask = leaf.apply(X_bin)
-            scores[mask] += 1.0
-        scores *= self.weight
-        return scores
+            scores[mask] += 1.0  # Simple vote
+        return scores * self.weight
 
-    # --- Utility -----------------------------------------------------------
+    @cached_property
     def n_leaves(self) -> int:
         return len(self.leaves)
-
