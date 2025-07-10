@@ -1,13 +1,11 @@
-# src/trainer.py
 from __future__ import annotations
 from dataclasses import dataclass, asdict
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from collections import deque
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 import math
 import random
 from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, SequentialLR
@@ -26,10 +24,6 @@ from src.utils import (
     create_gain_bias
 )
 
-
-# --------------------------------------------------------------------------- #
-# 1.  Hyper-parameters
-# --------------------------------------------------------------------------- #
 @dataclass
 class Config:
     feature_cols: List[str]
@@ -37,7 +31,7 @@ class Config:
     n_bins: int = 255
     device: str = "cuda"
 
-    # Boost-GFN
+    # Boost-GFN parameters
     updates: int = 50
     rollouts: int = 60
     batch_size: int = 8192
@@ -45,343 +39,271 @@ class Config:
     top_k_trees: int = 10
     boosting_lr: float = 0.1
 
-    # Policy net
+    # Policy network architecture
     lstm_hidden: int = 512
     mlp_layers: int = 12
     mlp_width: int = 256
     lr: float = 5e-5
 
-    # Priors & Annealing
+    # Priors & annealing
     beta_start: float = 0.35
     beta_end: float = math.log(4)
     prior_scale: float = 0.5
 
-
-# --------------------------------------------------------------------------- #
-# 2.  Trainer (fit + predict)
-# --------------------------------------------------------------------------- #
 class Trainer:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.tokenizer: Optional[Tokenizer] = None
         self.ensemble: list[list[list[int]]] = []
         self.y_mean: float = 0.0
-        self.pf: Optional[PolicyPaperMLP] = None # Policy network
+        self.pf: Optional[PolicyPaperMLP] = None
+        self.pb: Optional[PolicyPaperMLP] = None
+        self.log_z: Optional[torch.Tensor] = None
+        self.replay_buffer: Optional[ReplayBuffer] = None
 
-    # --------------------------------------------------------------------- #
-    # fit
-    # --------------------------------------------------------------------- #
     def fit(self, df_train: pd.DataFrame) -> "Trainer":
         c = self.cfg
         device = c.device
 
-        # ---- Tokenizer and Vocab -----------------------------------------
+        # --- Setup tokenizer and environment ---
         v = Vocab(len(c.feature_cols), c.n_bins, 1)
         self.tokenizer = Tokenizer(v)
-
-        # ---- Environment --------------------------------------------------
         env = TabularEnv(
             df_train,
             feature_cols=c.feature_cols,
             target_col=c.target_col,
             n_bins=c.n_bins,
-            device=device,
+            device=device
         )
-        
-        y_tr_true, X_tr_binned = env.y_full.clone(), env.X_full.clone()
+        y_true, X_binned = env.y_full.clone(), env.X_full.clone()
 
-        # ---- Gain-Based Prior ---------------------------------------------
-        prior_bias = create_gain_bias(df_train, c.feature_cols, c.target_col, self.tokenizer, c.n_bins, c.prior_scale).to(device)
+        # --- Prior bias based on gain ---
+        """
+        prior_bias = create_gain_bias(
+            df_train, c.feature_cols, c.target_col,
+            self.tokenizer, c.n_bins, c.prior_scale
+        ).to(device)
+        """
 
-        # ---- Policy Nets --------------------------------------------------
+        # --- Policy networks ---
         pf = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
         pb = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
-        pf = torch.jit.script(pf); pb = torch.jit.script(pb)
-        self.pf = pf # Store policy network
-        with torch.no_grad():
-            pf.head_tok.bias.copy_(prior_bias)
-            pb.head_tok.bias.copy_(prior_bias)
-        
+        pf = torch.jit.script(pf)
+        pb = torch.jit.script(pb)
+        #with torch.no_grad():
+        #    pf.head_tok.bias.copy_(prior_bias)
+        #    pb.head_tok.bias.copy_(prior_bias)
+        self.pf, self.pb = pf, pb
 
+        # --- Normalizer ---
         log_z = torch.zeros((), device=device, requires_grad=True)
-        optf, optb, optz = torch.optim.AdamW(pf.parameters(), lr=c.lr), torch.optim.AdamW(pb.parameters(), lr=c.lr), torch.optim.Adam([log_z], lr=c.lr/10)
+        self.log_z = log_z
+
+        # --- Optimizers and schedulers ---
+        optf = torch.optim.AdamW(pf.parameters(), lr=c.lr)
+        optb = torch.optim.AdamW(pb.parameters(), lr=c.lr)
+        optz = torch.optim.Adam([log_z], lr=c.lr/10)
         optimizers = [optf, optb, optz]
-        
-        # ---- LR Schedulers ------------------------------------------------
-        warmup_updates, t_max_val = 10, max(1, c.updates - 10)
-        warmup_schedulers = [LambdaLR(opt, lr_lambda=lambda upd: min(1.0, upd / warmup_updates)) for opt in optimizers]
-        decay_schedulers = [CosineAnnealingLR(opt, T_max=t_max_val) for opt in optimizers]
-        schedulers = [SequentialLR(opt, schedulers=[ws, ds], milestones=[warmup_updates]) for opt, ws, ds in zip(optimizers, warmup_schedulers, decay_schedulers)]
-        
-        # ---- Replay Buffer & Baseline -------------------------------------
-        buf = ReplayBuffer(capacity=10000)
-        base_prediction = torch.full_like(y_tr_true, y_tr_true.mean())
-        self.y_mean = y_tr_true.mean().item()
-        
-        BETA_ANNEAL_UPDATES, TEMP_ANNEAL_UPDATES, FL_LOSS_ANNEAL_UPDATES = 20.0, 20.0, 20.0
 
-        # ------------------------------------------------------------------ #
-        # Boost loop
-        # ------------------------------------------------------------------ #
+        warmup = 10
+        tmax = max(1, c.updates - warmup)
+        schedulers = []
+        for opt in optimizers:
+            ws = LambdaLR(opt, lr_lambda=lambda u: min(1.0, u / warmup))
+            ds = CosineAnnealingLR(opt, T_max=tmax)
+            schedulers.append(SequentialLR(opt, schedulers=[ws, ds], milestones=[warmup]))
+
+        # --- Replay buffer and baseline ---
+        buf = ReplayBuffer(capacity=100000)
+        self.replay_buffer = buf
+        base_pred = torch.full_like(y_true, y_true.mean())
+        self.y_mean = y_true.mean().item()
+
+        # --- Annealing constants ---
+        BA, TA, FA = 20.0, 20.0, 20.0
+
         print("--- Starting GFN-Boost Training ---")
-        for upd in range(1, c.updates + 1):
-            residuals, env.y = y_tr_true - base_prediction, y_tr_true - base_prediction
-            progress = min(1.0, (upd - 1) / BETA_ANNEAL_UPDATES)
-            current_beta = 0.01#c.beta_start + progress * (c.beta_end - c.beta_start)
-            temperature = max(1.0, 5.0 - (upd - 1) * (4.0 / TEMP_ANNEAL_UPDATES))
-            lam_fl = 0.1#min(1.0, upd / FL_LOSS_ANNEAL_UPDATES)
-            tb_loss_acc, fl_loss_acc, complete_rollouts_this_update = 0, 0, 0
-            
-            for opt in optimizers: opt.zero_grad()
-            
-            pbar = tqdm(range(c.rollouts), desc=f"Boosting Round {upd:02d}", leave=False)
-            for _ in pbar:
-                env.reset(c.batch_size)
-                seq = [v.BOS]
-                open_leaf_depths = deque([0]) 
-                with torch.no_grad():
-                    while not env.done:
-                        if not open_leaf_depths: break
-                        x = torch.tensor([seq], device=device)
-                        logits, _ = pf.forward(x)
-                        logits = logits[0, -1]
-                        mask = torch.zeros_like(logits, dtype=torch.bool)
-                        current_depth = open_leaf_depths[-1]
-                        if env.open_leaves > 0 and current_depth < c.max_depth:
-                            mask[v.split_start : v.split_start + v.num_feat] = True
-                        if env.open_leaves > 0:
-                            mask[v.split_start + v.num_feat + v.num_th:] = True
-                        if not mask.any(): break
-                        tok1 = _safe_sample(logits, mask, temperature)
-                        kind, idx = self.tokenizer.decode_one(tok1)
-                        if kind == 'feat':
-                            d = open_leaf_depths.pop(); open_leaf_depths.append(d + 1); open_leaf_depths.append(d + 1)
-                        else: open_leaf_depths.pop()
-                        env.step((kind, idx)); seq.append(tok1)
-                        if kind == 'feat':
-                            x2, _ = pf.forward(torch.tensor([seq], device=device))
-                            logits_th = x2[0, -1]
-                            th_mask = torch.zeros_like(logits_th, dtype=torch.bool)
-                            th_mask[v.split_start+v.num_feat : v.split_start+v.num_feat+v.num_th] = True
-                            tok2 = _safe_sample(logits_th, th_mask, temperature)
-                            env.step(self.tokenizer.decode_one(tok2)); seq.append(tok2)
-                seq.append(v.EOS)
+        for upd in tqdm(range(1, c.updates + 1), desc="Boost Updates"):
+            # Compute residuals and set environment target
+            residuals = y_true - base_pred
+            env.y = residuals.clone()
 
-                if env.open_leaves != 0: continue
-                complete_rollouts_this_update += 1
-                R, prior, _, _ = env.evaluate(current_beta)
+            tb_acc, fl_acc, complete = 0.0, 0.0, 0
+            prog = min(1.0, (upd - 1) / BA)
+            beta = 0.01#c.beta_start + prog * (c.beta_end - c.beta_start)
+            temp = max(1.0, 5.0 - (upd - 1) * (4.0 / TA))
+            lam_fl = 0.1#min(1.0, upd / FA)
+
+            # Zero gradients
+            for opt in optimizers:
+                opt.zero_grad()
+
+            # --- Forward rollouts ---
+            forward_seqs: list[tuple[list[int], float, float]] = []
+            for _ in tqdm(range(c.rollouts), desc=f"Rollouts {upd:02d}", leave=False):
+                seq = self.rollout(env, temp)
+                if seq is None:
+                    continue
+                complete += 1
+                R, prior, _, _ = env.evaluate(beta)
                 buf.add(R, seq, prior.item(), env.idxs.clone())
-                
-                tokens_fwd = torch.tensor([seq], device=device)
-                log_pf_fwd = pf.log_prob(tokens_fwd)
-                logF = pf.log_F(tokens_fwd)
-                tokens_bwd = torch.flip(tokens_fwd, dims=[1])
-                log_pb = pb.log_prob(tokens_bwd)
-                dE = deltaE_split_gain(tokens_fwd, self.tokenizer, env)
-                
-                l_tb = tb_loss(log_pf_fwd, log_pb, log_z, torch.tensor([R], device=device).unsqueeze(0), prior)
-                l_fl = fl_loss(logF, log_pf_fwd, log_pb, dE)
-                loss = l_tb + lam_fl * l_fl
-                loss.backward()
-                tb_loss_acc += l_tb.item(); fl_loss_acc += l_fl.item()
+                forward_seqs.append((seq, R, prior.item()))
 
-            did_any_backward = complete_rollouts_this_update > 0
-            if did_any_backward:
-                denom = complete_rollouts_this_update
-                torch.nn.utils.clip_grad_norm_(pf.parameters(), 1.0)
-                torch.nn.utils.clip_grad_norm_(pb.parameters(), 1.0)
-                torch.nn.utils.clip_grad_value_([log_z], 1.0)
+            # --- Backward (replay) samples ---
+            replay_seqs: list[tuple[list[int], float, float]] = []
+            if buf.data and upd > 1:
+                replay_seqs = self.sample_replay(c.top_k_trees)
+
+            # --- Compute losses and backpropagate ---
+            for seq, R, prior in forward_seqs + replay_seqs:
+                tok = torch.tensor([seq], device=device)
+                log_pf = pf.log_prob(tok)
+                log_pb = pb.log_prob(torch.flip(tok, dims=[1]))
+                R_t = torch.tensor([R], device=device)
+                pr_t = torch.tensor([prior], device=device)
+
+                # Trajectory balance loss
+                l_tb = tb_loss(log_pf, log_pb, log_z, R_t, pr_t)
+                tb_acc += l_tb.item()
+
+                # (Optional) flow loss on forward rollouts
+                l_fl = fl_loss(pf.log_F(tok), log_pf, log_pb, deltaE_split_gain(tok, self.tokenizer, env)) if R is not None else 0.0
+                fl_acc += l_fl.item() if isinstance(l_fl, torch.Tensor) else 0.0
+
+                (l_tb + lam_fl * l_fl).backward()
+
+            # --- Optimizer step ---
+            if complete > 0:
                 for opt in optimizers:
-                    for group in opt.param_groups:
-                        for param in group['params']:
-                            if param.grad is not None: param.grad /= denom
-                for opt in optimizers: opt.step()
-            
-            if did_any_backward:
-                for scheduler in schedulers: scheduler.step()
-            
+                    torch.nn.utils.clip_grad_norm_(opt.param_groups[0]['params'], 1.0)
+                    opt.step()
+                for sch in schedulers:
+                    sch.step()
+
+            # --- Update ensemble and baseline prediction ---
             if buf.data:
-                top_k_trajectories = buf.data[:c.top_k_trees]
-                top_k_sequences = [t[1] for t in top_k_trajectories]
-                self.ensemble.append(top_k_sequences)
-                avg_residual_preds = torch.zeros_like(base_prediction)
-                for best_seq in top_k_sequences:
-                    predictor = get_tree_predictor(best_seq, X_tr_binned, residuals, self.tokenizer)
-                    avg_residual_preds += predictor(X_tr_binned)
-                if len(top_k_sequences) > 0:
-                    avg_residual_preds /= len(top_k_sequences)
-                
-                base_prediction += c.boosting_lr * avg_residual_preds
-                
-                final_corr = torch.corrcoef(torch.stack([base_prediction, y_tr_true]))[0,1].item()
-                print(f"Boosting Round {upd:02d} | Comp: {complete_rollouts_this_update}/{c.rollouts} | "
-                      f"TB: {tb_loss_acc/denom if did_any_backward else 0:.4f} | FL: {fl_loss_acc/denom if did_any_backward else 0:.4f} | Train ρ: {final_corr:+.3f}")
-            else:
-                print(f"Boosting Round {upd:02d} | No complete trees generated.")
-            
+                topk = self.sample_replay(c.top_k_trees)
+                self.ensemble.append([seq for seq, _, _ in topk])
+                avg = torch.zeros_like(base_pred)
+                for seq in [seq for topk in self.ensemble for seq in topk]:
+                    avg += get_tree_predictor(seq, X_binned, residuals, self.tokenizer)(X_binned)
+                avg /= len([seq for topk in self.ensemble for seq in topk])
+                base_pred += c.boosting_lr * avg
+
+            # --- Print stats ---
+            corr = torch.corrcoef(torch.stack([base_pred, y_true]))[0, 1].item()
+            avg_tb = tb_acc / max(1, complete)
+            avg_fl = fl_acc / max(1, complete)
+            print(f"Update {upd}/{c.updates} | TB Loss: {avg_tb:.4f} | FL Loss: {avg_fl:.4f} | Train Corr: {corr:+.4f}")
+
+            # Clear buffer for next iteration
             buf.data.clear()
 
         return self
 
-    # ------------------------------------------------------------------ #
-    # predict
-    # ------------------------------------------------------------------ #
-    def predict(self, df_test: pd.DataFrame, df_train: pd.DataFrame) -> np.ndarray:
-        if self.tokenizer is None:
-            raise RuntimeError("Call fit() first.")
+    def sample_replay(self, k: int) -> list[tuple[list[int], float, float]]:
+        buf = self.replay_buffer
+        if not buf.data:
+            return []
+        entries = buf.data
+        weights = []
+        with torch.no_grad():
+            for R, seq, pr, _ in entries:
+                tok = torch.tensor([seq], device=self.cfg.device)
+                tok_bwd = torch.flip(tok, dims=[1])
+                log_pb = self.pb.log_prob(tok_bwd)  # shape (1, seq_len)
+                weights.append(log_pb.sum().exp().item())
 
-        device = self.cfg.device
-        
-        env = TabularEnv(
-            df_train,
-            feature_cols=self.cfg.feature_cols,
-            target_col=self.cfg.target_col,
-            n_bins=self.cfg.n_bins,
-            device=device,
-        )
-        
-        X_te_binned = env._featurise(df_test, df_train, self.cfg.feature_cols, self.cfg.n_bins)
-        final_test_preds = torch.full((len(df_test),), self.y_mean, device=device)
-        
-        X_tr_binned = env.X_full.clone()
-        y_tr_true = env.y_full.clone()
-        inference_residuals = y_tr_true.clone()
-        
-        print("\n--- Training finished. Starting Boosted Inference. ---")
-        for i, top_k_in_round in enumerate(tqdm(self.ensemble, desc="Building boosted ensemble")):
-            avg_train_preds_for_round, avg_test_preds_for_round = torch.zeros_like(y_tr_true), torch.zeros_like(final_test_preds)
-            if not top_k_in_round: continue
-            
-            for tree_seq in top_k_in_round:
-                predictor = get_tree_predictor(tree_seq, X_tr_binned, inference_residuals, self.tokenizer)
-                avg_train_preds_for_round += predictor(X_tr_binned)
-                avg_test_preds_for_round += predictor(X_te_binned)
-                
-            avg_train_preds_for_round /= len(top_k_in_round)
-            avg_test_preds_for_round /= len(top_k_in_round)
+        total = sum(weights)
+        k = min(k, len(entries))
+        if total > 0:
+            probs = [w / total for w in weights]
+            idxs = random.choices(range(len(entries)), weights=probs, k=k)
+        else:
+            idxs = random.sample(range(len(entries)), k)
 
-            final_test_preds += self.cfg.boosting_lr * avg_test_preds_for_round
-            inference_residuals -= self.cfg.boosting_lr * avg_train_preds_for_round
-            
-        return final_test_preds.cpu().numpy()
+        return [(entries[i][1], entries[i][0], entries[i][2]) for i in idxs]
 
-    # ------------------------------------------------------------------ #
-    # NEW: Policy-Based Inference
-    # ------------------------------------------------------------------ #
-    def _generate_tree_from_policy(self, env: TabularEnv, temperature: float = 1.0) -> Optional[List[int]]:
-        """
-        Generates a single tree sequence by sampling from the policy network (pf).
-        """
+
+    def rollout(self, env: TabularEnv, temp: float) -> Optional[list[int]]:
         c = self.cfg
         v = self.tokenizer.v
-        device = c.device
-
+        seq: list[int] = [v.BOS]
+        depths = deque([0])
         env.reset(c.batch_size)
-        seq = [v.BOS]
-        open_leaf_depths = deque([0])
 
         with torch.no_grad():
-            while not env.done:
-                if not open_leaf_depths:
-                    break  # Should not happen if logic is correct
-
-                x = torch.tensor([seq], device=device)
-                logits, _ = self.pf.forward(x)
+            while not env.done and depths:
+                x = torch.tensor([seq], device=c.device)
+                logits, _ = self.pf(x)
                 logits = logits[0, -1]
-
                 mask = torch.zeros_like(logits, dtype=torch.bool)
-                current_depth = open_leaf_depths[-1]
+                d = depths[-1]
 
-                if env.open_leaves > 0 and current_depth < c.max_depth:
+                # mask feature-vs-stop
+                if env.open_leaves > 0 and d < c.max_depth:
                     mask[v.split_start : v.split_start + v.num_feat] = True
-                
+                # mask stop-vs-backtrack
                 if env.open_leaves > 0:
-                    mask[v.split_start + v.num_feat + v.num_th:] = True
-
+                    mask[v.split_start + v.num_feat + v.num_th :] = True
                 if not mask.any():
                     break
 
-                tok1 = _safe_sample(logits, mask, temperature)
+                tok1 = _safe_sample(logits, mask, temp)
                 kind, idx = self.tokenizer.decode_one(tok1)
-
                 if kind == 'feat':
-                    d = open_leaf_depths.pop()
-                    open_leaf_depths.append(d + 1)
-                    open_leaf_depths.append(d + 1)
-                else: # leaf
-                    open_leaf_depths.pop()
-                
+                    d0 = depths.pop()
+                    depths.extend([d0 + 1, d0 + 1])
+                else:
+                    depths.pop()
+
                 env.step((kind, idx))
                 seq.append(tok1)
 
+                # threshold split
                 if kind == 'feat':
-                    x2, _ = self.pf.forward(torch.tensor([seq], device=device))
-                    logits_th = x2[0, -1]
-                    th_mask = torch.zeros_like(logits_th, dtype=torch.bool)
-                    th_mask[v.split_start + v.num_feat : v.split_start + v.num_feat + v.num_th] = True
-                    tok2 = _safe_sample(logits_th, th_mask, temperature)
+                    x2 = torch.tensor([seq], device=c.device)
+                    logits2, _ = self.pf(x2)
+                    th = logits2[0, -1]
+                    m2 = torch.zeros_like(th, dtype=torch.bool)
+                    start = v.split_start + v.num_feat
+                    m2[start : start + v.num_th] = True
+                    tok2 = _safe_sample(th, m2, temp)
                     env.step(self.tokenizer.decode_one(tok2))
                     seq.append(tok2)
 
         seq.append(v.EOS)
+        return seq if env.open_leaves == 0 else None
 
-        if env.open_leaves == 0:
-            return seq
-        return None
-
-    def predict_from_policy(self, df_test: pd.DataFrame, df_train: pd.DataFrame, n_trees: int) -> np.ndarray:
-        """
-        Generates `n_trees` directly from the policy network at inference time to make predictions.
-        """
-        if self.tokenizer is None or self.pf is None:
-            raise RuntimeError("The trainer has not been fitted, or the policy network (pf) is missing.")
-
+    def predict(self, df_test: pd.DataFrame, df_train: pd.DataFrame) -> np.ndarray:
+        if self.tokenizer is None:
+            raise RuntimeError("Call fit() first.")
         c = self.cfg
         device = c.device
+        env = TabularEnv(df_train, feature_cols=c.feature_cols, target_col=c.target_col, n_bins=c.n_bins, device=device)
+        X_te = env._featurise(df_test, df_train, c.feature_cols, c.n_bins)
+        preds = torch.full((len(df_test),), self.y_mean, device=device)
+        X_tr, y_tr = env.X_full.clone(), env.y_full.clone()
 
-        # This env is just for featurizing data and getting original targets.
-        env = TabularEnv(
-            df_train, feature_cols=c.feature_cols, target_col=c.target_col, n_bins=c.n_bins, device=device
-        )
-        
-        X_te_binned = env._featurise(df_test, df_train, c.feature_cols, c.n_bins)
-        final_test_preds = torch.zeros(len(df_test), device=device)
-        
-        X_tr_binned = env.X_full.clone()
-        y_tr_true = env.y_full.clone()
-        
-        print(f"\n--- Generating {n_trees} trees from policy network for inference. ---")
-        
-        generated_trees = 0
-        with tqdm(total=n_trees, desc="Generating Trees") as pbar:
-            while generated_trees < n_trees:
-                # Create a clean environment for each tree generation to ensure a reset state
-                tree_gen_env = TabularEnv(
-                    df_train, feature_cols=c.feature_cols, target_col=c.target_col, n_bins=c.n_bins, device=device
-                )
-                tree_seq = self._generate_tree_from_policy(tree_gen_env)
-                if tree_seq:
-                    # For policy inference, we predict on the original target values, not residuals
-                    predictor = get_tree_predictor(tree_seq, X_tr_binned, y_tr_true, self.tokenizer)
-                    final_test_preds += predictor(X_te_binned)
-                    generated_trees += 1
-                    pbar.update(1)
+        for trees in tqdm(self.ensemble, desc="Ensemble", leave=False):
+            if not trees:
+                continue
+            avg_tr = torch.zeros_like(y_tr)
+            avg_te = torch.zeros_like(preds)
+            for seq in trees:
+                pred = get_tree_predictor(seq, X_tr, y_tr, self.tokenizer)
+                avg_tr += pred(X_tr)
+                avg_te += pred(X_te)
+            avg_tr /= len(trees)
+            avg_te /= len(trees)
+            preds += c.boosting_lr * avg_te
+            y_tr -= c.boosting_lr * avg_tr
 
-        if generated_trees > 0:
-            final_test_preds /= generated_trees
-        
-        final_test_preds += self.y_mean
+        return preds.cpu().numpy()
 
-        return final_test_preds.cpu().numpy()
-
-
-    # ------------------------------------------------------------------ #
-    # sklearn helpers
-    # ------------------------------------------------------------------ #
     def get_params(self, deep=True):
         return asdict(self.cfg)
 
     def set_params(self, **params):
-        for k, v in params.items():
-            setattr(self.cfg, k, v)
+        for k, v in params.items(): setattr(self.cfg, k, v)
         return self
