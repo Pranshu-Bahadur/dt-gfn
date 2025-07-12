@@ -132,7 +132,7 @@ class Trainer:
             prog = min(1.0, (upd - 1) / BA)
             beta = 0.01#c.beta_start + prog * (c.beta_end - c.beta_start)
             temp = max(1.0, 5.0 - (upd - 1) * (4.0 / TA))
-            lam_fl = 0.1#min(1.0, upd / FA)
+            lam_fl = 0.01#min(1.0, upd / FA)
 
             # Zero gradients
             for opt in optimizers:
@@ -162,15 +162,18 @@ class Trainer:
                 R_t = torch.tensor([R], device=device)
                 pr_t = torch.tensor([prior], device=device)
 
+                R_t = deltaE_split_gain(tok, self.tokenizer, env) + 1e-8
+                
+        
                 # Trajectory balance loss
-                l_tb = tb_loss(log_pf, log_pb, log_z, R_t, pr_t)
+                l_tb = tb_loss(log_pf, log_pb, log_z, R_t.sum(), pr_t)
                 tb_acc += l_tb.item()
 
                 # (Optional) flow loss on forward rollouts
-                l_fl = fl_loss(pf.log_F(tok), log_pf, log_pb, deltaE_split_gain(tok, self.tokenizer, env)) if R is not None else 0.0
+                l_fl = fl_loss(pf.log_F(tok), log_pf, log_pb, R_t) if R_t is not None else 0.0
                 fl_acc += l_fl.item() if isinstance(l_fl, torch.Tensor) else 0.0
 
-                (l_tb + lam_fl * l_fl).backward()
+                (l_tb + l_fl * lam_fl).backward()
 
             # --- Optimizer step ---
             if complete > 0:

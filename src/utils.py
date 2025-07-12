@@ -16,45 +16,76 @@ def tb_loss(log_pf, log_pb, log_z, R, prior):
     return ((log_z + log_pf.sum(1) - (torch.log(R) + prior + log_pb.sum(1)))**2).mean()
 
 @torch.jit.script
-def fl_loss(logF, log_pf, log_pb, dE):
-    """Flow Matching Loss, batched."""
-    return ((logF[:, :-1] + log_pf - (logF[:, 1:] + log_pb - dE))**2).mean()
+def fl_loss(logF, log_pf, log_pb, dR):
+    """Flow-Matching loss with positive rewards."""
+    return (
+        (logF[:, :-1] + log_pf
+         - (logF[:, 1:] + log_pb + dR)          # was “- dE”
+        )**2
+    ).mean()
+
+# --- utils.py --------------------------------------------------------------
 
 def deltaE_split_gain(tokens, tok, env):
     """
-    Compute ΔE (negative split gain) for every transition in a batch of trajectories.
+    Compute ΔR = + split-gain (reward) for every transition in a batch
+    of trajectories — higher is better.
     """
-    y = env.y[env.idxs]; N = y.numel()
-    dE = torch.zeros(tokens.shape[1] - 1, device=y.device)
+    y  = env.y[env.idxs];       N = y.numel()
+    dR = torch.zeros(tokens.shape[1] - 1, device=y.device)
+
+    # Baseline (parent) MSE for the whole leaf
     if N > 0:
-        y2 = y * y; full_mse = (y2.mean() - y.mean() ** 2).item()
-    else: full_mse = 0.0
-    stack_rows = [torch.arange(N, device=y.device)]; stack_mse = [full_mse]
-    action_sequence = tokens[0, 1:-1].tolist(); it = iter(tok.decode(action_sequence))
-    token_idx = 0
+        full_mse = (y.mul(y).mean() - y.mean()**2).item()
+    else:
+        full_mse = 0.0
+
+    stack_rows = [torch.arange(N, device=y.device)]
+    stack_mse  = [full_mse]
+
+    action_sequence = tokens[0, 1:-1].tolist()
+    it             = iter(tok.decode(action_sequence))
+    token_idx      = 0
+
     for kind, idx in it:
         if kind == "feat":
             token_idx += 1
-            try: _, th = next(it)
-            except StopIteration: break
-            if not stack_rows: break
-            parent_rows = stack_rows.pop(); parent_mse = stack_mse.pop()
-            fv = env.X_full[env.idxs[parent_rows], idx]; mask = fv <= th
-            L_rows = parent_rows[mask]; R_rows = parent_rows[~mask]
-            def mse_fn(rows):
-                if rows.numel() < 2: return 0.0
-                yy = y[rows]; return ((yy*yy).mean() - yy.mean()**2).item()
-            mseL, mseR = mse_fn(L_rows), mse_fn(R_rows)
-            stack_rows.extend([R_rows, L_rows]); stack_mse.extend([mseR, mseL])
-            wL = L_rows.numel(); wR = R_rows.numel(); parent_N = wL + wR
+            try:
+                _, th = next(it)               # threshold token
+            except StopIteration:
+                break
+
+            parent_rows = stack_rows.pop()
+            parent_mse  = stack_mse.pop()
+
+            fv   = env.X_full[env.idxs[parent_rows], idx]
+            mask = fv <= th
+            L_rows, R_rows = parent_rows[mask], parent_rows[~mask]
+
+            def mse(rows):
+                if rows.numel() < 2:
+                    return 0.0
+                yy = y[rows]
+                return ((yy * yy).mean() - yy.mean()**2).item()
+
+            mseL, mseR = mse(L_rows), mse(R_rows)
+            stack_rows.extend([R_rows, L_rows])
+            stack_mse.extend([mseR,  mseL])
+
+            wL, wR      = L_rows.numel(), R_rows.numel()
+            parent_N    = wL + wR
             if parent_N > 0:
-                gain = parent_mse - (wL/parent_N * mseL + wR/parent_N * mseR)
-                dE[token_idx] = -gain
+                gain = parent_mse - (wL / parent_N * mseL + wR / parent_N * mseR)
+                dR[token_idx] = gain          # <-- POSITIVE reward
             token_idx += 1
-        else:
-            if stack_rows: stack_rows.pop(); stack_mse.pop()
+
+        else:  # "end-leaf"
+            if stack_rows:
+                stack_rows.pop(); stack_mse.pop()
             token_idx += 1
-    return dE.unsqueeze(0)
+
+    return dR.unsqueeze(0)
+
 
 def get_tree_predictor(traj, X_binned, y_target, tok):
     """
@@ -120,10 +151,49 @@ class ReplayBuffer:
         if len(self.data) > self.capacity: self.data.pop()
     def sample(self, k): return random.sample(self.data, min(k, len(self.data)))
 
-def _safe_sample(logits, mask, temperature):
-    """Masked, temperature-controlled sampling from logits."""
-    logits = logits / temperature; masked = torch.where(mask, logits, torch.tensor(-1e9, device=logits.device))
-    probs = torch.softmax(masked, dim=-1); return torch.multinomial(probs, 1).item()
+import torch
+import torch.nn.functional as F
+
+END_TOKEN = 2   # whatever your tokenizer uses
+EPS       = 1e-9
+
+def _safe_sample(logits: torch.Tensor,
+                 mask:   torch.Tensor,
+                 temperature: float = 1.0,
+                 fallback: str = "end") -> int:
+    """
+    Sample an action index safely.
+    • logits:      [A] tensor of raw scores.
+    • mask:        [A] bool tensor – True  ⟹ keep    • False ⟹ illegal action
+    • temperature: >0
+    • fallback:    "end" → return END_TOKEN
+                   "greedy" → argmax over *all* logits
+                   "error"  → raise ValueError
+    """
+    # 1. apply temperature
+    logits = logits / max(temperature, EPS)
+
+    # 2. mask out illegal actions
+    logits = logits.masked_fill(~mask, float("-inf"))
+
+    # 3. if *every* action is masked, decide what to do
+    if (~mask).all():
+        if fallback == "end":
+            return END_TOKEN
+        elif fallback == "greedy":
+            return torch.argmax(logits).item()  # identical to original logits
+        else:
+            raise ValueError("No valid actions at this state.")
+
+    # 4. numerically stable softmax
+    probs = F.softmax(logits, dim=-1)
+    if torch.isnan(probs).any() or probs.sum() < EPS:
+        # re-normalise just in case (shouldn’t happen, but prevents rare NaNs)
+        probs = torch.where(torch.isfinite(logits), torch.exp(logits), torch.zeros_like(logits))
+        probs = probs / probs.sum()
+
+    # 5. sample
+    return torch.multinomial(probs, 1).item()
 
 def create_gain_bias(df_train, feats, target, tok, bins, prior_scale=0.5) -> torch.Tensor:
     """Uses a LightGBM model to create a gain-based prior for the policy network."""
