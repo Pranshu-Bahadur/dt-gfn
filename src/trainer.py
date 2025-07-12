@@ -11,6 +11,7 @@ import random
 from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, SequentialLR
 from tqdm import tqdm
 
+# Assuming these imports are in the correct path
 from src.tokenizer import Tokenizer, Vocab
 from src.env import TabularEnv
 from src.policy import PolicyPaperMLP
@@ -20,7 +21,7 @@ from src.utils import (
     fl_loss,
     _safe_sample,
     get_tree_predictor,
-    deltaE_split_gain,
+    deltaE_split_gain_GH,
     create_gain_bias
 )
 
@@ -34,7 +35,7 @@ class Config:
     # Boost-GFN parameters
     updates: int = 50
     rollouts: int = 60
-    batch_size: int = 8192
+    batch_size: int = 8192  # Note: This parameter is not used in the corrected training loop.
     max_depth: int = 7
     top_k_trees: int = 10
     boosting_lr: float = 0.1
@@ -62,137 +63,122 @@ class Trainer:
         self.replay_buffer: Optional[ReplayBuffer] = None
 
     def fit(self, df_train: pd.DataFrame) -> "Trainer":
-        c = self.cfg
-        device = c.device
+        c, device = self.cfg, self.cfg.device
+        if device == "cuda" and not torch.cuda.is_available():
+            print("⚠️  CUDA not available → falling back to CPU.")
+            device = "cpu"
 
-        # --- Setup tokenizer and environment ---
+        # ── 1. Tokenizer & environment ----------------------------------
         v = Vocab(len(c.feature_cols), c.n_bins, 1)
         self.tokenizer = Tokenizer(v)
-        env = TabularEnv(
-            df_train,
-            feature_cols=c.feature_cols,
-            target_col=c.target_col,
-            n_bins=c.n_bins,
-            device=device
-        )
-        y_true, X_binned = env.y_full.clone(), env.X_full.clone()
+        env = TabularEnv(df_train, c.feature_cols, c.target_col,
+                         c.n_bins, device=device)
+        y_true, X_bin = env.y_full, env.X_full
 
-        # --- Policy networks ---
-        pf = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
-        pb = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
-        pf = torch.jit.script(pf)
-        pb = torch.jit.script(pb)
-        self.pf, self.pb = pf, pb
+        # ── 2. Policy nets ----------------------------------------------
+        self.pf = torch.jit.script(
+            PolicyPaperMLP(v.size(), c.lstm_hidden,
+                           c.mlp_layers, c.mlp_width).to(device))
+        self.pb = torch.jit.script(
+            PolicyPaperMLP(v.size(), c.lstm_hidden,
+                           c.mlp_layers, c.mlp_width).to(device))
 
-        # --- Normalizer ---
-        log_z = torch.zeros((), device=device, requires_grad=True)
-        self.log_z = log_z
-
-        # --- Optimizers and schedulers ---
-        optf = torch.optim.AdamW(pf.parameters(), lr=c.lr)
-        optb = torch.optim.AdamW(pb.parameters(), lr=c.lr)
-        optz = torch.optim.Adam([log_z], lr=c.lr / 10)
+        # ── 3. Normaliser & optim ---------------------------------------
+        self.log_z = torch.zeros((), device=device, requires_grad=True)
+        optf = torch.optim.AdamW(self.pf.parameters(), lr=c.lr)
+        optb = torch.optim.AdamW(self.pb.parameters(), lr=c.lr)
+        optz = torch.optim.Adam([self.log_z], lr=c.lr / 10)
         optimizers = [optf, optb, optz]
 
-        warmup = 10
-        tmax = max(1, c.updates - warmup)
-        schedulers = []
-        for opt in optimizers:
-            ws = LambdaLR(opt, lr_lambda=lambda u: min(1.0, u / warmup))
-            ds = CosineAnnealingLR(opt, T_max=tmax)
-            schedulers.append(SequentialLR(opt, schedulers=[ws, ds], milestones=[warmup]))
+        warm, tmax = 10, max(1, c.updates - 10)
+        schedulers = [SequentialLR(opt, [LambdaLR(opt, lambda u: min(1,u/warm)),
+                                         CosineAnnealingLR(opt, T_max=tmax)],
+                                   milestones=[warm])
+                      for opt in optimizers]
 
-        # --- Replay buffer and baseline ---
-        buf = ReplayBuffer(capacity=100000)
-        self.replay_buffer = buf
+        # ── 4. Boosting-state -------------------------------------------
+        self.replay_buffer = ReplayBuffer(100_000)
         self.y_mean = y_true.mean().item()
-        base_pred = torch.full_like(y_true, self.y_mean)
-        
-        # --- Annealing constants ---
-        BA, TA, FA = 20.0, 20.0, 20.0
+        f_ensemble = torch.full_like(y_true, self.y_mean)   # current pred
+        BA, TA, FA = 20.0, 20.0, 20.0                       # anneal
 
-        print("--- Starting GFN-Boost Training ---")
-        for upd in tqdm(range(1, c.updates + 1), desc="Boost Updates"):
-            # Compute residuals and set environment target
-            residuals = y_true - base_pred
-            env.y = residuals.clone()
+        print(f"--- GFN-Boost training on {device} ---")
+        for upd in tqdm(range(1, c.updates + 1), desc="Boost"):
+            # residuals + GH stats for this round
+            resid = (y_true - f_ensemble).detach()
+            g = -2.0 * resid
+            h = 2.0 * torch.ones_like(g)
 
-            tb_acc, fl_acc, complete = 0.0, 0.0, 0
-            prog = min(1.0, (upd - 1) / BA)
-            beta = 0.01  # c.beta_start + prog * (c.beta_end - c.beta_start)
-            temp = max(1.0, 5.0 - (upd - 1) * (4.0 / TA))
-            lam_fl = 0.01  # min(1.0, upd / FA)
+            env.y = resid
 
-            # Zero gradients
-            for opt in optimizers:
-                opt.zero_grad()
+            # β / temperature schedules
+            beta = c.beta_start + min(1.0, (upd-1)/BA)*(c.beta_end-c.beta_start)
+            temp = max(1.0, 5.0 - (upd-1)*(4.0/TA))
+            lam_fl = min(1.0, upd / FA)
 
-            # --- Forward rollouts ---
-            forward_seqs: list[tuple[list[int], float, float]] = []
-            for _ in tqdm(range(c.rollouts), desc=f"Rollouts {upd:02d}", leave=False):
+            # ---------- gather trajectories -----------------------------
+            self.replay_buffer.data.clear()
+            fwd_trajs = []
+            
+            for _ in range(c.rollouts):
                 seq = self.rollout(env, temp)
-                if seq is None:
-                    continue
-                complete += 1
-                R, prior, _, _ = env.evaluate(beta)
-                buf.add(R, seq, prior.item(), env.idxs.clone())
-                forward_seqs.append((seq, R, prior.item()))
+                if seq:
+                    R_sum = deltaE_split_gain_GH(
+                        torch.tensor([seq], device=device),
+                        self.tokenizer, env, g, h).sum().item()
+                    self.replay_buffer.add(R_sum, seq, 0.0, None)
+                    fwd_trajs.append((seq, R_sum, 0.0))
 
-            # --- Backward (replay) samples ---
-            replay_seqs: list[tuple[list[int], float, float]] = []
-            if buf.data and upd > 1:
-                replay_seqs = self.sample_replay(c.top_k_trees)
+            rep_trajs = self.sample_replay(c.top_k_trees) if upd > 1 else []
+            all_trajs = fwd_trajs + rep_trajs
+            if not all_trajs:
+                continue
 
-            # --- Compute losses and backpropagate ---
-            for seq, R, prior in forward_seqs + replay_seqs:
+            # ---------- optimise ---------------------------------------
+            for opt in optimizers: opt.zero_grad()
+            tb_total = fl_total = 0.0
+
+            for seq, R_sum, prior in all_trajs:
                 tok = torch.tensor([seq], device=device)
-                log_pf = pf.log_prob(tok)
-                log_pb = pb.log_prob(torch.flip(tok, dims=[1]))
-                
-                # Use split gain on the current residuals as the reward
-                R_t = deltaE_split_gain(tok, self.tokenizer, env) + 1e-8
+                log_pf = self.pf.log_prob(tok)
+                log_pb = self.pb.log_prob(tok.flip(1))
+                dR = deltaE_split_gain_GH(tok, self.tokenizer, env,
+                                              g, h) + 1e-8
                 pr_t = torch.tensor([prior], device=device)
 
-                # Trajectory balance loss
-                l_tb = tb_loss(log_pf, log_pb, log_z, R_t.sum(), pr_t)
-                tb_acc += l_tb.item()
+                # FIX: Pad dR tensor if its length doesn't match log_pf
+                if dR.shape[1] < log_pf.shape[1]:
+                    padding_size = log_pf.shape[1] - dR.shape[1]
+                    # Pad with 0s on the right side (for the final transitions)
+                    dR = torch.nn.functional.pad(dR, (0, padding_size))
 
-                # (Optional) flow loss
-                l_fl = fl_loss(pf.log_F(tok), log_pf, log_pb, R_t)
-                fl_acc += l_fl.item()
+                l_tb = tb_loss(log_pf, log_pb, self.log_z, dR.sum(), pr_t)
+                l_fl = fl_loss(self.pf.log_F(tok), log_pf, log_pb, dR)
 
-                (l_tb + l_fl * lam_fl).backward()
+                tb_total += l_tb.item()
+                fl_total += l_fl.item()
+                (l_tb + lam_fl * l_fl).backward()
 
-            # --- Optimizer step ---
-            if complete > 0:
-                for opt in optimizers:
-                    torch.nn.utils.clip_grad_norm_(opt.param_groups[0]['params'], 1.0)
-                    opt.step()
-                for sch in schedulers:
-                    sch.step()
+            for opt in optimizers:
+                torch.nn.utils.clip_grad_norm_(opt.param_groups[0]['params'], 1.0)
+                opt.step()
+            for sch in schedulers: sch.step()
 
-            # --- Update ensemble and baseline prediction ---
-            if buf.data:
-                topk = self.sample_replay(c.top_k_trees)
+            # ---------- add top-k trees to ensemble ---------------------
+            topk = self.sample_replay(c.top_k_trees)
+            if topk:
                 self.ensemble.append([seq for seq, _, _ in topk])
-                
-                avg_pred_on_residuals = torch.zeros_like(base_pred)
-                for seq in topk:
-                    # Predictor is trained on the current set of residuals
-                    tree_predictor = get_tree_predictor(seq[0], X_binned, residuals, self.tokenizer)
-                    avg_pred_on_residuals += tree_predictor(X_binned)
-                
-                avg_pred_on_residuals /= len(topk)
-                base_pred += c.boosting_lr * avg_pred_on_residuals
+                delta_pred = torch.zeros_like(f_ensemble)
+                for seq, _, _ in topk:
+                    delta_pred += get_tree_predictor(
+                        seq, X_bin, resid, self.tokenizer)(X_bin)
+                f_ensemble += c.boosting_lr * delta_pred / len(topk)
 
-            # --- Print stats ---
-            corr = torch.corrcoef(torch.stack([base_pred, y_true]))[0, 1].item()
-            avg_tb = tb_acc / max(1, complete)
-            avg_fl = fl_acc / max(1, complete)
-            print(f"Update {upd}/{c.updates} | TB Loss: {avg_tb:.4f} | FL Loss: {avg_fl:.4f} | Train Corr: {corr:+.4f}")
-
-            # Clear buffer for the next boosting iteration
-            buf.data.clear()
+            # ---------- stats ------------------------------------------
+            train_corr = torch.corrcoef(torch.stack([f_ensemble, y_true]))[0,1].item()
+            n_traj = len(all_trajs)
+            tqdm.write(f"Upd {upd:02d}  TB {tb_total/n_traj:.4f}  "
+                       f"FL {fl_total/n_traj:.4f}  Corr {train_corr:+.4f}")
 
         return self
 
@@ -224,7 +210,9 @@ class Trainer:
         v = self.tokenizer.v
         seq: list[int] = [v.BOS]
         depths = deque([0])
-        env.reset(c.batch_size)
+        
+        # CORRECTED: Reset environment for a single trajectory.
+        env.reset(1)
 
         with torch.no_grad():
             while not env.done and depths:
@@ -279,26 +267,20 @@ class Trainer:
         X_te = env._featurise(df_test, df_train, c.feature_cols, c.n_bins)
         X_tr, y_tr = env.X_full.clone(), env.y_full.clone()
 
-        # --- CORRECTED PREDICTION LOGIC ---
-        # Start with the initial baseline prediction
+        # --- PREDICTION LOGIC ---
         test_predictions = torch.full((len(df_test),), self.y_mean, device=device)
         train_predictions = torch.full_like(y_tr, self.y_mean)
 
-        # Iterate through the stored ensemble, which contains one set of trees for each boosting round
         for trees_in_round in tqdm(self.ensemble, desc="Ensemble Prediction", leave=False):
             if not trees_in_round:
                 continue
 
-            # 1. Determine the residuals these trees were trained on
-            # This is the crucial step: we use the state of the ensemble *before* this round
             residuals_for_this_round = y_tr - train_predictions
 
-            # 2. Get the average prediction from this round's trees
             avg_pred_on_test = torch.zeros_like(test_predictions)
             avg_pred_on_train = torch.zeros_like(train_predictions)
 
             for seq in trees_in_round:
-                # The tree predictor needs the correct residual target it was trained on
                 predictor = get_tree_predictor(seq, X_tr, residuals_for_this_round, self.tokenizer)
                 avg_pred_on_test += predictor(X_te)
                 avg_pred_on_train += predictor(X_tr)
@@ -306,11 +288,7 @@ class Trainer:
             avg_pred_on_test /= len(trees_in_round)
             avg_pred_on_train /= len(trees_in_round)
 
-            # 3. Add this round's predictions to the total
-            # This is a stateless update to the final prediction
             test_predictions += c.boosting_lr * avg_pred_on_test
-            
-            # 4. Update the training predictions to calculate residuals for the *next* round
             train_predictions += c.boosting_lr * avg_pred_on_train
 
         return test_predictions.cpu().numpy()

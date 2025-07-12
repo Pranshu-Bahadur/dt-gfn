@@ -26,65 +26,82 @@ def fl_loss(logF, log_pf, log_pb, dR):
 
 # --- utils.py --------------------------------------------------------------
 
-def deltaE_split_gain(tokens, tok, env):
+# -------------------------------------------------------------------------
+#  ΔR with first- and second-order stats  (XGBoost-style split gain)
+# -------------------------------------------------------------------------
+def deltaE_split_gain_GH(
+        tokens:  torch.Tensor,     # [1, L]  token ids incl. BOS/EOS
+        tok,                       # Tokenizer
+        env,                       # TabularEnv  (provides X_full, idxs, ...)
+        g: torch.Tensor,           # gradient   vector[ N_total ]
+        h: torch.Tensor,           # Hessian    vector[ N_total ]
+        lam: float = 1.0,          # L2 reg λ
+        gamma: float = 0.0         # split cost γ
+) -> torch.Tensor:
     """
-    Compute ΔR = + split-gain (reward) for every transition in a batch
-    of trajectories — higher is better.
+    Per-step positive reward ΔR using gradient/Hessian formulation:
+
+        gain = ½ [ G_L²/(H_L+λ) + G_R²/(H_R+λ) − G_P²/(H_P+λ) ] − γ
+
+    Equivalent to XGBoost/LightGBM when λ,γ match.
+    Returns: 1×(L-1) tensor (no reward for BOS/EOS).
     """
-    y  = env.y[env.idxs];       N = y.numel()
-    dR = torch.zeros(tokens.shape[1] - 1, device=y.device)
+    device = tokens.device
+    seq = tokens[0, 1:-1].tolist()                      # strip BOS/EOS
+    dR  = torch.zeros(len(seq), device=device)
 
-    # Baseline (parent) MSE for the whole leaf
-    if N > 0:
-        full_mse = (y.mul(y).mean() - y.mean()**2).item()
-    else:
-        full_mse = 0.0
+    # Stack keeps (row_idx_tensor, G_sum, H_sum) for the *current* leaf
+    full_rows = env.idxs.clone()                       # rows of root leaf
+    G_root = g[full_rows].sum()
+    H_root = h[full_rows].sum()
+    stack_rows  = [full_rows]
+    stack_G     = [G_root]
+    stack_H     = [H_root]
 
-    stack_rows = [torch.arange(N, device=y.device)]
-    stack_mse  = [full_mse]
-
-    action_sequence = tokens[0, 1:-1].tolist()
-    it             = iter(tok.decode(action_sequence))
-    token_idx      = 0
-
-    for kind, idx in it:
-        if kind == "feat":
-            token_idx += 1
+    tok_iter = iter(tok.decode(seq))
+    t = 0
+    for kind, idx in tok_iter:
+        if kind == "feat":                             # split node
+            t += 1
+            # paired threshold token
             try:
-                _, th = next(it)               # threshold token
+                _, th = next(tok_iter)
             except StopIteration:
                 break
 
-            parent_rows = stack_rows.pop()
-            parent_mse  = stack_mse.pop()
+            rows_P = stack_rows.pop()
+            G_P    = stack_G.pop()
+            H_P    = stack_H.pop()
 
-            fv   = env.X_full[env.idxs[parent_rows], idx]
+            # split parent rows
+            fv   = env.X_full[rows_P, idx]
             mask = fv <= th
-            L_rows, R_rows = parent_rows[mask], parent_rows[~mask]
+            rows_L, rows_R = rows_P[mask], rows_P[~mask]
 
-            def mse(rows):
-                if rows.numel() < 2:
-                    return 0.0
-                yy = y[rows]
-                return ((yy * yy).mean() - yy.mean()**2).item()
+            G_L, H_L = g[rows_L].sum(), h[rows_L].sum()
+            G_R, H_R = G_P - G_L, H_P - H_L      # faster than re-indexing
 
-            mseL, mseR = mse(L_rows), mse(R_rows)
-            stack_rows.extend([R_rows, L_rows])
-            stack_mse.extend([mseR,  mseL])
+            # classic second-order gain
+            gain = 0.5 * (
+                (G_L*G_L)/(H_L + lam) +
+                (G_R*G_R)/(H_R + lam) -
+                (G_P*G_P)/(H_P + lam)
+            ) - gamma
+            dR[t] = max(gain, 0.0)               # keep reward ≥ 0
 
-            wL, wR      = L_rows.numel(), R_rows.numel()
-            parent_N    = wL + wR
-            if parent_N > 0:
-                gain = parent_mse - (wL / parent_N * mseL + wR / parent_N * mseR)
-                dR[token_idx] = gain          # <-- POSITIVE reward
-            token_idx += 1
-
-        else:  # "end-leaf"
+            # push children for DFS order   (R first so L is processed next)
+            stack_rows.extend([rows_R, rows_L])
+            stack_G.extend([G_R, G_L])
+            stack_H.extend([H_R, H_L])
+            t += 1
+        else:                                     # "th" or "leaf"
+            # simply pop when we finish a leaf path
             if stack_rows:
-                stack_rows.pop(); stack_mse.pop()
-            token_idx += 1
+                stack_rows.pop(); stack_G.pop(); stack_H.pop()
+            t += 1
 
     return dR.unsqueeze(0)
+
 
 
 def get_tree_predictor(traj, X_binned, y_target, tok):
