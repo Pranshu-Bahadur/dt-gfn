@@ -77,22 +77,11 @@ class Trainer:
         )
         y_true, X_binned = env.y_full.clone(), env.X_full.clone()
 
-        # --- Prior bias based on gain ---
-        """
-        prior_bias = create_gain_bias(
-            df_train, c.feature_cols, c.target_col,
-            self.tokenizer, c.n_bins, c.prior_scale
-        ).to(device)
-        """
-
         # --- Policy networks ---
         pf = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
         pb = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
         pf = torch.jit.script(pf)
         pb = torch.jit.script(pb)
-        #with torch.no_grad():
-        #    pf.head_tok.bias.copy_(prior_bias)
-        #    pb.head_tok.bias.copy_(prior_bias)
         self.pf, self.pb = pf, pb
 
         # --- Normalizer ---
@@ -102,7 +91,7 @@ class Trainer:
         # --- Optimizers and schedulers ---
         optf = torch.optim.AdamW(pf.parameters(), lr=c.lr)
         optb = torch.optim.AdamW(pb.parameters(), lr=c.lr)
-        optz = torch.optim.Adam([log_z], lr=c.lr/10)
+        optz = torch.optim.Adam([log_z], lr=c.lr / 10)
         optimizers = [optf, optb, optz]
 
         warmup = 10
@@ -116,9 +105,9 @@ class Trainer:
         # --- Replay buffer and baseline ---
         buf = ReplayBuffer(capacity=100000)
         self.replay_buffer = buf
-        base_pred = torch.full_like(y_true, y_true.mean())
         self.y_mean = y_true.mean().item()
-
+        base_pred = torch.full_like(y_true, self.y_mean)
+        
         # --- Annealing constants ---
         BA, TA, FA = 20.0, 20.0, 20.0
 
@@ -130,9 +119,9 @@ class Trainer:
 
             tb_acc, fl_acc, complete = 0.0, 0.0, 0
             prog = min(1.0, (upd - 1) / BA)
-            beta = 0.01#c.beta_start + prog * (c.beta_end - c.beta_start)
+            beta = 0.01  # c.beta_start + prog * (c.beta_end - c.beta_start)
             temp = max(1.0, 5.0 - (upd - 1) * (4.0 / TA))
-            lam_fl = 0.01#min(1.0, upd / FA)
+            lam_fl = 0.01  # min(1.0, upd / FA)
 
             # Zero gradients
             for opt in optimizers:
@@ -159,19 +148,18 @@ class Trainer:
                 tok = torch.tensor([seq], device=device)
                 log_pf = pf.log_prob(tok)
                 log_pb = pb.log_prob(torch.flip(tok, dims=[1]))
-                R_t = torch.tensor([R], device=device)
+                
+                # Use split gain on the current residuals as the reward
+                R_t = deltaE_split_gain(tok, self.tokenizer, env) + 1e-8
                 pr_t = torch.tensor([prior], device=device)
 
-                R_t = deltaE_split_gain(tok, self.tokenizer, env) + 1e-8
-                
-        
                 # Trajectory balance loss
                 l_tb = tb_loss(log_pf, log_pb, log_z, R_t.sum(), pr_t)
                 tb_acc += l_tb.item()
 
-                # (Optional) flow loss on forward rollouts
-                l_fl = fl_loss(pf.log_F(tok), log_pf, log_pb, R_t) if R_t is not None else 0.0
-                fl_acc += l_fl.item() if isinstance(l_fl, torch.Tensor) else 0.0
+                # (Optional) flow loss
+                l_fl = fl_loss(pf.log_F(tok), log_pf, log_pb, R_t)
+                fl_acc += l_fl.item()
 
                 (l_tb + l_fl * lam_fl).backward()
 
@@ -187,11 +175,15 @@ class Trainer:
             if buf.data:
                 topk = self.sample_replay(c.top_k_trees)
                 self.ensemble.append([seq for seq, _, _ in topk])
-                avg = torch.zeros_like(base_pred)
-                for seq in [seq for topk in self.ensemble for seq in topk]:
-                    avg += get_tree_predictor(seq, X_binned, residuals, self.tokenizer)(X_binned)
-                avg /= len([seq for topk in self.ensemble for seq in topk])
-                base_pred += c.boosting_lr * avg
+                
+                avg_pred_on_residuals = torch.zeros_like(base_pred)
+                for seq in topk:
+                    # Predictor is trained on the current set of residuals
+                    tree_predictor = get_tree_predictor(seq[0], X_binned, residuals, self.tokenizer)
+                    avg_pred_on_residuals += tree_predictor(X_binned)
+                
+                avg_pred_on_residuals /= len(topk)
+                base_pred += c.boosting_lr * avg_pred_on_residuals
 
             # --- Print stats ---
             corr = torch.corrcoef(torch.stack([base_pred, y_true]))[0, 1].item()
@@ -199,14 +191,14 @@ class Trainer:
             avg_fl = fl_acc / max(1, complete)
             print(f"Update {upd}/{c.updates} | TB Loss: {avg_tb:.4f} | FL Loss: {avg_fl:.4f} | Train Corr: {corr:+.4f}")
 
-            # Clear buffer for next iteration
+            # Clear buffer for the next boosting iteration
             buf.data.clear()
 
         return self
 
     def sample_replay(self, k: int) -> list[tuple[list[int], float, float]]:
         buf = self.replay_buffer
-        if not buf.data:
+        if not buf or not buf.data:
             return []
         entries = buf.data
         weights = []
@@ -214,7 +206,7 @@ class Trainer:
             for R, seq, pr, _ in entries:
                 tok = torch.tensor([seq], device=self.cfg.device)
                 tok_bwd = torch.flip(tok, dims=[1])
-                log_pb = self.pb.log_prob(tok_bwd)  # shape (1, seq_len)
+                log_pb = self.pb.log_prob(tok_bwd)
                 weights.append(log_pb.sum().exp().item())
 
         total = sum(weights)
@@ -226,7 +218,6 @@ class Trainer:
             idxs = random.sample(range(len(entries)), k)
 
         return [(entries[i][1], entries[i][0], entries[i][2]) for i in idxs]
-
 
     def rollout(self, env: TabularEnv, temp: float) -> Optional[list[int]]:
         c = self.cfg
@@ -243,10 +234,8 @@ class Trainer:
                 mask = torch.zeros_like(logits, dtype=torch.bool)
                 d = depths[-1]
 
-                # mask feature-vs-stop
                 if env.open_leaves > 0 and d < c.max_depth:
                     mask[v.split_start : v.split_start + v.num_feat] = True
-                # mask stop-vs-backtrack
                 if env.open_leaves > 0:
                     mask[v.split_start + v.num_feat + v.num_th :] = True
                 if not mask.any():
@@ -254,16 +243,16 @@ class Trainer:
 
                 tok1 = _safe_sample(logits, mask, temp)
                 kind, idx = self.tokenizer.decode_one(tok1)
+                
                 if kind == 'feat':
                     d0 = depths.pop()
                     depths.extend([d0 + 1, d0 + 1])
-                else:
+                else: # stop
                     depths.pop()
 
                 env.step((kind, idx))
                 seq.append(tok1)
 
-                # threshold split
                 if kind == 'feat':
                     x2 = torch.tensor([seq], device=c.device)
                     logits2, _ = self.pf(x2)
@@ -275,38 +264,61 @@ class Trainer:
                     env.step(self.tokenizer.decode_one(tok2))
                     seq.append(tok2)
 
-        seq.append(v.EOS)
-        return seq if env.open_leaves == 0 else None
+            seq.append(v.EOS)
+            return seq if env.open_leaves == 0 else None
 
     def predict(self, df_test: pd.DataFrame, df_train: pd.DataFrame) -> np.ndarray:
-        if self.tokenizer is None:
+        if self.tokenizer is None or not self.ensemble:
             raise RuntimeError("Call fit() first.")
+        
         c = self.cfg
         device = c.device
+
+        # --- Setup environment for featurization ---
         env = TabularEnv(df_train, feature_cols=c.feature_cols, target_col=c.target_col, n_bins=c.n_bins, device=device)
         X_te = env._featurise(df_test, df_train, c.feature_cols, c.n_bins)
-        preds = torch.full((len(df_test),), self.y_mean, device=device)
         X_tr, y_tr = env.X_full.clone(), env.y_full.clone()
 
-        for trees in tqdm(self.ensemble, desc="Ensemble", leave=False):
-            if not trees:
-                continue
-            avg_tr = torch.zeros_like(y_tr)
-            avg_te = torch.zeros_like(preds)
-            for seq in trees:
-                pred = get_tree_predictor(seq, X_tr, y_tr, self.tokenizer)
-                avg_tr += pred(X_tr)
-                avg_te += pred(X_te)
-            avg_tr /= len(trees)
-            avg_te /= len(trees)
-            preds += c.boosting_lr * avg_te
-            y_tr -= c.boosting_lr * avg_tr
+        # --- CORRECTED PREDICTION LOGIC ---
+        # Start with the initial baseline prediction
+        test_predictions = torch.full((len(df_test),), self.y_mean, device=device)
+        train_predictions = torch.full_like(y_tr, self.y_mean)
 
-        return preds.cpu().numpy()
+        # Iterate through the stored ensemble, which contains one set of trees for each boosting round
+        for trees_in_round in tqdm(self.ensemble, desc="Ensemble Prediction", leave=False):
+            if not trees_in_round:
+                continue
+
+            # 1. Determine the residuals these trees were trained on
+            # This is the crucial step: we use the state of the ensemble *before* this round
+            residuals_for_this_round = y_tr - train_predictions
+
+            # 2. Get the average prediction from this round's trees
+            avg_pred_on_test = torch.zeros_like(test_predictions)
+            avg_pred_on_train = torch.zeros_like(train_predictions)
+
+            for seq in trees_in_round:
+                # The tree predictor needs the correct residual target it was trained on
+                predictor = get_tree_predictor(seq, X_tr, residuals_for_this_round, self.tokenizer)
+                avg_pred_on_test += predictor(X_te)
+                avg_pred_on_train += predictor(X_tr)
+
+            avg_pred_on_test /= len(trees_in_round)
+            avg_pred_on_train /= len(trees_in_round)
+
+            # 3. Add this round's predictions to the total
+            # This is a stateless update to the final prediction
+            test_predictions += c.boosting_lr * avg_pred_on_test
+            
+            # 4. Update the training predictions to calculate residuals for the *next* round
+            train_predictions += c.boosting_lr * avg_pred_on_train
+
+        return test_predictions.cpu().numpy()
 
     def get_params(self, deep=True):
         return asdict(self.cfg)
 
     def set_params(self, **params):
-        for k, v in params.items(): setattr(self.cfg, k, v)
+        for k, v in params.items():
+            setattr(self.cfg, k, v)
         return self
