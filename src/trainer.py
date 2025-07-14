@@ -54,6 +54,9 @@ class Config:
     # Parallelism
     num_parallel: int = 10  # Adjust based on VRAM; 8 should fit within 40GB if current is 25GB
 
+    # RAS
+    lambda_ras: float = 0.1  # RAS penalty weight
+
 class Trainer:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -134,12 +137,13 @@ class Trainer:
             # --- Forward rollouts with GPU batching ---
             forward_tuples: list[tuple[list[int], float]] = []
             rollouts_done = 0
+            visit_counts = {}  # Shared for RAS across all rollouts in this update
             with tqdm(total=c.rollouts, desc=f"Batch Rollouts {upd:02d}", leave=False) as pbar:
                 while rollouts_done < c.rollouts:
                     batch_size = min(c.num_parallel, c.rollouts - rollouts_done)
                     
                     envs = [env_template] * batch_size
-                    batch_results = self.batched_rollout(envs, temp, residuals, beta)
+                    batch_results = self.batched_rollout(envs, temp, residuals, beta, visit_counts)
                     
                     for result in batch_results:
                         if result is None:
@@ -247,7 +251,7 @@ class Trainer:
         return [(entries[i][1], entries[i][2]) for i in idxs]
 
     def batched_rollout(
-        self, envs: List[TabularEnv], temp: float, residuals: torch.Tensor, beta: float
+        self, envs: List[TabularEnv], temp: float, residuals: torch.Tensor, beta: float, visit_counts: dict
     ) -> List[Optional[Tuple[list[int], float, torch.Tensor]]]:
         c = self.cfg
         v = self.tokenizer.v
@@ -290,6 +294,16 @@ class Trainer:
                     masks.append(mask)
                 batch_mask = torch.stack(masks)
 
+                # RAS: Penalize logits vectorized
+                state_hashes = [tuple(seqs[i]) for i in active_indices]
+                visits = torch.zeros_like(last_logits, device=device)
+                for b, h in enumerate(state_hashes):
+                    if h not in visit_counts:
+                        visit_counts[h] = torch.zeros(v.size(), device=device)
+                    visits[b] = visit_counts[h]
+                penalties = c.lambda_ras * visits
+                last_logits -= penalties * batch_mask.float()
+
                 # Sample actions for all active environments at once
                 toks1 = _safe_sample(last_logits, batch_mask, temp)
 
@@ -304,6 +318,10 @@ class Trainer:
 
                     seqs[original_idx].append(tok1)
                     local_envs[original_idx].step((kind, idx))
+
+                    # RAS update
+                    h = state_hashes[i]
+                    visit_counts[h][tok1] += 1
 
                     if kind == 'feat':
                         d0 = depths[original_idx].pop()
@@ -334,12 +352,26 @@ class Trainer:
                     th_end = th_start + v.num_th
                     th_mask[:, th_start:th_end] = True
                     
+                    # RAS for thresholds
+                    th_hashes = [tuple(seqs[i]) for i in sub_batch_active_indices]
+                    th_visits = torch.zeros_like(sub_last_logits, device=device)
+                    for b, h in enumerate(th_hashes):
+                        if h not in visit_counts:
+                            visit_counts[h] = torch.zeros(v.size(), device=device)
+                        th_visits[b] = visit_counts[h]
+                    th_penalties = c.lambda_ras * th_visits
+                    sub_last_logits -= th_penalties * th_mask.float()
+
                     toks2 = _safe_sample(sub_last_logits, th_mask, temp)
 
                     for i, original_idx in enumerate(sub_batch_active_indices):
                         tok2 = toks2[i].item()
                         seqs[original_idx].append(tok2)
                         local_envs[original_idx].step(self.tokenizer.decode_one(tok2))
+
+                        # RAS update for threshold
+                        h = th_hashes[i]
+                        visit_counts[h][tok2] += 1
 
                 active_indices = still_active_indices
 
