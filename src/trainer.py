@@ -1,7 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass, asdict
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Deque
 from collections import deque
+import copy
 
 import numpy as np
 import pandas as pd
@@ -50,6 +51,9 @@ class Config:
     beta_end: float = math.log(4)
     prior_scale: float = 0.5
 
+    # Parallelism
+    num_parallel: int = 10  # Adjust based on VRAM; 8 should fit within 40GB if current is 25GB
+
 class Trainer:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -65,17 +69,17 @@ class Trainer:
         c = self.cfg
         device = c.device
 
-        # --- Setup tokenizer and environment ---
+        # --- Setup tokenizer and environment template ---
         v = Vocab(len(c.feature_cols), c.n_bins, 1)
         self.tokenizer = Tokenizer(v)
-        env = TabularEnv(
+        env_template = TabularEnv(
             df_train,
             feature_cols=c.feature_cols,
             target_col=c.target_col,
             n_bins=c.n_bins,
             device=device
         )
-        y_true, X_binned = env.y_full.clone(), env.X_full.clone()
+        y_true, X_binned = env_template.y_full.clone(), env_template.X_full.clone()
 
         # --- Policy networks ---
         pf = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
@@ -115,7 +119,7 @@ class Trainer:
         for upd in tqdm(range(1, c.updates + 1), desc="Boost Updates"):
             # Compute residuals and set environment target
             residuals = y_true - base_pred
-            env.y = residuals.clone()
+            env_template.y = residuals.clone()
 
             tb_acc, fl_acc, complete = 0.0, 0.0, 0
             prog = min(1.0, (upd - 1) / BA)
@@ -127,30 +131,46 @@ class Trainer:
             for opt in optimizers:
                 opt.zero_grad()
 
-            # --- Forward rollouts ---
-            forward_seqs: list[tuple[list[int], float, float]] = []
-            for _ in tqdm(range(c.rollouts), desc=f"Rollouts {upd:02d}", leave=False):
-                seq = self.rollout(env, temp)
-                if seq is None:
-                    continue
-                complete += 1
-                R, prior, _, _ = env.evaluate(beta)
-                buf.add(R, seq, prior.item(), env.idxs.clone())
-                forward_seqs.append((seq, R, prior.item()))
+            # --- Forward rollouts with GPU batching ---
+            forward_tuples: list[tuple[list[int], float]] = []
+            rollouts_done = 0
+            with tqdm(total=c.rollouts, desc=f"Batch Rollouts {upd:02d}", leave=False) as pbar:
+                while rollouts_done < c.rollouts:
+                    batch_size = min(c.num_parallel, c.rollouts - rollouts_done)
+                    
+                    envs = [env_template] * batch_size
+                    batch_results = self.batched_rollout(envs, temp, residuals, beta)
+                    
+                    for result in batch_results:
+                        if result is None:
+                            continue
+                        seq, prior, idxs = result
+                        complete += 1
+                        buf.add(0.0, seq, prior, idxs)
+                        forward_tuples.append((seq, prior))
+                    
+                    rollouts_done += batch_size
+                    pbar.update(batch_size)
 
             # --- Backward (replay) samples ---
-            replay_seqs: list[tuple[list[int], float, float]] = []
+            replay_tuples: list[tuple[list[int], float]] = []
             if buf.data and upd > 1:
-                replay_seqs = self.sample_replay(c.top_k_trees)
+                replay_tuples = self.sample_replay(c.top_k_trees)
 
             # --- Compute losses and backpropagate ---
-            for seq, R, prior in forward_seqs + replay_seqs:
+            
+            # FIX: Reset the template environment. This initializes `env_template.idxs` to
+            # the full range of training samples, which is the required state for
+            # deltaE_split_gain to evaluate trajectories starting from the root.
+            env_template.reset(c.batch_size)
+            
+            for seq, prior in forward_tuples + replay_tuples:
                 tok = torch.tensor([seq], device=device)
                 log_pf = pf.log_prob(tok)
                 log_pb = pb.log_prob(torch.flip(tok, dims=[1]))
                 
                 # Use split gain on the current residuals as the reward
-                R_t = deltaE_split_gain(tok, self.tokenizer, env) + 1e-8
+                R_t = deltaE_split_gain(tok, self.tokenizer, env_template) + 1e-8
                 pr_t = torch.tensor([prior], device=device)
 
                 # Trajectory balance loss
@@ -173,16 +193,22 @@ class Trainer:
 
             # --- Update ensemble and baseline prediction ---
             if buf.data:
-                topk = self.sample_replay(c.top_k_trees)
-                self.ensemble.append([seq for seq, _, _ in topk])
+                # sample_replay returns (seq, prior) tuples
+                topk_tuples = self.sample_replay(c.top_k_trees)
+                topk_seqs = [seq for seq, _ in topk_tuples]
+                if not topk_seqs: continue
+
+                self.ensemble.append(topk_seqs)
                 
                 avg_pred_on_residuals = torch.zeros_like(base_pred)
-                for seq in topk:
+                for seq in topk_seqs:
                     # Predictor is trained on the current set of residuals
-                    tree_predictor = get_tree_predictor(seq[0], X_binned, residuals, self.tokenizer)
+                    tree_predictor = get_tree_predictor(seq, X_binned, residuals, self.tokenizer)
                     avg_pred_on_residuals += tree_predictor(X_binned)
                 
-                avg_pred_on_residuals /= len(topk)
+                if topk_seqs:
+                    avg_pred_on_residuals /= len(topk_seqs)
+
                 base_pred += c.boosting_lr * avg_pred_on_residuals
 
             # --- Print stats ---
@@ -196,14 +222,14 @@ class Trainer:
 
         return self
 
-    def sample_replay(self, k: int) -> list[tuple[list[int], float, float]]:
+    def sample_replay(self, k: int) -> list[tuple[list[int], float]]:
         buf = self.replay_buffer
         if not buf or not buf.data:
             return []
-        entries = buf.data
+        entries = list(buf.data) # entries are (R, seq, pr, idxs)
         weights = []
         with torch.no_grad():
-            for R, seq, pr, _ in entries:
+            for _, seq, _, _ in entries:
                 tok = torch.tensor([seq], device=self.cfg.device)
                 tok_bwd = torch.flip(tok, dims=[1])
                 log_pb = self.pb.log_prob(tok_bwd)
@@ -217,55 +243,117 @@ class Trainer:
         else:
             idxs = random.sample(range(len(entries)), k)
 
-        return [(entries[i][1], entries[i][0], entries[i][2]) for i in idxs]
+        # Return list of (sequence, prior)
+        return [(entries[i][1], entries[i][2]) for i in idxs]
 
-    def rollout(self, env: TabularEnv, temp: float) -> Optional[list[int]]:
+    def batched_rollout(
+        self, envs: List[TabularEnv], temp: float, residuals: torch.Tensor, beta: float
+    ) -> List[Optional[Tuple[list[int], float, torch.Tensor]]]:
         c = self.cfg
         v = self.tokenizer.v
-        seq: list[int] = [v.BOS]
-        depths = deque([0])
-        env.reset(c.batch_size)
+        num = len(envs)
+        device = c.device
+        
+        # Create independent shallow copies of the environment for each rollout
+        local_envs = [copy.copy(env) for env in envs]
+        for env in local_envs:
+            env.reset(c.batch_size)
+            env.y = residuals  # Share residuals tensor
+
+        seqs: List[List[int]] = [[v.BOS] for _ in range(num)]
+        depths: List[Deque[int]] = [deque([0]) for _ in range(num)]
+        
+        active_indices = list(range(num))
+        final_results: List[Optional[Tuple[list[int], float, torch.Tensor]]] = [None] * num
 
         with torch.no_grad():
-            while not env.done and depths:
-                x = torch.tensor([seq], device=c.device)
-                logits, _ = self.pf(x)
-                logits = logits[0, -1]
-                mask = torch.zeros_like(logits, dtype=torch.bool)
-                d = depths[-1]
-
-                if env.open_leaves > 0 and d < c.max_depth:
-                    mask[v.split_start : v.split_start + v.num_feat] = True
-                if env.open_leaves > 0:
-                    mask[v.split_start + v.num_feat + v.num_th :] = True
-                if not mask.any():
-                    break
-
-                tok1 = _safe_sample(logits, mask, temp)
-                kind, idx = self.tokenizer.decode_one(tok1)
+            while active_indices:
+                # --- Step 1: Sample Feature or Leaf action ---
                 
-                if kind == 'feat':
-                    d0 = depths.pop()
-                    depths.extend([d0 + 1, d0 + 1])
-                else: # stop
-                    depths.pop()
+                # Batch preparation
+                batch_seqs_tensors = [torch.tensor(seqs[i], device=device) for i in active_indices]
+                x_batch = torch.nn.utils.rnn.pad_sequence(batch_seqs_tensors, batch_first=True, padding_value=v.PAD)
 
-                env.step((kind, idx))
-                seq.append(tok1)
+                logits_batch, _ = self.pf(x_batch)
+                last_logits = logits_batch[:, -1, :]  # [num_active, vocab_size]
 
-                if kind == 'feat':
-                    x2 = torch.tensor([seq], device=c.device)
-                    logits2, _ = self.pf(x2)
-                    th = logits2[0, -1]
-                    m2 = torch.zeros_like(th, dtype=torch.bool)
-                    start = v.split_start + v.num_feat
-                    m2[start : start + v.num_th] = True
-                    tok2 = _safe_sample(th, m2, temp)
-                    env.step(self.tokenizer.decode_one(tok2))
-                    seq.append(tok2)
+                # Create action masks for the active environments
+                masks = []
+                for i in active_indices:
+                    env, d_q = local_envs[i], depths[i]
+                    d = d_q[-1] if d_q else c.max_depth
+                    mask = torch.zeros(v.size(), dtype=torch.bool, device=device)
+                    if env.open_leaves > 0 and d < c.max_depth:
+                        mask[v.split_start : v.split_start + v.num_feat] = True
+                    if env.open_leaves > 0:
+                        mask[v.split_start + v.num_feat + v.num_th :] = True
+                    masks.append(mask)
+                batch_mask = torch.stack(masks)
 
-            seq.append(v.EOS)
-            return seq if env.open_leaves == 0 else None
+                # Sample actions for all active environments at once
+                toks1 = _safe_sample(last_logits, batch_mask, temp)
+
+                # --- Update states and identify which rollouts need a threshold ---
+                
+                needs_threshold_map = {} # {sub_batch_idx: original_active_idx}
+                
+                still_active_indices = []
+                for i, original_idx in enumerate(active_indices):
+                    tok1 = toks1[i].item()
+                    kind, idx = self.tokenizer.decode_one(tok1)
+
+                    seqs[original_idx].append(tok1)
+                    local_envs[original_idx].step((kind, idx))
+
+                    if kind == 'feat':
+                        d0 = depths[original_idx].pop()
+                        depths[original_idx].extend([d0 + 1, d0 + 1])
+                        needs_threshold_map[len(needs_threshold_map)] = i
+                    else: # kind == 'leaf'
+                        depths[original_idx].pop()
+                    
+                    if not depths[original_idx]:
+                        local_envs[original_idx].done = True
+                    
+                    if not local_envs[original_idx].done:
+                        still_active_indices.append(original_idx)
+
+                # --- Step 2: Batched Threshold Sampling ---
+
+                if needs_threshold_map:
+                    sub_batch_active_indices = [active_indices[i] for i in needs_threshold_map.values()]
+                    
+                    sub_batch_seq_tensors = [torch.tensor(seqs[i], device=device) for i in sub_batch_active_indices]
+                    x_sub_batch = torch.nn.utils.rnn.pad_sequence(sub_batch_seq_tensors, batch_first=True, padding_value=v.PAD)
+
+                    sub_logits, _ = self.pf(x_sub_batch)
+                    sub_last_logits = sub_logits[:, -1, :]
+
+                    th_mask = torch.zeros_like(sub_last_logits, dtype=torch.bool, device=device)
+                    th_start = v.split_start + v.num_feat
+                    th_end = th_start + v.num_th
+                    th_mask[:, th_start:th_end] = True
+                    
+                    toks2 = _safe_sample(sub_last_logits, th_mask, temp)
+
+                    for i, original_idx in enumerate(sub_batch_active_indices):
+                        tok2 = toks2[i].item()
+                        seqs[original_idx].append(tok2)
+                        local_envs[original_idx].step(self.tokenizer.decode_one(tok2))
+
+                active_indices = still_active_indices
+
+        # --- Finalize: Mark valid trajectories and evaluate ---
+        for i in range(num):
+            env = local_envs[i]
+            if env.done and env.open_leaves == 0:
+                seqs[i].append(v.EOS)
+                # Evaluate to get the prior; reward is recalculated in the main loop
+                _, prior, _, _ = env.evaluate(beta)
+                final_results[i] = (seqs[i], prior.item(), env.idxs.clone())
+
+        return final_results
+
 
     def predict(self, df_test: pd.DataFrame, df_train: pd.DataFrame) -> np.ndarray:
         if self.tokenizer is None or not self.ensemble:
@@ -302,12 +390,12 @@ class Trainer:
                 predictor = get_tree_predictor(seq, X_tr, residuals_for_this_round, self.tokenizer)
                 avg_pred_on_test += predictor(X_te)
                 avg_pred_on_train += predictor(X_tr)
+            
+            if trees_in_round:
+                avg_pred_on_test /= len(trees_in_round)
+                avg_pred_on_train /= len(trees_in_round)
 
-            avg_pred_on_test /= len(trees_in_round)
-            avg_pred_on_train /= len(trees_in_round)
-
-            # 3. Add this round's predictions to the total
-            # This is a stateless update to the final prediction
+            # 3. Add this round's predictions to the total (for test set)
             test_predictions += c.boosting_lr * avg_pred_on_test
             
             # 4. Update the training predictions to calculate residuals for the *next* round
