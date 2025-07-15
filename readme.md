@@ -82,10 +82,5 @@ This implementation builds on the following works:
 - DT-GFN Paper: Mahfoud, M., et al. "Learning Decision Trees as Amortized Structure Inference." Frontiers in Probabilistic Inference Workshop, ICLR 2025.
 - Fast-MCTD Paper: Yoon, J., et al. "Fast Monte Carlo Tree Diffusion: 100x Speedup via Parallel Sparse Planning." arXiv preprint arXiv:2506.09498, 2025.
 - Let the Flows Tell Paper: Zhang, D., et al. "Let the Flows Tell: Solving Graph Combinatorial Problems with GFlowNets." NeurIPS 2023.
-- Original DT-GFN Repo: https://github.com/nikolaymalkin/dt-gfn
+- [Original DT-GFN Repo](https://github.com/GFNOrg/dt-gfn)
 - DT-GFN Kaggle Notebook: [DRW DT-GFN: generate trees using GFlowNets](https://www.kaggle.com/code/pranshubahadur/drw-dt-gfn-generate-trees-using-gflownets)
-
-## License
-
-MIT License. See LICENSE file for details.
----
