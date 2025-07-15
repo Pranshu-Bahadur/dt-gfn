@@ -1,171 +1,91 @@
 [Making this notebook a Repo/Package](https://www.kaggle.com/code/pranshubahadur/drw-dt-gfn-generate-trees-using-gflownets)
 
 this repo is a WIP we thank creators of DT-GFN and their original repo. This is just an attempt to make dt-gfn useable in production pipelines / competitions.
-# DT-GFN: GFlowNet-Boosted Decision Tree s
 
-A clean, **modular**, and **high-performance** implementation of the Decision-Tree GFlowNet (DT-GFN) algorithm.  
-The project builds on the research of **Mahfoud et al. (2025)** and was inspired by the Kaggle exploration *“drw-dt-gfn-generate-trees-using-gflownets”* by **Pranshu Bahadur**.
+# Fast-DT-GFN-Boost
 
-`DT-GFN` frames decision-tree construction as a *sequential decision process*.  
-A **Generative Flow Network** learns to *draw* trees from an approximate Bayesian posterior, yielding a **diverse ensemble** of compact, interpretable models that excel on complex tabular data.
+This repository implements a boosting variant of Decision Tree Generative Flow Networks (DT-GFN), inspired by the original DT-GFN framework for amortized structure inference in decision trees. It incorporates optimizations for faster training and inference, including parallel batched rollouts and vectorized Redundancy-Aware Selection (RAS), adapted from techniques in the Fast Monte Carlo Tree Diffusion (Fast-MCTD) paper. The implementation is designed for tabular data tasks, with a focus on scalability for larger datasets like those in Numerai competitions.
 
-| Update | Complete Rollouts | TB Loss | FL Loss | Train ρ |
-|:-----:|:-----------------:|:------:|:------:|:-------:|
-| 01 → 10 | 10 / 10 | 58.6 → 72.5 | 0.003 → 0.0032 | **+0.146 → +0.262** |
-| 20 | 10 / 10 | 58.9 | 0.0044 | **+0.300** |
+## Description
 
----
+DT-GFN frames decision tree learning as a sequential decision-making process using Generative Flow Networks (GFNs) to sample trees proportionally to a Bayesian posterior. This repo extends it with a boosting ensemble approach, where each iteration fits trees to residuals, similar to gradient boosting. 
 
-## ✨ Key Features
-| | |
-|---|---|
-| ⚡ **High-Performance Policy Nets** | PyTorch + `torch.jit.script` for graph-mode speed. |
-| 🧩 **Flexible Pre-processing** | Quantile or uniform binning; supports **pre-binned** integer features. |
-| 📦 **Zero-Dependency Tokenizer** | Pure-Python, HF-friendly, no external libs. |
-| ⚙️ **Optimized Environment** | `TabularEnv` stores int8 tensors, CUDA-ready. |
-| 🚀 **Advanced GFN Training** | Replay-buffered boosting; Trajectory Balance **+** Flow Matching losses (Zhang et al., 2023). |
-| 🤖 **Scikit-Learn Wrapper** | `DTGFNRegressor` exposes familiar `.fit()` / `.predict()`. |
-| ✅ **Fully Tested & Typed** | 100 % `pytest` coverage, mypy-clean. |
+Key enhancements:
+- **Parallel Batched Rollouts**: Enables GPU-parallel sampling of multiple trajectories (tree constructions) in batches, reducing rollout time.
+- **Vectorized RAS**: Diversifies explorations by penalizing redundant actions in a vectorized manner, improving efficiency without significant overhead.
 
----
+These features draw from parallel and redundancy-aware methods in Fast-MCTD, while building on GFN-based structure learning from DT-GFN and graph problems in "Let the flows tell".
+
+@TODO: Add Sparse Planning
 
 ## Installation
 
+Clone the repository and install dependencies:
+
 ```bash
-# Clone the repo
-git clone https://github.com/pranshu-bahadur/dt-gfn.git
+git clone https://github.com/Pranshu-Bahadur/dt-gfn.git
 cd dt-gfn
+pip install -r requirements.txt
+```
 
-# Install (add [dev] to get black, mypy, pytest, etc.)
-pip install -e ".[dev]"
+Requirements include PyTorch, NumPy, Pandas, and tqdm. Tested on Python 3.10+ with CUDA support.
 
-# Run tests
-pytest -q
-````
+## Usage
 
----
+### Quick Start
 
-## 🚀 Quick-Start — Kaggle *DRW Crypto Market* Example
+For local use (Numerai Data):
 
 ```python
+from src.wrapper import DTGFNRegressor
 import pandas as pd
 from pathlib import Path
-from src.wrappers.sklearn import DTGFNRegressor
 
-# 1. Load data
-DATA = Path("/kaggle/input/drw-crypto-market-prediction")
-train = pd.read_parquet(DATA / "train.parquet")
-test  = pd.read_parquet(DATA / "test.parquet")
+DATA_DIR = Path('/content/dt-gfn/v5.0')
+train = pd.read_parquet(DATA_DIR / "train.parquet")
 
-# 2. Feature list
-FEATURES = [c for c in train.columns if c.startswith("X") or
-            c in ("bid_qty","ask_qty","buy_qty","sell_qty","volume")]
+FEATURES = features['feature_sets']['all']
 
-# 3. Configure & train
 model = DTGFNRegressor(
-    feature_cols = FEATURES,
-    n_bins       = 256,
-    bin_strategy = "feature_quantile",
-    updates      = 20,
-    rollouts     = 40,
-    batch_size   = 8192,
-    max_depth    = 4,
-    boosting_lr  = 0.15,
-    device       = "cuda",   # use "cpu" if no GPU
+    feature_cols=FEATURES,
+    n_bins=5,
+    updates=100,
+    rollouts=10,
+    batch_size=len(train),
+    max_depth=9,
+    boosting_lr=0.1,
+    device="cuda",
+
 )
 
-print("Fitting...")
-model.fit(train[FEATURES], train["label"])
+model.fit(train[FEATURES], train["target"])
 
-# 4. Predict & submit
-print("Predicting...")
-preds = model.predict(test[FEATURES])
-
-subm = pd.read_csv(DATA / "sample_submission.csv")
-subm["prediction"] = preds
-subm.to_csv("dtgfn_submission.csv", index=False)
+# Predict
+preds = model.predict(df_test[FEATURES], 'ensemble') #'policy' for n trees generator
 ```
 
-A **20-update** run on a single T4 GPU reaches **≈ 0.09–0.10** public LB.
-Scale to **50–100** updates for the original 0.097 @ one-T4 result.
+Adjust `num_parallel` in Config for VRAM constraints (e.g., 10 on A100 with 40GB).
 
----
+### Training Parameters
 
-## Command-Line Interface
+- `updates`: Number of boosting iterations (default: 50).
+- `rollouts`: Rollouts per update (default: 60).
+- `max_depth`: Maximum tree depth (default: 7).
+- `num_parallel`: Batch size for parallel rollouts (default: 10; tune for VRAM).
 
-```bash
-python -m src.cli \
-  --train data/train.parquet \
-  --test  data/test.parquet \
-  --feature-cols X863 X856 X344 ... volume \
-  --n-bins 256 --updates 50 --rollouts 60 \
-  --batch-size 8192 --device cuda
-```
+For deeper trees, increase `max_depth` and monitor VRAM (current rollout stage uses ~19GB on full Numerai dataset).
 
-Run `python -m src.cli --help` for all flags.
+## Citations
 
----
+This implementation builds on the following works:
 
-## Project Structure
-
-```
-dtgfn/
-├─ src/
-│  ├─ binning/         # Binner & BinConfig
-│  ├─ env.py           # TabularEnv (int8, CUDA)
-│  ├─ tokenizer.py     # Pure-Python Tokenizer
-│  ├─ trees/
-│  │   └─ policy.py    # PolicyPaperMLP
-│  ├─ utils.py         # predictor, losses, replay, sampling
-│  ├─ trainer.py       # Boost loop (.fit / .predict)
-│  └─ wrappers/
-│      └─ sklearn.py   # DTGFNRegressor
-├─ tests/              # pytest suite
-└─ docs/               # diagrams, assets
-```
-
----
-
-## Development & CI
-
-* **Formatting** — `black .`
-* **Static typing** — `mypy src/`
-* **Testing** — `pytest` (≈ 6 s CPU)
-* **GitHub Actions** — lint + tests on every push / PR
-
----
-
-## Citation & Acknowledgements
-
-If this repo helps your research or competition entry, please cite:
-
-```bibtex
-@misc{dtgfn_repo_2025,
-  title  = {DT-GFN: A Modular Implementation of GFlowNet-Boosted Decision Trees},
-  author = {Pranshu Bahadur and Timothy DeLise},
-  year   = {2025},
-  url    = {https://github.com/pranshu-bahadur/dt-gfn}
-}
-
-@article{mahfoud2025learning,
-  title   = {Learning Decision Trees as Amortized Structure Inference},
-  author  = {Mahfoud, Mohammed and Boukachab, Ghait and Koziarski, Michal and Hernandez-Garcia, Alex and Bauer, Stefan and Bengio, Yoshua and Malkin, Nikolay},
-  journal = {arXiv preprint arXiv:2503.06985},
-  year    = {2025}
-}
-
-@inproceedings{zhang2023let,
-  title     = {Let the Flows Tell: Solving Graph Combinatorial Optimization Problems with GFlowNets},
-  author    = {Zhang, Dinghuai and Dai, Hanjun and Malkin, Nikolay and Courville, Aaron and Bengio, Yoshua and Pan, Ling},
-  booktitle = {Advances in Neural Information Processing Systems},
-  year      = {2023}
-}
-```
-
----
+- DT-GFN Paper: Mahfoud, M., et al. "Learning Decision Trees as Amortized Structure Inference." Frontiers in Probabilistic Inference Workshop, ICLR 2025.
+- Fast-MCTD Paper: Yoon, J., et al. "Fast Monte Carlo Tree Diffusion: 100x Speedup via Parallel Sparse Planning." arXiv preprint arXiv:2506.09498, 2025.
+- Let the Flows Tell Paper: Zhang, D., et al. "Let the Flows Tell: Solving Graph Combinatorial Problems with GFlowNets." NeurIPS 2023.
+- Original DT-GFN Repo: https://github.com/nikolaymalkin/dt-gfn
+- DT-GFN Kaggle Notebook: [DRW DT-GFN: generate trees using GFlowNets](https://www.kaggle.com/code/pranshubahadur/drw-dt-gfn-generate-trees-using-gflownets)
 
 ## License
 
-**MIT** — see `LICENSE` for full text.
-
-
+MIT License. See LICENSE file for details.
+---
