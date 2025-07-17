@@ -73,7 +73,7 @@ class DTGFNRegressor(BaseEstimator, RegressorMixin):
         self._trainer = Trainer(cfg).fit(df_train)
         return self  # sklearn convention
 
-    def predict(self, X: pd.DataFrame, predict_mode: str = "ensemble", n_trees: int = 100) -> pd.Series:
+    def predict(self, X: pd.DataFrame, predict_mode: str = "ensemble") -> pd.Series:
         """
         Make predictions using the fitted model.
 
@@ -81,8 +81,7 @@ class DTGFNRegressor(BaseEstimator, RegressorMixin):
             X (pd.DataFrame): The input features for which to make predictions.
             predict_mode (str): The prediction strategy. Can be one of:
                                 'ensemble': Use the boosted ensemble created during training (default).
-                                'policy': Generate `n_trees` on-the-fly from the policy network.
-            n_trees (int): The number of trees to generate if `predict_mode` is 'policy'.
+                                'policy': Generate a new boosted ensemble on-the-fly from the policy network.
 
         Returns:
             A pandas Series containing the predictions.
@@ -90,12 +89,8 @@ class DTGFNRegressor(BaseEstimator, RegressorMixin):
         if self._trainer is None or self.df_train_ is None:
             raise RuntimeError("DTGFNRegressor has not been fitted yet. Call fit() first.")
 
-        if predict_mode == "ensemble":
-            predictions = self._trainer.predict(X, self.df_train_)
-        elif predict_mode == "policy":
-            predictions = self._trainer.predict_from_policy(X, self.df_train_, n_trees=n_trees)
-        else:
-            raise ValueError(f"Unknown predict_mode: '{predict_mode}'. Must be 'ensemble' or 'policy'.")
+        use_policy = (predict_mode == "policy")
+        predictions = self._trainer.predict(X, self.df_train_, use_policy=use_policy)
         
         return pd.Series(predictions, index=X.index)
 

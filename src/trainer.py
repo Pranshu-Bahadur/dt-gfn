@@ -365,7 +365,7 @@ class Trainer:
         return final_results
 
 
-    def predict(self, df_test: pd.DataFrame, df_train: pd.DataFrame) -> np.ndarray:
+    def predict(self, df_test: pd.DataFrame, df_train: pd.DataFrame, use_policy: bool = False) -> np.ndarray:
         if self.tokenizer is None or not self.ensemble:
             raise RuntimeError("Call fit() first.")
         
@@ -373,43 +373,98 @@ class Trainer:
         device = c.device
 
         # --- Setup environment for featurization ---
-        env = TabularEnv(df_train, feature_cols=c.feature_cols, target_col=c.target_col, n_bins=c.n_bins, device=device)
-        X_te = env._featurise(df_test, df_train, c.feature_cols, c.n_bins)
-        X_tr, y_tr = env.X_full.clone(), env.y_full.clone()
+        env_template = TabularEnv(df_train, feature_cols=c.feature_cols, target_col=c.target_col, n_bins=c.n_bins, device=device)
+        X_te = env_template._featurise(df_test, df_train, c.feature_cols, c.n_bins)
+        X_tr, y_tr = env_template.X_full.clone(), env_template.y_full.clone()
 
         # --- CORRECTED PREDICTION LOGIC ---
         # Start with the initial baseline prediction
         test_predictions = torch.full((len(df_test),), self.y_mean, device=device)
         train_predictions = torch.full_like(y_tr, self.y_mean)
 
-        # Iterate through the stored ensemble, which contains one set of trees for each boosting round
-        for trees_in_round in tqdm(self.ensemble, desc="Ensemble Prediction", leave=False):
-            if not trees_in_round:
-                continue
+        if not use_policy:
+            # Use stored ensemble
+            for trees_in_round in tqdm(self.ensemble, desc="Ensemble Prediction", leave=False):
+                if not trees_in_round:
+                    continue
 
-            # 1. Determine the residuals these trees were trained on
-            # This is the crucial step: we use the state of the ensemble *before* this round
-            residuals_for_this_round = y_tr - train_predictions
+                # 1. Determine the residuals these trees were trained on
+                # This is the crucial step: we use the state of the ensemble *before* this round
+                residuals_for_this_round = y_tr - train_predictions
 
-            # 2. Get the average prediction from this round's trees
-            avg_pred_on_test = torch.zeros_like(test_predictions)
-            avg_pred_on_train = torch.zeros_like(train_predictions)
+                # 2. Get the average prediction from this round's trees
+                avg_pred_on_test = torch.zeros_like(test_predictions)
+                avg_pred_on_train = torch.zeros_like(train_predictions)
 
-            for seq in trees_in_round:
-                # The tree predictor needs the correct residual target it was trained on
-                predictor = get_tree_predictor(seq, X_tr, residuals_for_this_round, self.tokenizer)
-                avg_pred_on_test += predictor(X_te)
-                avg_pred_on_train += predictor(X_tr)
-            
-            if trees_in_round:
-                avg_pred_on_test /= len(trees_in_round)
-                avg_pred_on_train /= len(trees_in_round)
+                for seq in trees_in_round:
+                    # The tree predictor needs the correct residual target it was trained on
+                    predictor = get_tree_predictor(seq, X_tr, residuals_for_this_round, self.tokenizer)
+                    avg_pred_on_test += predictor(X_te)
+                    avg_pred_on_train += predictor(X_tr)
+                
+                if trees_in_round:
+                    avg_pred_on_test /= len(trees_in_round)
+                    avg_pred_on_train /= len(trees_in_round)
 
-            # 3. Add this round's predictions to the total (for test set)
-            test_predictions += c.boosting_lr * avg_pred_on_test
-            
-            # 4. Update the training predictions to calculate residuals for the *next* round
-            train_predictions += c.boosting_lr * avg_pred_on_train
+                # 3. Add this round's predictions to the total (for test set)
+                test_predictions += c.boosting_lr * avg_pred_on_test
+                
+                # 4. Update the training predictions to calculate residuals for the *next* round
+                train_predictions += c.boosting_lr * avg_pred_on_train
+        else:
+            # Use policy to generate trees at inference
+            old_buf = self.replay_buffer
+            for upd in tqdm(range(1, c.updates + 1), desc="Policy Generation", leave=False):
+                residuals_for_this_round = y_tr - train_predictions
+                env_template.y = residuals_for_this_round.clone()
+
+                buf = ReplayBuffer(capacity=100000)
+                self.replay_buffer = buf
+
+                rollouts_done = 0
+                while rollouts_done < c.rollouts:
+                    batch_size = min(c.num_parallel, c.rollouts - rollouts_done)
+                    envs = [env_template] * batch_size
+                    batch_results = self.batched_rollout(envs, temp=1.0, residuals=residuals_for_this_round, beta=0.01)
+                    
+                    for result in batch_results:
+                        if result is not None:
+                            seq, prior, idxs = result
+                            buf.add(0.0, seq, prior, idxs)
+                    
+                    rollouts_done += batch_size
+
+                if buf.data:
+                    topk_tuples = self.sample_replay(c.top_k_trees)
+                    if topk_tuples:
+                        # Reset environment for gain calculation
+                        env_template.reset(c.batch_size)
+                        
+                        tree_rewards = []
+                        for seq, _ in topk_tuples:
+                            tok = torch.tensor([seq], device=device)
+                            R_t = deltaE_split_gain(tok, self.tokenizer, env_template).sum().item()
+                            tree_rewards.append(R_t)
+
+                        sorted_indices = sorted(range(len(topk_tuples)), key=lambda i: tree_rewards[i], reverse=True)
+                        topk_seqs = [topk_tuples[i][0] for i in sorted_indices]
+
+                        avg_pred_on_test = torch.zeros_like(test_predictions)
+                        avg_pred_on_train = torch.zeros_like(train_predictions)
+
+                        for seq in topk_seqs:
+                            predictor = get_tree_predictor(seq, X_tr, residuals_for_this_round, self.tokenizer)
+                            avg_pred_on_test += predictor(X_te)
+                            avg_pred_on_train += predictor(X_tr)
+                        
+                        if topk_seqs:
+                            avg_pred_on_test /= len(topk_seqs)
+                            avg_pred_on_train /= len(topk_seqs)
+
+                        test_predictions += c.boosting_lr * avg_pred_on_test
+                        train_predictions += c.boosting_lr * avg_pred_on_train
+
+            self.replay_buffer = old_buf
 
         return test_predictions.cpu().numpy()
 

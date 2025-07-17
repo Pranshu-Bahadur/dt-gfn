@@ -198,4 +198,3 @@ class PolicyTransformer(PolicyBase):
     def log_F(self, seq: torch.Tensor) -> torch.Tensor:
         _, flow = self.forward(seq)
         return flow
-
