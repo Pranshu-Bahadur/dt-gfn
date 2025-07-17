@@ -157,7 +157,7 @@ class Trainer:
             if buf.data and upd > 1:
                 replay_tuples = self.sample_replay(c.top_k_trees)
 
-            # --- Compute losses and backpropagate ---
+            # --- Compute losses and backpropagate (no sorting here to avoid extra R_t calc) ---
             
             # FIX: Reset the template environment. This initializes `env_template.idxs` to
             # the full range of training samples, which is the required state for
@@ -197,6 +197,16 @@ class Trainer:
                 topk_tuples = self.sample_replay(c.top_k_trees)
                 topk_seqs = [seq for seq, _ in topk_tuples]
                 if not topk_seqs: continue
+
+                # Sort top-k by reward (descending split gain) right before boosting part
+                tree_rewards = []
+                for seq in topk_seqs:
+                    tok = torch.tensor([seq], device=device)
+                    R_t = deltaE_split_gain(tok, self.tokenizer, env_template).sum().item()
+                    tree_rewards.append(R_t)
+
+                sorted_indices = sorted(range(len(topk_seqs)), key=lambda i: tree_rewards[i], reverse=True)
+                topk_seqs = [topk_seqs[i] for i in sorted_indices]
 
                 self.ensemble.append(topk_seqs)
                 
