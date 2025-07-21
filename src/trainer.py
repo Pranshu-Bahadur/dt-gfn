@@ -53,6 +53,9 @@ class Config:
 
     # Parallelism
     num_parallel: int = 10  # Adjust based on VRAM; 8 should fit within 40GB if current is 25GB
+    
+    # Inference
+    policy_inference_trees: int = 500 # Default number of trees for policy prediction
 
 class Trainer:
     def __init__(self, cfg: Config):
@@ -364,10 +367,15 @@ class Trainer:
 
         return final_results
 
-
-    def predict(self, df_test: pd.DataFrame, df_train: pd.DataFrame, use_policy: bool = False) -> np.ndarray:
-        if self.tokenizer is None or not self.ensemble:
-            raise RuntimeError("Call fit() first.")
+    def predict(
+        self,
+        df_test: pd.DataFrame,
+        df_train: pd.DataFrame,
+        use_policy: bool = False,
+        policy_inference_trees: Optional[int] = None
+    ) -> np.ndarray:
+        if self.tokenizer is None or (not self.ensemble and not use_policy):
+            raise RuntimeError("Call fit() first or ensure use_policy=True for generation.")
         
         c = self.cfg
         device = c.device
@@ -377,7 +385,7 @@ class Trainer:
         X_te = env_template._featurise(df_test, df_train, c.feature_cols, c.n_bins)
         X_tr, y_tr = env_template.X_full.clone(), env_template.y_full.clone()
 
-        # --- CORRECTED PREDICTION LOGIC ---
+        # --- PREDICTION LOGIC ---
         # Start with the initial baseline prediction
         test_predictions = torch.full((len(df_test),), self.y_mean, device=device)
         train_predictions = torch.full_like(y_tr, self.y_mean)
@@ -387,17 +395,11 @@ class Trainer:
             for trees_in_round in tqdm(self.ensemble, desc="Ensemble Prediction", leave=False):
                 if not trees_in_round:
                     continue
-
-                # 1. Determine the residuals these trees were trained on
-                # This is the crucial step: we use the state of the ensemble *before* this round
                 residuals_for_this_round = y_tr - train_predictions
-
-                # 2. Get the average prediction from this round's trees
                 avg_pred_on_test = torch.zeros_like(test_predictions)
                 avg_pred_on_train = torch.zeros_like(train_predictions)
 
                 for seq in trees_in_round:
-                    # The tree predictor needs the correct residual target it was trained on
                     predictor = get_tree_predictor(seq, X_tr, residuals_for_this_round, self.tokenizer)
                     avg_pred_on_test += predictor(X_te)
                     avg_pred_on_train += predictor(X_tr)
@@ -406,65 +408,52 @@ class Trainer:
                     avg_pred_on_test /= len(trees_in_round)
                     avg_pred_on_train /= len(trees_in_round)
 
-                # 3. Add this round's predictions to the total (for test set)
                 test_predictions += c.boosting_lr * avg_pred_on_test
-                
-                # 4. Update the training predictions to calculate residuals for the *next* round
                 train_predictions += c.boosting_lr * avg_pred_on_train
         else:
-            # Use policy to generate trees at inference
-            old_buf = self.replay_buffer
-            for upd in tqdm(range(1, c.updates + 1), desc="Policy Generation", leave=False):
-                residuals_for_this_round = y_tr - train_predictions
-                env_template.y = residuals_for_this_round.clone()
+            # Use policy to generate trees with batched residual updates.
+            if policy_inference_trees is not None:
+                total_trees = policy_inference_trees
+            else:
+                total_trees = c.policy_inference_trees
+            
+            num_batches = math.ceil(total_trees / c.num_parallel)
 
-                buf = ReplayBuffer(capacity=100000)
-                self.replay_buffer = buf
+            for i in tqdm(range(num_batches), desc="Policy Generation (Batched)", leave=False):
+                # 1. Determine residuals for the current batch
+                residuals_for_this_batch = y_tr - train_predictions
+                env_template.y = residuals_for_this_batch.clone()
 
-                rollouts_done = 0
-                while rollouts_done < c.rollouts:
-                    batch_size = min(c.num_parallel, c.rollouts - rollouts_done)
-                    envs = [env_template] * batch_size
-                    batch_results = self.batched_rollout(envs, temp=1.0, residuals=residuals_for_this_round, beta=0.01)
-                    
-                    for result in batch_results:
-                        if result is not None:
-                            seq, prior, idxs = result
-                            buf.add(0.0, seq, prior, idxs)
-                    
-                    rollouts_done += batch_size
+                # 2. Generate one batch of trees
+                trees_in_batch = min(c.num_parallel, total_trees - (i * c.num_parallel))
+                if trees_in_batch <= 0:
+                    break
 
-                if buf.data:
-                    topk_tuples = self.sample_replay(c.top_k_trees)
-                    if topk_tuples:
-                        # Reset environment for gain calculation
-                        env_template.reset(c.batch_size)
-                        
-                        tree_rewards = []
-                        for seq, _ in topk_tuples:
-                            tok = torch.tensor([seq], device=device)
-                            R_t = deltaE_split_gain(tok, self.tokenizer, env_template).sum().item()
-                            tree_rewards.append(R_t)
+                envs = [env_template] * trees_in_batch
+                batch_results = self.batched_rollout(
+                    envs, temp=1.0, residuals=residuals_for_this_batch, beta=0.01
+                )
+                
+                generated_seqs = [res[0] for res in batch_results if res is not None]
+                if not generated_seqs:
+                    continue
 
-                        sorted_indices = sorted(range(len(topk_tuples)), key=lambda i: tree_rewards[i], reverse=True)
-                        topk_seqs = [topk_tuples[i][0] for i in sorted_indices]
+                # 3. Calculate average prediction from this batch's trees
+                avg_pred_on_test = torch.zeros_like(test_predictions)
+                avg_pred_on_train = torch.zeros_like(train_predictions)
 
-                        avg_pred_on_test = torch.zeros_like(test_predictions)
-                        avg_pred_on_train = torch.zeros_like(train_predictions)
+                for seq in generated_seqs:
+                    predictor = get_tree_predictor(seq, X_tr, residuals_for_this_batch, self.tokenizer)
+                    avg_pred_on_test += predictor(X_te)
+                    avg_pred_on_train += predictor(X_tr)
+                
+                if generated_seqs:
+                    avg_pred_on_test /= len(generated_seqs)
+                    avg_pred_on_train /= len(generated_seqs)
 
-                        for seq in topk_seqs:
-                            predictor = get_tree_predictor(seq, X_tr, residuals_for_this_round, self.tokenizer)
-                            avg_pred_on_test += predictor(X_te)
-                            avg_pred_on_train += predictor(X_tr)
-                        
-                        if topk_seqs:
-                            avg_pred_on_test /= len(topk_seqs)
-                            avg_pred_on_train /= len(topk_seqs)
-
-                        test_predictions += c.boosting_lr * avg_pred_on_test
-                        train_predictions += c.boosting_lr * avg_pred_on_train
-
-            self.replay_buffer = old_buf
+                # 4. Update total predictions (boosting step)
+                test_predictions += c.boosting_lr * avg_pred_on_test
+                train_predictions += c.boosting_lr * avg_pred_on_train
 
         return test_predictions.cpu().numpy()
 

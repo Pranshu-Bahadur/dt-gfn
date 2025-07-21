@@ -1,5 +1,3 @@
-# src/wrapper.py
-
 from __future__ import annotations
 from typing import Any, Dict, Optional, List
 
@@ -73,7 +71,7 @@ class DTGFNRegressor(BaseEstimator, RegressorMixin):
         self._trainer = Trainer(cfg).fit(df_train)
         return self  # sklearn convention
 
-    def predict(self, X: pd.DataFrame, predict_mode: str = "ensemble") -> pd.Series:
+    def predict(self, X: pd.DataFrame, predict_mode: str = "ensemble", n_trees: Optional[int] = None) -> pd.Series:
         """
         Make predictions using the fitted model.
 
@@ -82,6 +80,9 @@ class DTGFNRegressor(BaseEstimator, RegressorMixin):
             predict_mode (str): The prediction strategy. Can be one of:
                                 'ensemble': Use the boosted ensemble created during training (default).
                                 'policy': Generate a new boosted ensemble on-the-fly from the policy network.
+            n_trees (Optional[int]): The number of trees to generate when using 'policy' mode.
+                                     If None, uses the default from the model configuration.
+                                     This argument is ignored if predict_mode is 'ensemble'.
 
         Returns:
             A pandas Series containing the predictions.
@@ -90,7 +91,13 @@ class DTGFNRegressor(BaseEstimator, RegressorMixin):
             raise RuntimeError("DTGFNRegressor has not been fitted yet. Call fit() first.")
 
         use_policy = (predict_mode == "policy")
-        predictions = self._trainer.predict(X, self.df_train_, use_policy=use_policy)
+        
+        predictions = self._trainer.predict(
+            df_test=X, 
+            df_train=self.df_train_, 
+            use_policy=use_policy, 
+            policy_inference_trees=n_trees
+        )
         
         return pd.Series(predictions, index=X.index)
 
