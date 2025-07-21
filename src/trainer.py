@@ -356,13 +356,13 @@ class Trainer:
 
                 active_indices = still_active_indices
 
-        # --- Finalize: Mark valid trajectories and evaluate ---
+        # --- Finalize: Mark valid trajectories and get prior ---
         for i in range(num):
             env = local_envs[i]
             if env.done and env.open_leaves == 0:
                 seqs[i].append(v.EOS)
-                # Evaluate to get the prior; reward is recalculated in the main loop
-                _, prior, _, _ = env.evaluate(beta)
+                # Get the prior; reward is calculated in the main loop
+                prior = env.get_prior(beta)
                 final_results[i] = (seqs[i], prior.item(), env.idxs.clone())
 
         return final_results
