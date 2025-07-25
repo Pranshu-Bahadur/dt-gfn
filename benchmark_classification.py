@@ -1,12 +1,13 @@
 import argparse
 import pandas as pd
 import numpy as np
-from sklearn.datasets import load_iris, load_wine, load_breast_cancer, fetch_covtype, fetch_openml
+from sklearn.datasets import load_iris, load_wine, load_breast_cancer, fetch_covtype
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score
 from src.wrapper import DTGFNClassifier
 import torch
 from sklearn.preprocessing import LabelEncoder
+from ucimlrepo import fetch_ucirepo # Import the new library
 
 def run_benchmark(dataset_name: str):
     """
@@ -19,20 +20,21 @@ def run_benchmark(dataset_name: str):
     elif dataset_name == "breast_cancer":
         X, y = load_breast_cancer(return_X_y=True, as_frame=True)
     elif dataset_name == "raisin":
-        # The Raisin dataset is available on OpenML, we fetch it from there.
-        raisin_data = fetch_openml(name='Raisin', version=1, as_frame=True, parser='auto')
-        X = raisin_data.data
-        # The target is categorical ('Kecimen', 'Besni'), so we encode it to (0, 1)
-        le = LabelEncoder()
-        y = pd.Series(le.fit_transform(raisin_data.target), name='target')
-    elif dataset_name == "adult":
-        adult = fetch_openml(name="adult", version=2, as_frame=True, parser='auto')
-        X = pd.get_dummies(adult.data)
-        y = (adult.target == '>50K').astype(int)
+        # Fetch the Raisin dataset using the robust ucimlrepo library
+        try:
+            raisin_data = fetch_ucirepo(id=850)
+            X = raisin_data.data.features
+            y = raisin_data.data.targets
+            # The target is categorical, so we encode it to integers
+            le = LabelEncoder()
+            y = pd.Series(le.fit_transform(y.values.ravel()), name='target')
+        except Exception as e:
+            print(f"Failed to load Raisin dataset using ucimlrepo. Error: {e}")
+            print("Please ensure you have run 'pip install ucimlrepo'")
+            return
     elif dataset_name == "covertype":
         covtype_data = fetch_covtype(return_X_y=True, as_frame=True)
         X = covtype_data.data
-        # The target column is named 'Cover_Type', and classes are 1-7, so we map to 0-6
         y = covtype_data.target - 1
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
@@ -51,18 +53,17 @@ def run_benchmark(dataset_name: str):
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=seed, stratify=y if y.nunique() > 1 else None)
 
         model = DTGFNClassifier(
-            n_bins=16,
+            n_bins=99,
             updates=100,
             rollouts=10,
-            batch_size=64,
+            batch_size=900,
             max_depth=5,
-            boosting_lr=0.5,
-            # reward_function='gini', # Using 'bayesian' by default
+            boosting_lr=1.0,
+            reward_function='gini',
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
         
         model.fit(X_train, y_train)
-        # Using ensemble prediction ('policy' mode) as requested
         preds = model.predict(X_test, 'policy', 1000) 
 
         accuracy = accuracy_score(y_test, preds)
@@ -91,6 +92,6 @@ def run_benchmark(dataset_name: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="iris",
-                        choices=["iris", "wine", "breast_cancer", "raisin", "covertype", "adult"])
+                        choices=["iris", "wine", "breast_cancer", "raisin", "covertype"])
     args = parser.parse_args()
     run_benchmark(args.dataset)

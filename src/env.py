@@ -19,7 +19,7 @@ class TabularEnv:
         n_bins: int,
         task: str = "regression",
         device: str = "cpu",
-        shuffle_on_reset: bool = True
+        shuffle_on_reset: bool = False
     ):
         self.device = device
         self.feature_cols = feature_cols

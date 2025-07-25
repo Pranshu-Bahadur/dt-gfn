@@ -47,14 +47,13 @@ class Config:
     boosting_lr: float = 0.1
 
     # Policy network architecture
-    lstm_hidden: int = 512
-    mlp_layers: int = 12
+    lstm_hidden: int = 256
+    mlp_layers: int = 3
     mlp_width: int = 256
-    lr: float = 5e-5
+    lr: float = 1e-2
 
     # Priors & annealing
-    beta_start: float = 0.35
-    beta_end: float = math.log(4)
+    beta: Optional[float] = None # Will be set based on the paper's formula
     prior_scale: float = 0.5
 
     # Parallelism
@@ -118,6 +117,12 @@ class Trainer:
             base_pred = torch.full_like(y_true, self.y_mean, dtype=torch.float32)
         else:
             base_pred = torch.zeros((len(y_true), c.n_classes), device=device) if c.n_classes > 2 else torch.zeros(len(y_true), device=device, dtype=torch.float32)
+        
+        if c.beta is None and c.task == 'classification' and c.reward_function == 'bayesian':
+            num_features = len(c.feature_cols)
+            num_thresholds = c.n_bins
+            c.beta = math.log(4) + math.log(num_features) + math.log(num_thresholds)
+            print(f"Using beta derived from the paper's formula: {c.beta:.4f}")
 
         print("--- Starting GFN-Boost Training ---")
         for upd in tqdm(range(1, c.updates + 1), desc="Boost Updates"):
@@ -134,15 +139,14 @@ class Trainer:
             
             env_template.y = residuals.clone()
 
-            prog = min(1.0, (upd - 1) / 20.0)
-            beta = c.beta_start + prog * (c.beta_end - c.beta_start)
+            beta = 0.1#c.beta if c.beta is not None else 0.1
             temp = max(1.0, 5.0 - (upd - 1) * (4.0 / 20.0))
+            lam_fl = 0.1#min(1.0, upd / 20.0)
 
             for opt in optimizers: opt.zero_grad()
             
             forward_tuples = self._collect_rollouts(env_template, temp, residuals, beta)
             
-            # Use a fresh env with all idxs for reward calculation
             reward_env = copy.copy(env_template)
             reward_env.reset(len(y_true))
 
@@ -152,17 +156,27 @@ class Trainer:
                 tok = torch.tensor([seq], device=device)
                 log_pf = self.pf.log_prob(tok)
                 log_pb = self.pb.log_prob(torch.flip(tok, dims=[1]))
-
+                
+                R_t_per_step = None # Initialize to handle scope
                 if c.task == "classification":
                     if c.reward_function == "bayesian":
                         R_t = calculate_bayesian_reward(tok, self.tokenizer, reward_env, beta)
                     else: # gini
-                        R_t = deltaE_split_gain_classification(tok, self.tokenizer, reward_env).sum() + 1e-8
+                        R_t_per_step = deltaE_split_gain_classification(tok, self.tokenizer, reward_env)
+                        R_t = R_t_per_step.sum(1) + 1e-8
                 else: # regression
-                    R_t = deltaE_split_gain_regression(tok, self.tokenizer, env_template).sum() + 1e-8
+                    R_t_per_step = deltaE_split_gain_regression(tok, self.tokenizer, env_template)
+                    R_t = R_t_per_step.sum(1) + 1e-8
 
                 l_tb = tb_loss(log_pf, log_pb, self.log_z, R_t, torch.tensor([prior], device=device))
-                l_tb.backward()
+                total_loss = l_tb
+                
+                # Add Flow Loss if we have per-step rewards (i.e., for regression and Gini classification)
+                if R_t_per_step is not None:
+                    l_fl = fl_loss(self.pf.log_F(tok), log_pf, log_pb, R_t_per_step)
+                    total_loss += lam_fl * l_fl
+                
+                total_loss.backward()
 
             if forward_tuples:
                 for opt in optimizers: torch.nn.utils.clip_grad_norm_(opt.param_groups[0]['params'], 1.0); opt.step()
@@ -170,7 +184,6 @@ class Trainer:
 
             base_pred = self._update_ensemble(base_pred, X_binned, residuals, beta, reward_env)
             
-            # Logging
             if c.task == "regression":
                 corr = torch.corrcoef(torch.stack([base_pred.squeeze(), y_true.squeeze()]))[0, 1].item()
                 tqdm.write(f"Update {upd}/{c.updates} | Train Corr: {corr:+.4f}")
@@ -195,7 +208,6 @@ class Trainer:
                 for result in batch_results:
                     if result:
                         seq, prior, idxs = result
-                        # Reward is recalculated later, so placeholder is fine
                         self.replay_buffer.add(0.0, seq, prior, idxs)
                         forward_tuples.append((seq, prior))
                 rollouts_done += batch_size
@@ -218,7 +230,7 @@ class Trainer:
                 else:
                     R_t = deltaE_split_gain_classification(tok, self.tokenizer, reward_env).sum().item()
             else:
-                R_t = deltaE_split_gain_regression(tok, self.tokenizer, env_template).sum().item()
+                R_t = deltaE_split_gain_regression(tok, self.tokenizer, reward_env).sum().item()
             tree_rewards.append(R_t)
 
         sorted_indices = sorted(range(len(topk_seqs)), key=lambda i: tree_rewards[i], reverse=True)
@@ -338,12 +350,10 @@ class Trainer:
                 test_preds += c.boosting_lr * avg_test
                 train_preds += c.boosting_lr * avg_train
         else:
-            # Policy-based prediction generates trees on the fly
             total_trees = policy_inference_trees if policy_inference_trees is not None else c.policy_inference_trees
             num_batches = math.ceil(total_trees / c.num_parallel)
 
             for i in tqdm(range(num_batches), desc="Policy-based Prediction", leave=False):
-                # 1. Determine residuals for the current batch
                 if c.task == "regression":
                     residuals_for_batch = y_tr - train_preds
                 else:
@@ -356,29 +366,25 @@ class Trainer:
                 
                 env_template.y = residuals_for_batch.clone()
 
-                # 2. Generate one batch of trees
                 trees_in_batch = min(c.num_parallel, total_trees - (i * c.num_parallel))
                 if trees_in_batch <= 0:
                     break
 
-                # Use a fixed beta and temperature for inference
                 batch_results = self.batched_rollout(
                     [copy.copy(env_template) for _ in range(trees_in_batch)],
                     temp=1.0,
                     residuals=residuals_for_batch,
-                    beta=c.beta_end
+                    beta=c.beta if c.beta is not None else 0.1
                 )
                 
                 generated_seqs = [res[0] for res in batch_results if res is not None]
                 if not generated_seqs:
                     continue
 
-                # 3. Calculate average prediction from this batch's trees
                 avg_test_batch = torch.zeros_like(test_preds)
                 avg_train_batch = torch.zeros_like(train_preds)
 
                 for seq in generated_seqs:
-                    # The predictor is trained on the *current* residuals
                     predictor = get_tree_predictor(seq, X_tr, residuals_for_batch, self.tokenizer)
                     avg_test_batch += predictor(X_te)
                     avg_train_batch += predictor(X_tr)
@@ -387,7 +393,6 @@ class Trainer:
                     avg_test_batch /= len(generated_seqs)
                     avg_train_batch /= len(generated_seqs)
 
-                # 4. Update total predictions (boosting step)
                 test_preds += c.boosting_lr * avg_test_batch
                 train_preds += c.boosting_lr * avg_train_batch
                 
