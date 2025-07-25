@@ -56,8 +56,8 @@ def run_benchmark(dataset_name: str):
             n_bins=99,
             updates=100,
             rollouts=10,
-            batch_size=630,
-            top_k_trees=1,
+            batch_size=150,
+            top_k_trees=10,
             max_depth=5,
             boosting_lr=1.0,
             reward_function='gini',
@@ -65,7 +65,7 @@ def run_benchmark(dataset_name: str):
         )
 
         model.fit(X_train, y_train)
-        #model._trainer.cfg.boosting_lr = 0.5
+        model._trainer.cfg.num_parallel = 10
         preds = model.predict(X_test, 'policy', 1000)
 
         accuracy = accuracy_score(y_test, preds)

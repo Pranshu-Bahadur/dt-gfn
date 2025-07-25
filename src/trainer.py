@@ -48,7 +48,7 @@ class Config:
 
     # Policy network architecture
     lstm_hidden: int = 512
-    mlp_layers: int = 12
+    mlp_layers: int = 3
     mlp_width: int = 256
     lr: float = 1e-2
 
@@ -57,7 +57,7 @@ class Config:
     prior_scale: float = 0.5
 
     # Parallelism
-    num_parallel: int = 100
+    num_parallel: int = 10
     
     # Inference
     policy_inference_trees: int = 500
@@ -168,10 +168,10 @@ class Trainer:
                         R_t = calculate_bayesian_reward(tok, self.tokenizer, reward_env, beta)
                     else: # gini
                         R_t_per_step = deltaE_split_gain_classification(tok, self.tokenizer, reward_env)
-                        R_t = R_t_per_step.sum() + 1e-8
+                        R_t = R_t_per_step.sum(1) + 1e-8
                 else: # regression
                     R_t_per_step = deltaE_split_gain_regression(tok, self.tokenizer, env_template)
-                    R_t = R_t_per_step.sum() + 1e-8
+                    R_t = R_t_per_step.sum(1) + 1e-8
 
                 l_tb = tb_loss(log_pf, log_pb, self.log_z, R_t, torch.tensor([prior], device=device))
                 total_loss = l_tb
