@@ -1,19 +1,14 @@
-# src/env.py
-
 from __future__ import annotations
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.preprocessing import LabelEncoder
+
 
 class TabularEnv:
     """
-    A tabular decision-tree environment for GFN rollouts, updated to match
-    the production pipeline for Numerai data.
-
-    - Features are binned using quantile-based method.
-    - Reward calculation is removed as it's handled externally.
-    - Step logic correctly handles open leaves.
+    A tabular decision-tree environment for GFN rollouts.
     """
 
     def __init__(
@@ -22,19 +17,36 @@ class TabularEnv:
         feature_cols: List[str],
         target_col: str,
         n_bins: int,
+        task: str = "regression",
         device: str = "cpu",
+        shuffle_on_reset: bool = True
     ):
         self.device = device
         self.feature_cols = feature_cols
         self.target_col = target_col
         self.n_bins = n_bins
+        self.task = task
+        self.shuffle_on_reset = shuffle_on_reset
+        self.le = None
+        self.n_classes: Optional[int] = None
 
-        # Featurization is now handled internally
+        # Featurization is handled internally
         self.X_full = self._featurise(df_train, df_train, feature_cols, n_bins)
-        self.y_full = torch.tensor(
-            df_train[target_col].values, dtype=torch.float32, device=device
-        )
+        
+        if self.task == "classification":
+            self.le = LabelEncoder()
+            y_encoded = self.le.fit_transform(df_train[target_col].values)
+            self.y_full = torch.tensor(y_encoded, dtype=torch.long, device=device)
+            self.n_classes = len(self.le.classes_)
+        else:
+            self.y_full = torch.tensor(
+                df_train[target_col].values, dtype=torch.float32, device=device
+            )
+
         self.y = self.y_full.clone()
+        
+        # Keep a master set of indices to shuffle from
+        self._master_indices = torch.arange(len(self.y_full), device=device)
 
         # Will be set in reset()
         self.paths: List[Tuple[str, int]]
@@ -51,29 +63,23 @@ class TabularEnv:
     ) -> torch.Tensor:
         """
         Bins features using quantiles from the source dataframe.
-        Skips binning if the data is already of integer type.
         """
-        # --- Check if data is already binned ---
         if all(pd.api.types.is_integer_dtype(df_source[f]) for f in feats):
             return torch.tensor(
                 df_target[feats].values.astype(np.int8), device=self.device
             )
 
-        # --- If not binned, proceed with quantile binning ---
         X_binned = []
         for f in feats:
-            # Get series from source and target dataframes
             s_source = df_source[f].replace([np.inf, -np.inf], np.nan).fillna(df_source[f].median()).values
             s_eval = df_target[f].replace([np.inf, -np.inf], np.nan).fillna(df_source[f].median()).values
 
-            # Create quantile-based bin edges from the source data
             quantiles = np.linspace(0, 1, bins + 1)
             edges = np.quantile(s_source, quantiles)
             edges = np.unique(edges)
-            edges[0] -= 1e-9  # Ensure the lowest values are included
-            edges[-1] += 1e-9 # Ensure the highest values are included
+            edges[0] -= 1e-9
+            edges[-1] += 1e-9
 
-            # Bin the target data using the calculated edges
             binned_eval = np.searchsorted(edges, s_eval, side="right") - 1
             X_binned.append(binned_eval)
 
@@ -83,33 +89,34 @@ class TabularEnv:
 
     def reset(self, batch_size: int):
         """
-        Resets the environment for a new rollout, using a non-shuffling,
-        circular pointer to select a contiguous block of data.
+        Resets the environment for a new rollout.
+        If shuffle_on_reset is True, it shuffles the data indices before selecting a batch.
+        Otherwise, it uses a non-shuffling, circular pointer.
         """
         if not hasattr(self, "_ptr"):
-            self._ptr = 0  # Initialise the pointer on the first call
+            self._ptr = 0  # Initialise the pointer
+            # Shuffle indices at the beginning of the first epoch if required
+            if self.shuffle_on_reset:
+                self._master_indices = self._master_indices[torch.randperm(len(self._master_indices))]
 
-        n = len(self.y_full)
-        end = self._ptr + batch_size
+        # If we've completed an epoch, reset pointer and maybe shuffle
+        if self._ptr + batch_size > len(self._master_indices):
+            self._ptr = 0
+            if self.shuffle_on_reset:
+                # Reshuffle for the new epoch
+                self._master_indices = self._master_indices[torch.randperm(len(self._master_indices))]
+        
+        # Select the next batch of indices
+        self.idxs = self._master_indices[self._ptr : self._ptr + batch_size]
+        
+        # Move the pointer for the next batch
+        self._ptr += batch_size
 
-        if end <= n:
-            # Standard case: the batch fits within the remaining data
-            idxs = torch.arange(self._ptr, end, device=self.device)
-        else:
-            # Wrap-around case: the batch goes beyond the end of the data
-            first_part = torch.arange(self._ptr, n, device=self.device)
-            second_part = torch.arange(0, end - n, device=self.device)
-            idxs = torch.cat([first_part, second_part])
-
-        self._ptr = end % n  # Move the pointer for the next batch
-
-        self.idxs = idxs
         self.paths, self.open_leaves, self.done = [], 1, False
 
     def step(self, action: Tuple[str, int]):
         """
         Advance the environment by one token action.
-        Updates open_leaves based on the action taken.
         """
         self.paths.append(action)
         kind, _ = action
@@ -118,13 +125,11 @@ class TabularEnv:
         elif kind == "leaf":
             self.open_leaves -= 1
 
-        # A trajectory is done if all leaves are closed or if it's too long
         self.done = (self.open_leaves == 0 or len(self.paths) > 8192)
 
     def get_prior(self, current_beta: float) -> torch.Tensor:
         """
         Computes the prior for a completed trajectory.
-        Reward is now calculated externally.
         """
         prior = -current_beta * sum(1 for k, _ in self.paths if k == "feat")
         return torch.tensor([prior], device=self.device)

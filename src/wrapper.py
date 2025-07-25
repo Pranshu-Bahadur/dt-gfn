@@ -2,55 +2,53 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, List
 
 import pandas as pd
-from sklearn.base import BaseEstimator, RegressorMixin
+import numpy as np
+import torch
+from sklearn.base import BaseEstimator, RegressorMixin, ClassifierMixin
 
 from src.trainer import Trainer, Config
 
 
-class DTGFNRegressor(BaseEstimator, RegressorMixin):
+class DTGFN(BaseEstimator):
     """
-    Scikit-learn compatible wrapper around the updated DT-GFN Trainer.
+    Scikit-learn compatible wrapper for the DT-GFN Trainer.
     
-    This wrapper allows for two prediction modes:
-    1. 'ensemble': Uses the pre-trained boosted ensemble from the replay buffer (default).
-    2. 'policy': Generates a new ensemble of trees directly from the policy network at inference time.
+    This wrapper can be used for both regression and classification tasks.
     """
 
     def __init__(self, feature_cols: Optional[List[str]] = None, **config_kwargs):
         """
-        Initializes the DTGFNRegressor.
+        Initializes the DTGFN model.
 
         Args:
             feature_cols (Optional[List[str]]): A list of feature column names. 
-                                                If None, all columns in X during fit (except 'target') will be used.
+                                                If None, all columns in X during fit will be used.
             **config_kwargs: Hyperparameters for the Trainer's Config object.
         """
-        # Store kwargs so get_params works
         self.feature_cols = feature_cols
         self._cfg_kwargs: Dict[str, Any] = config_kwargs
         self._trainer: Optional[Trainer] = None
         self.df_train_: Optional[pd.DataFrame] = None
+        self.task = self._cfg_kwargs.get("task", "classification")
 
-    # ------------------------------------------------------------------ #
-    # scikit-learn API
-    # ------------------------------------------------------------------ #
     def fit(self, X: pd.DataFrame, y=None):
         """
         Fit the model. `X` must be a pandas DataFrame; `y` may be a Series/
         array, or you may include the target column in `X` and omit `y`.
         """
+        # Get target column name from config, default to 'target' if not provided
+        target_col = self._cfg_kwargs.get("target_col", "target")
+
         # Build training DataFrame with target column present
         if y is not None:
             df_train = X.copy()
-            df_train["target"] = y
-            target_col = "target"
+            df_train[target_col] = y
         else:
-            if "target" not in X.columns:
+            if target_col not in X.columns:
                 raise ValueError(
-                    "If `y` is not provided, X must contain a 'target' column."
+                    f"If `y` is not provided, X must contain the target column '{target_col}'."
                 )
             df_train = X.copy()
-            target_col = "target"
 
         self.df_train_ = df_train.copy()
         
@@ -66,45 +64,57 @@ class DTGFNRegressor(BaseEstimator, RegressorMixin):
             target_col=target_col,
             **self._cfg_kwargs,
         )
+        self.task = cfg.task
 
         # Train
         self._trainer = Trainer(cfg).fit(df_train)
-        return self  # sklearn convention
+        return self
 
-    def predict(self, X: pd.DataFrame, predict_mode: str = "ensemble", n_trees: Optional[int] = None) -> pd.Series:
+    def predict(self, X: pd.DataFrame, predict_mode: str = "ensemble", n_trees: Optional[int] = None) -> np.ndarray:
         """
         Make predictions using the fitted model.
 
-        Args:
-            X (pd.DataFrame): The input features for which to make predictions.
-            predict_mode (str): The prediction strategy. Can be one of:
-                                'ensemble': Use the boosted ensemble created during training (default).
-                                'policy': Generate a new boosted ensemble on-the-fly from the policy network.
-            n_trees (Optional[int]): The number of trees to generate when using 'policy' mode.
-                                     If None, uses the default from the model configuration.
-                                     This argument is ignored if predict_mode is 'ensemble'.
-
-        Returns:
-            A pandas Series containing the predictions.
+        For regression, this returns the predicted values.
+        For classification, this returns the class labels.
         """
-        if self._trainer is None or self.df_train_ is None:
-            raise RuntimeError("DTGFNRegressor has not been fitted yet. Call fit() first.")
-
-        use_policy = (predict_mode == "policy")
+        if self._trainer is None:
+            raise RuntimeError("DTGFN has not been fitted yet. Call fit() first.")
         
-        predictions = self._trainer.predict(
-            df_test=X, 
-            df_train=self.df_train_, 
-            use_policy=use_policy, 
-            policy_inference_trees=n_trees
-        )
+        if self.task == "regression":
+            return self._trainer.predict(df_test=X, df_train=self.df_train_, use_policy=(predict_mode == "policy"), policy_inference_trees=n_trees)
+        else:
+            probas = self.predict_proba(X, predict_mode, n_trees)
+            if self._trainer.cfg.n_classes == 2:
+                # Get the index of the highest probability for each sample
+                return probas.argmax(axis=1)
+            else:
+                return probas.argmax(axis=1)
+
+
+    def predict_proba(self, X: pd.DataFrame, predict_mode: str = "ensemble", n_trees: Optional[int] = None) -> np.ndarray:
+        """
+        Predict class probabilities.
+        """
+        if self._trainer is None:
+            raise RuntimeError("DTGFN has not been fitted yet. Call fit() first.")
+        if self.task != "classification":
+            raise AttributeError("predict_proba is only available for classification tasks.")
+
+        logits = self._trainer.predict(df_test=X, df_train=self.df_train_, use_policy=(predict_mode == "policy"), policy_inference_trees=n_trees)
         
-        return pd.Series(predictions, index=X.index)
+        if self._trainer.cfg.n_classes == 2:
+            # logits are 1D for binary classification
+            probas = torch.sigmoid(torch.from_numpy(logits)).numpy()
+            # Ensure probas is a column vector before stacking
+            if probas.ndim == 1:
+                probas = probas.reshape(-1, 1)
+            # Create a (n_samples, 2) array with P(class 0) and P(class 1)
+            return np.hstack([1 - probas, probas])
+        else:
+            # logits are (n_samples, n_classes) for multi-class
+            return torch.softmax(torch.from_numpy(logits), dim=1).numpy()
 
 
-    # ------------------------------------------------------------------ #
-    # Parameter handling for GridSearchCV / cloning
-    # ------------------------------------------------------------------ #
     def get_params(self, deep: bool = True) -> Dict[str, Any]:
         """Gets parameters for this estimator."""
         params = self._cfg_kwargs.copy()
@@ -124,3 +134,13 @@ class DTGFNRegressor(BaseEstimator, RegressorMixin):
                 setattr(self._trainer.cfg, k, v)
 
         return self
+
+class DTGFNRegressor(DTGFN, RegressorMixin):
+    def __init__(self, feature_cols: Optional[List[str]] = None, **config_kwargs):
+        config_kwargs["task"] = "regression"
+        super().__init__(feature_cols, **config_kwargs)
+
+class DTGFNClassifier(DTGFN, ClassifierMixin):
+    def __init__(self, feature_cols: Optional[List[str]] = None, **config_kwargs):
+        config_kwargs["task"] = "classification"
+        super().__init__(feature_cols, **config_kwargs)
