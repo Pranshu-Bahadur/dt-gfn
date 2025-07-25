@@ -3,7 +3,7 @@ from typing import List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 
 
 class TabularEnv:
@@ -19,7 +19,8 @@ class TabularEnv:
         n_bins: int,
         task: str = "regression",
         device: str = "cpu",
-        shuffle_on_reset: bool = False
+        shuffle_on_reset: bool = False,
+        binning_strategy: str = "global_uniform" # "quantile" or "global_uniform"
     ):
         self.device = device
         self.feature_cols = feature_cols
@@ -27,8 +28,10 @@ class TabularEnv:
         self.n_bins = n_bins
         self.task = task
         self.shuffle_on_reset = shuffle_on_reset
+        self.binning_strategy = binning_strategy
         self.le = None
         self.n_classes: Optional[int] = None
+        self.scalers = {} # To store scalers for global_uniform strategy
 
         # Featurization is handled internally
         self.X_full = self._featurise(df_train, df_train, feature_cols, n_bins)
@@ -45,10 +48,8 @@ class TabularEnv:
 
         self.y = self.y_full.clone()
         
-        # Keep a master set of indices to shuffle from
         self._master_indices = torch.arange(len(self.y_full), device=device)
 
-        # Will be set in reset()
         self.paths: List[Tuple[str, int]]
         self.open_leaves: int
         self.done: bool
@@ -62,26 +63,52 @@ class TabularEnv:
         bins: int
     ) -> torch.Tensor:
         """
-        Bins features using quantiles from the source dataframe.
+        Bins features using the specified strategy.
         """
         if all(pd.api.types.is_integer_dtype(df_source[f]) for f in feats):
             return torch.tensor(
-                df_target[feats].values.astype(np.int8), device=self.device
+                df_target[feats].values.astype(np.int32), device=self.device
             )
 
         X_binned = []
-        for f in feats:
-            s_source = df_source[f].replace([np.inf, -np.inf], np.nan).fillna(df_source[f].median()).values
-            s_eval = df_target[f].replace([np.inf, -np.inf], np.nan).fillna(df_source[f].median()).values
+        
+        if self.binning_strategy == "quantile":
+            for f in feats:
+                s_source = df_source[f].replace([np.inf, -np.inf], np.nan).fillna(df_source[f].median()).values
+                s_eval = df_target[f].replace([np.inf, -np.inf], np.nan).fillna(df_source[f].median()).values
 
-            quantiles = np.linspace(0, 1, bins + 1)
-            edges = np.quantile(s_source, quantiles)
-            edges = np.unique(edges)
+                quantiles = np.linspace(0, 1, bins + 1)
+                edges = np.quantile(s_source, quantiles)
+                edges = np.unique(edges)
+                edges[0] -= 1e-9
+                edges[-1] += 1e-9
+
+                binned_eval = np.searchsorted(edges, s_eval, side="right") - 1
+                X_binned.append(binned_eval)
+
+        elif self.binning_strategy == "global_uniform":
+            # Define uniform bin edges from 0 to 1
+            edges = np.linspace(0, 1, bins + 1)
             edges[0] -= 1e-9
             edges[-1] += 1e-9
+            
+            for f in feats:
+                # If fitting (source is target), create and store a scaler
+                if df_source.equals(df_target):
+                    scaler = MinMaxScaler()
+                    # Fit on the source data column
+                    scaler.fit(df_source[[f]])
+                    self.scalers[f] = scaler
+                
+                # Use the stored scaler to transform the target data column
+                scaled_eval = self.scalers[f].transform(df_target[[f]])
+                
+                # Bin the scaled data
+                binned_eval = np.searchsorted(edges, scaled_eval.ravel(), side="right") - 1
+                X_binned.append(binned_eval)
+        else:
+            raise ValueError(f"Unknown binning_strategy: {self.binning_strategy}")
 
-            binned_eval = np.searchsorted(edges, s_eval, side="right") - 1
-            X_binned.append(binned_eval)
 
         return torch.tensor(
             np.stack(X_binned, 1).astype(np.int32), device=self.device
@@ -90,26 +117,18 @@ class TabularEnv:
     def reset(self, batch_size: int):
         """
         Resets the environment for a new rollout.
-        If shuffle_on_reset is True, it shuffles the data indices before selecting a batch.
-        Otherwise, it uses a non-shuffling, circular pointer.
         """
         if not hasattr(self, "_ptr"):
-            self._ptr = 0  # Initialise the pointer
-            # Shuffle indices at the beginning of the first epoch if required
+            self._ptr = 0
             if self.shuffle_on_reset:
                 self._master_indices = self._master_indices[torch.randperm(len(self._master_indices))]
 
-        # If we've completed an epoch, reset pointer and maybe shuffle
         if self._ptr + batch_size > len(self._master_indices):
             self._ptr = 0
             if self.shuffle_on_reset:
-                # Reshuffle for the new epoch
                 self._master_indices = self._master_indices[torch.randperm(len(self._master_indices))]
         
-        # Select the next batch of indices
         self.idxs = self._master_indices[self._ptr : self._ptr + batch_size]
-        
-        # Move the pointer for the next batch
         self._ptr += batch_size
 
         self.paths, self.open_leaves, self.done = [], 1, False
