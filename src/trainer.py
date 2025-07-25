@@ -398,71 +398,51 @@ class Trainer:
                 train_preds += c.boosting_lr * avg_train
         else:
             total_trees = policy_inference_trees if policy_inference_trees is not None else c.policy_inference_trees
-            num_batches = math.ceil(total_trees / c.rollouts)
-            beta = c.beta if c.beta is not None else 0.1
-            temp = 1.0
+            num_batches = math.ceil(total_trees / c.num_parallel)
 
             for i in tqdm(range(num_batches), desc="Policy-based Prediction", leave=False):
-                # Update residuals
                 if c.task == "regression":
-                    residuals = y_tr - train_preds
+                    residuals_for_batch = y_tr - train_preds
                 else:
                     if c.n_classes > 2:
                         probs = torch.softmax(train_preds, dim=1)
-                        residuals = torch.nn.functional.one_hot(y_tr, num_classes=c.n_classes) - probs
+                        residuals_for_batch = torch.nn.functional.one_hot(y_tr, num_classes=c.n_classes) - probs
                     else:
                         probs = torch.sigmoid(train_preds)
-                        residuals = y_tr - probs
+                        residuals_for_batch = y_tr - probs
                 
-                env_template.y = residuals.clone()
-                reward_env = copy.copy(env_template)
-                reward_env.reset(len(y_tr))
+                env_template.y = residuals_for_batch.clone()
 
-                # Perform rollouts
-                forward_tuples = self._collect_rollouts(env_template, temp, residuals, beta)
-                
-                # Sample from replay buffer
-                replay_tuples = self.sample_replay(c.top_k_trees)
-                
-                # Combine rollouts and replay samples
-                all_tuples = forward_tuples + replay_tuples
-                all_seqs = [seq for seq, _ in all_tuples]
+                trees_in_batch = min(c.num_parallel, total_trees - (i * c.num_parallel))
+                if trees_in_batch <= 0:
+                    break
 
-                if not all_seqs:
+                batch_results = self.batched_rollout(
+                    [copy.copy(env_template) for _ in range(trees_in_batch)],
+                    temp=1.0,
+                    residuals=residuals_for_batch,
+                    beta=c.beta if c.beta is not None else 0.1
+                )
+                
+                generated_seqs = [res[0] for res in batch_results if res is not None]
+                if not generated_seqs:
                     continue
 
-                # Evaluate all trees to find top-k
-                tree_rewards = []
-                for seq in all_seqs:
-                    tok = torch.tensor([seq], device=device)
-                    if c.task == "classification":
-                        if c.reward_function == "bayesian":
-                            R_t = calculate_bayesian_reward(tok, self.tokenizer, reward_env, beta).item()
-                        else:
-                            R_t = deltaE_split_gain_classification(tok, self.tokenizer, reward_env).sum().item()
-                    else:
-                        R_t = deltaE_split_gain_regression(tok, self.tokenizer, reward_env).sum().item()
-                    tree_rewards.append(R_t)
-
-                # Sort and select top-k trees
-                sorted_indices = sorted(range(len(all_seqs)), key=lambda i: tree_rewards[i], reverse=True)
-                top_k_seqs = [all_seqs[i] for i in sorted_indices[:c.top_k_trees]]
-
-                # Predict using top-k trees
                 avg_test_batch = torch.zeros_like(test_preds)
                 avg_train_batch = torch.zeros_like(train_preds)
-                for seq in top_k_seqs:
-                    predictor = get_tree_predictor(seq, X_tr, residuals, self.tokenizer)
+
+                for seq in generated_seqs:
+                    predictor = get_tree_predictor(seq, X_tr, residuals_for_batch, self.tokenizer)
                     avg_test_batch += predictor(X_te)
                     avg_train_batch += predictor(X_tr)
                 
-                if top_k_seqs:
-                    avg_test_batch /= len(top_k_seqs)
-                    avg_train_batch /= len(top_k_seqs)
+                if generated_seqs:
+                    avg_test_batch /= len(generated_seqs)
+                    avg_train_batch /= len(generated_seqs)
 
                 test_preds += c.boosting_lr * avg_test_batch
                 train_preds += c.boosting_lr * avg_train_batch
-
+                
         return test_preds.cpu().numpy()
 
     def get_params(self, deep=True): return asdict(self.cfg)
