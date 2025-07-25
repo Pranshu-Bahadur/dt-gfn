@@ -45,18 +45,19 @@ def run_benchmark(dataset_name: str):
 
     accuracies = []
     f1_scores = []
-    seeds = [42, 123, 456, 789, 1011]
+    seeds = [1, 2, 3, 4, 5]
 
     for i, seed in enumerate(seeds):
         print(f"\n--- Running Seed {i+1}/{len(seeds)} (random_state={seed}) ---")
         
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=seed, stratify=y if y.nunique() > 1 else None)
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=seed, stratify=y if y.nunique() > 1 else None)
 
         model = DTGFNClassifier(
-            n_bins=99,
+            n_bins=100,
             updates=100,
-            rollouts=10,
+            rollouts=90,
             batch_size=900,
+            top_k_trees=10,
             max_depth=5,
             boosting_lr=1.0,
             reward_function='gini',
@@ -64,6 +65,7 @@ def run_benchmark(dataset_name: str):
         )
         
         model.fit(X_train, y_train)
+        #model._trainer.cfg.boosting_lr = 0.5
         preds = model.predict(X_test, 'policy', 1000) 
 
         accuracy = accuracy_score(y_test, preds)

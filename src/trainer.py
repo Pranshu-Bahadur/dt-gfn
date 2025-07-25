@@ -15,7 +15,7 @@ from sklearn.preprocessing import LabelEncoder
 
 from src.tokenizer import Tokenizer, Vocab
 from src.env import TabularEnv
-from src.policy import PolicyPaperMLP
+from src.policy import PolicyPaperMLP, PolicyTransformer
 from src.utils import (
     ReplayBuffer,
     tb_loss,
@@ -47,8 +47,8 @@ class Config:
     boosting_lr: float = 0.1
 
     # Policy network architecture
-    lstm_hidden: int = 256
-    mlp_layers: int = 3
+    lstm_hidden: int = 512
+    mlp_layers: int = 12
     mlp_width: int = 256
     lr: float = 1e-2
 
@@ -57,7 +57,7 @@ class Config:
     prior_scale: float = 0.5
 
     # Parallelism
-    num_parallel: int = 10
+    num_parallel: int = 100
     
     # Inference
     policy_inference_trees: int = 500
@@ -94,11 +94,12 @@ class Trainer:
 
         y_true, X_binned = env_template.y_full.clone(), env_template.X_full.clone()
 
-        pf = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
-        pb = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
+        pf = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)#PolicyTransformer(v.size()).to(device)
+        pb = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)#PolicyTransformer(v.size()).to(device)
         self.pf, self.pb = torch.jit.script(pf), torch.jit.script(pb)
 
-        self.log_z = torch.zeros((), device=device, requires_grad=True)
+        self.log_z = torch.nn.Parameter(torch.tensor(150.0 / 64, device=device))
+        
         optimizers = [
             torch.optim.AdamW(self.pf.parameters(), lr=c.lr),
             torch.optim.AdamW(self.pb.parameters(), lr=c.lr),
@@ -139,9 +140,9 @@ class Trainer:
             
             env_template.y = residuals.clone()
 
-            beta = 0.1#c.beta if c.beta is not None else 0.1
+            beta = c.beta if c.beta is not None else 0.1
             temp = max(1.0, 5.0 - (upd - 1) * (4.0 / 20.0))
-            lam_fl = 0.1#min(1.0, upd / 20.0)
+            lam_fl = 0.1
 
             for opt in optimizers: opt.zero_grad()
             
@@ -152,29 +153,34 @@ class Trainer:
 
             all_tuples = forward_tuples + self.sample_replay(c.top_k_trees)
             
+            # Add loss accumulators
+            tb_loss_acc = 0.0
+            fl_loss_acc = 0.0
+            
             for seq, prior in all_tuples:
                 tok = torch.tensor([seq], device=device)
                 log_pf = self.pf.log_prob(tok)
                 log_pb = self.pb.log_prob(torch.flip(tok, dims=[1]))
                 
-                R_t_per_step = None # Initialize to handle scope
+                R_t_per_step = None 
                 if c.task == "classification":
                     if c.reward_function == "bayesian":
                         R_t = calculate_bayesian_reward(tok, self.tokenizer, reward_env, beta)
                     else: # gini
                         R_t_per_step = deltaE_split_gain_classification(tok, self.tokenizer, reward_env)
-                        R_t = R_t_per_step.sum(1) + 1e-8
+                        R_t = R_t_per_step.sum() + 1e-8
                 else: # regression
                     R_t_per_step = deltaE_split_gain_regression(tok, self.tokenizer, env_template)
-                    R_t = R_t_per_step.sum(1) + 1e-8
+                    R_t = R_t_per_step.sum() + 1e-8
 
                 l_tb = tb_loss(log_pf, log_pb, self.log_z, R_t, torch.tensor([prior], device=device))
                 total_loss = l_tb
+                tb_loss_acc += l_tb.item()
                 
-                # Add Flow Loss if we have per-step rewards (i.e., for regression and Gini classification)
                 if R_t_per_step is not None:
                     l_fl = fl_loss(self.pf.log_F(tok), log_pf, log_pb, R_t_per_step)
                     total_loss += lam_fl * l_fl
+                    fl_loss_acc += l_fl.item()
                 
                 total_loss.backward()
 
@@ -184,15 +190,21 @@ class Trainer:
 
             base_pred = self._update_ensemble(base_pred, X_binned, residuals, beta, reward_env)
             
+            # Logging
+            n_trajs = len(all_tuples)
+            avg_tb_loss = tb_loss_acc / n_trajs if n_trajs > 0 else 0
+            avg_fl_loss = fl_loss_acc / n_trajs if n_trajs > 0 else 0
+            
+            log_str = f"Update {upd}/{c.updates} | TB Loss: {avg_tb_loss:.4f} | FL Loss: {avg_fl_loss:.4f}"
             if c.task == "regression":
                 corr = torch.corrcoef(torch.stack([base_pred.squeeze(), y_true.squeeze()]))[0, 1].item()
-                tqdm.write(f"Update {upd}/{c.updates} | Train Corr: {corr:+.4f}")
+                tqdm.write(f"{log_str} | Train Corr: {corr:+.4f}")
             else:
                 if c.n_classes > 2:
                   acc = (base_pred.argmax(1) == y_true).float().mean().item()
                 else:
                   acc = ((torch.sigmoid(base_pred) > 0.5).long() == y_true).float().mean().item()
-                tqdm.write(f"Update {upd}/{c.updates} | Train Acc: {acc:.4f}")
+                tqdm.write(f"{log_str} | Train Acc: {acc:.4f}")
 
             self.replay_buffer.data.clear()
         return self

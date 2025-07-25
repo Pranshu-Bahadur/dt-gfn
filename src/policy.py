@@ -117,12 +117,12 @@ class PolicyTransformer(PolicyBase):
     def __init__(
         self,
         vocab_size: int,
-        d_model: int = 512,
-        n_layers: int = 6,
-        n_heads: int = 8,
-        d_ff: int = 2048,
-        dropout: float = 0.3,
-        max_len: int = 4*1024,
+        d_model: int = 128,
+        n_layers: int = 3,
+        n_heads: int = 4,
+        d_ff: int = 512,
+        dropout: float = 0.2,
+        max_len: int = 4*32,
     ):
         super().__init__()
 
