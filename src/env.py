@@ -20,7 +20,7 @@ class TabularEnv:
         task: str = "regression",
         device: str = "cpu",
         shuffle_on_reset: bool = False,
-        binning_strategy: str = "quantile" # "quantile" or "global_uniform"
+        binning_strategy: str = "global_uniform" # "quantile" or "global_uniform"
     ):
         self.device = device
         self.feature_cols = feature_cols

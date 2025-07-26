@@ -50,22 +50,24 @@ def run_benchmark(dataset_name: str):
     for i, seed in enumerate(seeds):
         print(f"\n--- Running Seed {i+1}/{len(seeds)} (random_state={seed}) ---")
 
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=seed, stratify=y if y.nunique() > 1 else None)
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=seed, stratify=y if y.nunique() > 1 else None)
 
         model = DTGFNClassifier(
             n_bins=99,
             updates=100,
             rollouts=10,
-            batch_size=150,
+            batch_size=900,
             top_k_trees=10,
             max_depth=5,
+            num_parallel=10,
             boosting_lr=1.0,
             reward_function='gini',
+            beta=0.7,
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
 
         model.fit(X_train, y_train)
-        model._trainer.cfg.num_parallel = 10
+        #model._trainer.cfg.random_forest = False
         preds = model.predict(X_test, 'policy', 1000)
 
         accuracy = accuracy_score(y_test, preds)

@@ -100,7 +100,6 @@ def deltaE_split_gain_classification(tokens: torch.Tensor, tok: "Tokenizer", env
         n_labels = len(labels)
         if n_labels == 0: return 0.0
         
-        # Clamp labels to be safe against CUDA errors
         clamped_labels = torch.clamp(labels, 0, env.n_classes - 1)
         counts = torch.bincount(clamped_labels, minlength=env.n_classes)
         
@@ -149,10 +148,10 @@ def deltaE_split_gain_classification(tokens: torch.Tensor, tok: "Tokenizer", env
 
 def calculate_bayesian_reward(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularEnv", beta: float) -> torch.Tensor:
     """
-    Computes reward for a completed tree based on Bayesian marginal likelihood.
+    Computes reward for a completed tree based on Bayesian marginal likelihood, as per the paper[cite: 324].
     Used for CLASSIFICATION tasks with the 'bayesian' reward function.
     """
-    alpha = 0.1
+    alpha = 0.1 # Dirichlet prior, as specified in the paper's hyperparameter table [cite: 895]
     alphas = torch.full((env.n_classes,), alpha, device=env.device)
 
     decoded_actions = tok.decode(tokens[0, 1:-1].tolist())
@@ -160,7 +159,6 @@ def calculate_bayesian_reward(tokens: torch.Tensor, tok: "Tokenizer", env: "Tabu
     leaves_indices = []
     n_decision_nodes = 0
     
-    # This logic builds a representation of the tree to find leaf nodes
     tree_nodes = {0: {'indices': env.idxs, 'children': []}}
     node_counter = 0
 
@@ -168,40 +166,35 @@ def calculate_bayesian_reward(tokens: torch.Tensor, tok: "Tokenizer", env: "Tabu
     
     while True:
         try:
-            # Find the next available leaf to split on
             leaf_node_id = -1
-            for nid, node in sorted(tree_nodes.items()): # process in order
+            for nid, node in sorted(tree_nodes.items()):
                 if not node['children']:
                     leaf_node_id = nid
                     break
             
-            if leaf_node_id == -1: break # No more leaves to split
+            if leaf_node_id == -1: break
 
             kind, val = next(action_iter)
-
             parent_indices = tree_nodes[leaf_node_id]['indices']
 
             if kind == 'feat':
-                if len(parent_indices) == 0: # Cannot split an empty node
-                    next(action_iter) # consume threshold
+                if len(parent_indices) == 0:
+                    next(action_iter)
                     continue
 
                 n_decision_nodes += 1
                 _, threshold = next(action_iter)
                 
-                # Partition data
                 fv = env.X_full[parent_indices, val]
                 mask = fv <= threshold
                 
                 left_indices = parent_indices[mask]
                 right_indices = parent_indices[~mask]
 
-                # If a split is invalid (all data goes to one side), treat as a leaf
                 if len(left_indices) == 0 or len(right_indices) == 0:
-                    tree_nodes[leaf_node_id]['children'] = [-1, -1] # Mark as terminal
+                    tree_nodes[leaf_node_id]['children'] = [-1, -1]
                     continue
 
-                # Add new nodes to tree
                 node_counter += 1; left_child_id = node_counter
                 tree_nodes[left_child_id] = {'indices': left_indices, 'children': []}
                 
@@ -209,18 +202,17 @@ def calculate_bayesian_reward(tokens: torch.Tensor, tok: "Tokenizer", env: "Tabu
                 tree_nodes[right_child_id] = {'indices': right_indices, 'children': []}
                 
                 tree_nodes[leaf_node_id]['children'] = [left_child_id, right_child_id]
-
-            else: # 'leaf' action means this path terminates
-                tree_nodes[leaf_node_id]['children'] = [-1, -1] # Mark as terminal
+            else:
+                tree_nodes[leaf_node_id]['children'] = [-1, -1]
                 
         except StopIteration:
             break
             
-    # Collect indices from all terminal leaf nodes
     for nid, node in tree_nodes.items():
         if not node['children']:
             leaves_indices.append(node['indices'])
 
+    # Calculate Log Marginal Likelihood from Proposition 3.2 
     log_likelihood = 0.0
     log_gamma_alpha_sum = torch.lgamma(alphas.sum())
     log_gamma_alpha_prod = torch.lgamma(alphas).sum()
@@ -237,6 +229,7 @@ def calculate_bayesian_reward(tokens: torch.Tensor, tok: "Tokenizer", env: "Tabu
         log_denominator = torch.lgamma(n_l + alphas.sum())
         log_likelihood += log_numerator - log_denominator
         
+    # Calculate Structure Prior from Section 4.2 
     log_prior = -beta * n_decision_nodes
     log_reward = log_likelihood + log_prior
     reward = torch.exp(log_reward) + 1e-9
