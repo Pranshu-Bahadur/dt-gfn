@@ -62,7 +62,8 @@ def run_benchmark(dataset_name: str):
             num_parallel=10,
             boosting_lr=1.0,
             reward_function='gini',
-            beta=0.7,
+            random_forest=False,
+            #beta=0.7,
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
 
