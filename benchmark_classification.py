@@ -53,23 +53,24 @@ def run_benchmark(dataset_name: str):
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=seed, stratify=y if y.nunique() > 1 else None)
 
         model = DTGFNClassifier(
-            n_bins=99,
+            n_bins=99, #please change binning_strategy to quantile in env.py for sota results with boosting
             updates=100,
             rollouts=10,
-            batch_size=900,
+            batch_size=1000, #please change according to dataset
             top_k_trees=10,
             max_depth=5,
-            num_parallel=10,
-            boosting_lr=1.0,
-            reward_function='gini',
+            num_parallel=10, #num paralellel rollouts
+            boosting_lr=0.1, #can try 0.1 or 1.0
+            reward_function='gini', #comment for bayesian reward
             random_forest=False,
-            #beta=0.7,
+            #beta=0.01, #for boosted version otherwise comment for approximation formula
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
 
         model.fit(X_train, y_train)
-        #model._trainer.cfg.random_forest = False
-        preds = model.predict(X_test, 'policy', 1000)
+        #model._trainer.cfg.random_forest = True
+        #model._trainer.cfg.num_parallel = 100
+        preds = model.predict(X_test, 'ensemble', 1000) #ensemble for uses best trees from training
 
         accuracy = accuracy_score(y_test, preds)
         f1 = f1_score(y_test, preds, average='weighted')

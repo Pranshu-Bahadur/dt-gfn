@@ -48,10 +48,10 @@ class Config:
     boosting_lr: float = 0.1
 
     # Policy network architecture
-    lstm_hidden: int = 512
+    lstm_hidden: int = 256
     mlp_layers: int = 3
     mlp_width: int = 256
-    lr: float = 1e-2
+    lr: float = 5e-5
 
     # Priors & annealing
     beta: Optional[float] = None  # Will be set based on the paper's formula
@@ -104,8 +104,8 @@ class Trainer:
         self.log_z = torch.nn.Parameter(torch.tensor(150.0 / 64, device=device))
         
         optimizers = [
-            torch.optim.AdamW(self.pf.parameters(), lr=c.lr),
-            torch.optim.AdamW(self.pb.parameters(), lr=c.lr),
+            torch.optim.AdamW(self.pf.parameters(), lr=c.lr, weight_decay=1e-5),
+            torch.optim.AdamW(self.pb.parameters(), lr=c.lr, weight_decay=1e-5),
             torch.optim.Adam([self.log_z], lr=c.lr / 10)
         ]
 
@@ -476,12 +476,12 @@ class Trainer:
                     train_preds += c.boosting_lr * avg_train_batch
                 
                     # ---- inside predict(), at the very end ----
-            if c.task == "classification":
-                if c.n_classes == 2:
-                    return test_preds[:, 1].cpu().numpy()   # already probs
-                return test_preds.cpu().numpy()             # (N, C) prob-matrix
-            else:
-                return test_preds.cpu().numpy()
+        if c.task == "classification":
+            if c.n_classes == 2:
+                  return test_preds[:, 1].cpu().numpy()   # already probs
+            return test_preds.cpu().numpy()             # (N, C) prob-matrix
+        else:
+            return test_preds.cpu().numpy()
 
 
     def get_params(self, deep=True): return asdict(self.cfg)
