@@ -69,8 +69,8 @@ def run_benchmark(dataset_name: str):
 
         model.fit(X_train, y_train)
         #model._trainer.cfg.random_forest = True
-        #model._trainer.cfg.num_parallel = 100
-        preds = model.predict(X_test, 'ensemble', 1000) #ensemble for uses best trees from training
+        #model._trainer.cfg.num_parallel = 1
+        preds = model.predict(X_test, 'policy', 1000) #ensemble for uses best trees from training
 
         accuracy = accuracy_score(y_test, preds)
         f1 = f1_score(y_test, preds, average='weighted')

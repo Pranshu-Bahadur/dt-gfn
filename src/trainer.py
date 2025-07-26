@@ -51,7 +51,7 @@ class Config:
     lstm_hidden: int = 256
     mlp_layers: int = 3
     mlp_width: int = 256
-    lr: float = 5e-5
+    lr: float = 1e-3
 
     # Priors & annealing
     beta: Optional[float] = None  # Will be set based on the paper's formula
@@ -97,8 +97,8 @@ class Trainer:
 
         y_true, X_binned = env_template.y_full.clone(), env_template.X_full.clone()
 
-        pf = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
-        pb = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
+        pf = PolicyTransformer(v.size()).to(device)#PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
+        pb =  PolicyTransformer(v.size()).to(device)#PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
         self.pf, self.pb = torch.jit.script(pf), torch.jit.script(pb)
 
         self.log_z = torch.nn.Parameter(torch.tensor(150.0 / 64, device=device))
