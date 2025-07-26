@@ -61,8 +61,8 @@ def run_benchmark(dataset_name: str):
             max_depth=5,
             num_parallel=10, #num paralellel rollouts
             boosting_lr=0.1, #can try 0.1 or 1.0
-            reward_function='gini', #comment for bayesian reward
-            random_forest=False,
+            #reward_function='gini', #comment for bayesian reward
+            random_forest=True,
             #beta=0.01, #for boosted version otherwise comment for approximation formula
             device="cuda" if torch.cuda.is_available() else "cpu",
         )

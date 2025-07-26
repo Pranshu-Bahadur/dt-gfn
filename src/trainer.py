@@ -104,8 +104,8 @@ class Trainer:
         self.log_z = torch.nn.Parameter(torch.tensor(150.0 / 64, device=device))
         
         optimizers = [
-            torch.optim.AdamW(self.pf.parameters(), lr=c.lr, weight_decay=1e-5),
-            torch.optim.AdamW(self.pb.parameters(), lr=c.lr, weight_decay=1e-5),
+            torch.optim.AdamW(self.pf.parameters(), lr=c.lr, weight_decay=1e-1),
+            torch.optim.AdamW(self.pb.parameters(), lr=c.lr, weight_decay=1e-1),
             torch.optim.Adam([self.log_z], lr=c.lr / 10)
         ]
 
@@ -141,7 +141,7 @@ class Trainer:
 
             beta = c.beta if c.beta is not None else 0.1
             temp = 1.0#max(1.0, 5.0 - (upd - 1) * (4.0 / 20.0))
-            lam_fl = 0.1
+            lam_fl = 1.0
 
             for opt in optimizers: opt.zero_grad()
             
@@ -163,7 +163,7 @@ class Trainer:
                 R_t_per_step = None 
                 if c.task == "classification":
                     if c.reward_function == "bayesian":
-                        R_t = R_t_per_step = calculate_bayesian_reward(tok, self.tokenizer, reward_env, beta)
+                        R_t = calculate_bayesian_reward(tok, self.tokenizer, reward_env, beta)
                     else:  # gini
                         R_t_per_step = deltaE_split_gain_classification(tok, self.tokenizer, reward_env)
                         R_t = R_t_per_step.sum() + 1e-8
