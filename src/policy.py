@@ -120,9 +120,9 @@ class PolicyTransformer(PolicyBase):
         d_model: int = 256,
         n_layers: int = 3,
         n_heads: int = 2,
-        d_ff: int = 256,
-        dropout: float = 0.2,
-        max_len: int = 4*32,
+        d_ff: int = 256*4,
+        dropout: float = 0.1,
+        max_len: int = 1024,
     ):
         super().__init__()
 
@@ -137,7 +137,7 @@ class PolicyTransformer(PolicyBase):
             dim_feedforward = d_ff,
             dropout   = dropout,
             batch_first = True,            # (B, T, D)
-            activation = "gelu",
+            activation = "relu",
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
@@ -146,7 +146,7 @@ class PolicyTransformer(PolicyBase):
         self.head_flow = nn.Linear(d_model, 1)
 
         # init
-        self._reset_parameters()
+        #self._reset_parameters()
 
     # ------------------------------------------------------------------ #
     # helpers
@@ -177,7 +177,7 @@ class PolicyTransformer(PolicyBase):
           flow   : (B, T)
         """
         h = self.token_emb(seq)              # (B, T, D)
-        h = self._add_positional(h)
+        #h = self._add_positional(h)
         h = self.encoder(h)                  # Transformer blocks
         logits = self.head_tok(h)            # (B, T, V)
         flow   = self.head_flow(h).squeeze(-1)  # (B, T)

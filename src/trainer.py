@@ -97,8 +97,8 @@ class Trainer:
 
         y_true, X_binned = env_template.y_full.clone(), env_template.X_full.clone()
 
-        pf = PolicyTransformer(v.size()).to(device)#PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
-        pb =  PolicyTransformer(v.size()).to(device)#PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)
+        pf = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)#
+        pb = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(device)#PolicyTransformer(v.size()).to(device)
         self.pf, self.pb = torch.jit.script(pf), torch.jit.script(pb)
 
         self.log_z = torch.nn.Parameter(torch.tensor(150.0 / 64, device=device))
@@ -140,7 +140,7 @@ class Trainer:
             env_template.y = residuals.clone()
 
             beta = c.beta if c.beta is not None else 0.1
-            temp = max(1.0, 5.0 - (upd - 1) * (4.0 / 20.0))
+            temp = 1.0#max(1.0, 5.0 - (upd - 1) * (4.0 / 20.0))
             lam_fl = 0.1
 
             for opt in optimizers: opt.zero_grad()
@@ -166,10 +166,10 @@ class Trainer:
                         R_t = R_t_per_step = calculate_bayesian_reward(tok, self.tokenizer, reward_env, beta)
                     else:  # gini
                         R_t_per_step = deltaE_split_gain_classification(tok, self.tokenizer, reward_env)
-                        R_t = R_t_per_step.sum(1) + 1e-8
+                        R_t = R_t_per_step.sum() + 1e-8
                 else:  # regression
                     R_t_per_step = deltaE_split_gain_regression(tok, self.tokenizer, reward_env)
-                    R_t = R_t_per_step.sum(1) + 1e-8
+                    R_t = R_t_per_step.sum() + 1e-8
 
                 l_tb = tb_loss(log_pf, log_pb, self.log_z, R_t, torch.tensor([prior], device=device))
                 total_loss = l_tb
