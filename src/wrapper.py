@@ -36,10 +36,8 @@ class DTGFN(BaseEstimator):
         Fit the model. `X` must be a pandas DataFrame; `y` may be a Series/
         array, or you may include the target column in `X` and omit `y`.
         """
-        # Get target column name from config, default to 'target' if not provided
-        target_col = self._cfg_kwargs.get("target_col", "label")
+        target_col = self._cfg_kwargs.get("target_col", "target")
 
-        # Build training DataFrame with target column present
         if y is not None:
             df_train = X.copy()
             df_train[target_col] = y
@@ -52,13 +50,8 @@ class DTGFN(BaseEstimator):
 
         self.df_train_ = df_train.copy()
         
-        # Determine feature columns
-        if self.feature_cols:
-            feature_cols = self.feature_cols
-        else:
-            feature_cols = [c for c in X.columns if c != target_col]
+        feature_cols = self.feature_cols or [c for c in X.columns if c != target_col]
         
-        # Build Config from kwargs + derived fields
         cfg = Config(
             feature_cols=feature_cols,
             target_col=target_col,
@@ -66,7 +59,6 @@ class DTGFN(BaseEstimator):
         )
         self.task = cfg.task
 
-        # Train
         self._trainer = Trainer(cfg).fit(df_train)
         return self
 
@@ -83,12 +75,9 @@ class DTGFN(BaseEstimator):
         if self.task == "regression":
             return self._trainer.predict(df_test=X, df_train=self.df_train_, use_policy=(predict_mode == "policy"), policy_inference_trees=n_trees)
         else:
+            # This logic now works correctly for both binary and multi-class
             probas = self.predict_proba(X, predict_mode, n_trees)
-            if self._trainer.cfg.n_classes == 2:
-                # Get the index of the highest probability for each sample
-                return probas.argmax(axis=1)
-            else:
-                return probas.argmax(axis=1)
+            return probas.argmax(axis=1)
 
 
     def predict_proba(self, X: pd.DataFrame, predict_mode: str = "ensemble", n_trees: Optional[int] = None) -> np.ndarray:
@@ -100,19 +89,20 @@ class DTGFN(BaseEstimator):
         if self.task != "classification":
             raise AttributeError("predict_proba is only available for classification tasks.")
 
-        logits = self._trainer.predict(df_test=X, df_train=self.df_train_, use_policy=(predict_mode == "policy"), policy_inference_trees=n_trees)
+        # This call returns logits for multi-class and probabilities for binary
+        raw_preds = self._trainer.predict(df_test=X, df_train=self.df_train_, use_policy=(predict_mode == "policy"), policy_inference_trees=n_trees)
         
+        # --- CORRECTED LOGIC ---
         if self._trainer.cfg.n_classes == 2:
-            # logits are 1D for binary classification
-            probas = torch.sigmoid(torch.from_numpy(logits)).numpy()
-            # Ensure probas is a column vector before stacking
-            if probas.ndim == 1:
-                probas = probas.reshape(-1, 1)
-            # Create a (n_samples, 2) array with P(class 0) and P(class 1)
-            return np.hstack([1 - probas, probas])
+            # For binary, raw_preds is already the probability of the positive class (class 1)
+            # It's a 1D array, so we reshape it to a column vector.
+            #probas_class1 = raw_preds.reshape(-1, 1)
+            
+            # Create the (n_samples, 2) array with P(class 0) and P(class 1)
+            return torch.softmax(torch.from_numpy(raw_preds), dim=1).numpy()#np.hstack([1 - probas_class1, probas_class1])
         else:
-            # logits are (n_samples, n_classes) for multi-class
-            return torch.softmax(torch.from_numpy(logits), dim=1).numpy()
+            # For multi-class, raw_preds are logits, so we apply softmax
+            return torch.softmax(torch.from_numpy(raw_preds), dim=1).numpy()
 
 
     def get_params(self, deep: bool = True) -> Dict[str, Any]:
@@ -128,7 +118,6 @@ class DTGFN(BaseEstimator):
         
         self._cfg_kwargs.update(params)
         
-        # Also update the config in the trainer if it exists
         if self._trainer:
             for k, v in params.items():
                 setattr(self._trainer.cfg, k, v)
