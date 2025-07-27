@@ -50,8 +50,9 @@ def run_benchmark(dataset_name: str):
     for i, seed in enumerate(seeds):
         print(f"\n--- Running Seed {i+1}/{len(seeds)} (random_state={seed}) ---")
 
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=seed, stratify=y if y.nunique() > 1 else None)
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=seed)
 
+        print(y_test)
         model = DTGFNClassifier(
             n_bins=99, #please change binning_strategy to quantile in env.py for sota results with boosting
             updates=100,
@@ -61,7 +62,7 @@ def run_benchmark(dataset_name: str):
             max_depth=5,
             num_parallel=10, #num paralellel rollouts
             boosting_lr=0.1, #can try 0.1 or 1.0
-            #reward_function='gini', #comment for bayesian reward
+            reward_function='gini', #comment for bayesian reward
             random_forest=True,
             #beta=0.01, #for boosted version otherwise comment for approximation formula
             device="cuda" if torch.cuda.is_available() else "cpu",
@@ -72,6 +73,8 @@ def run_benchmark(dataset_name: str):
         #model._trainer.cfg.num_parallel = 1
         preds = model.predict(X_test, 'policy', 1000) #ensemble for uses best trees from training
 
+        print(preds)
+        #print(y_test[0], preds[0])
         accuracy = accuracy_score(y_test, preds)
         f1 = f1_score(y_test, preds, average='weighted')
 

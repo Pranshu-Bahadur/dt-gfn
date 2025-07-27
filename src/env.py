@@ -3,7 +3,7 @@ from typing import List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler, StandardScaler
 
 
 class TabularEnv:
@@ -31,7 +31,8 @@ class TabularEnv:
         self.binning_strategy = binning_strategy
         self.le = None
         self.n_classes: Optional[int] = None
-        self.scalers = {} # To store scalers for global_uniform strategy
+        
+        self.feature_scaler = None
 
         # Featurization is handled internally
         self.X_full = self._featurise(df_train, df_train, feature_cols, n_bins)
@@ -50,10 +51,10 @@ class TabularEnv:
         
         self._master_indices = torch.arange(len(self.y_full), device=device)
 
-        self.paths: List[Tuple[str, int]]
-        self.open_leaves: int
-        self.done: bool
-        self.idxs: torch.Tensor
+        self.paths: List[Tuple[str, int]] = []
+        self.open_leaves: int = 1
+        self.done: bool = False
+        self.idxs: torch.Tensor = self._master_indices
 
     def _featurise(
         self,
@@ -63,19 +64,33 @@ class TabularEnv:
         bins: int
     ) -> torch.Tensor:
         """
-        Bins features using the specified strategy.
+        Normalizes (for classification) and bins features. For regression, if features
+        are already integers, they are returned directly as an int8 tensor.
         """
-        if all(pd.api.types.is_integer_dtype(df_source[f]) for f in feats):
+        # --- NEW: Handle pre-binned integer features for regression ---
+        if self.task == "regression" and all(pd.api.types.is_integer_dtype(df_source[f]) for f in feats):
             return torch.tensor(
-                df_target[feats].values.astype(np.int32), device=self.device
+                df_target[feats].values.astype(np.int8), device=self.device
             )
+
+        df_target_processed = df_target[feats].copy()
+        df_source_processed = df_source[feats].copy()
+        
+        if self.task == "classification":
+            if self.feature_scaler is None:
+                self.feature_scaler = MinMaxScaler()
+                self.feature_scaler.fit(df_source_processed)
+            
+            df_target_processed[:] = self.feature_scaler.transform(df_target_processed)
+            if not df_source.equals(df_target):
+                 df_source_processed[:] = self.feature_scaler.transform(df_source_processed)
 
         X_binned = []
         
         if self.binning_strategy == "quantile":
             for f in feats:
-                s_source = df_source[f].replace([np.inf, -np.inf], np.nan).fillna(df_source[f].median()).values
-                s_eval = df_target[f].replace([np.inf, -np.inf], np.nan).fillna(df_source[f].median()).values
+                s_source = df_source_processed[f].replace([np.inf, -np.inf], np.nan).fillna(df_source_processed[f].median()).values
+                s_eval = df_target_processed[f].replace([np.inf, -np.inf], np.nan).fillna(df_target_processed[f].median()).values
 
                 quantiles = np.linspace(0, 1, bins + 1)
                 edges = np.quantile(s_source, quantiles)
@@ -87,28 +102,15 @@ class TabularEnv:
                 X_binned.append(binned_eval)
 
         elif self.binning_strategy == "global_uniform":
-            # Define uniform bin edges from 0 to 1
             edges = np.linspace(0, 1, bins + 1)
             edges[0] -= 1e-9
             edges[-1] += 1e-9
             
             for f in feats:
-                # If fitting (source is target), create and store a scaler
-                if df_source.equals(df_target):
-                    scaler = MinMaxScaler()
-                    # Fit on the source data column
-                    scaler.fit(df_source[[f]])
-                    self.scalers[f] = scaler
-                
-                # Use the stored scaler to transform the target data column
-                scaled_eval = self.scalers[f].transform(df_target[[f]])
-                
-                # Bin the scaled data
-                binned_eval = np.searchsorted(edges, scaled_eval.ravel(), side="right") - 1
+                binned_eval = np.searchsorted(edges, df_target_processed[f].values.ravel(), side="right") - 1
                 X_binned.append(binned_eval)
         else:
             raise ValueError(f"Unknown binning_strategy: {self.binning_strategy}")
-
 
         return torch.tensor(
             np.stack(X_binned, 1).astype(np.int32), device=self.device
@@ -118,12 +120,7 @@ class TabularEnv:
         """
         Resets the environment for a new rollout.
         """
-        if not hasattr(self, "_ptr"):
-            self._ptr = 0
-            if self.shuffle_on_reset:
-                self._master_indices = self._master_indices[torch.randperm(len(self._master_indices))]
-
-        if self._ptr + batch_size > len(self._master_indices):
+        if not hasattr(self, "_ptr") or self._ptr + batch_size > len(self._master_indices):
             self._ptr = 0
             if self.shuffle_on_reset:
                 self._master_indices = self._master_indices[torch.randperm(len(self._master_indices))]
