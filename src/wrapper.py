@@ -37,7 +37,7 @@ class DTGFN(BaseEstimator):
         array, or you may include the target column in `X` and omit `y`.
         """
         # Get target column name from config, default to 'target' if not provided
-        target_col = self._cfg_kwargs.get("target_col", "target")
+        target_col = self._cfg_kwargs.get("target_col", "label")
 
         # Build training DataFrame with target column present
         if y is not None:

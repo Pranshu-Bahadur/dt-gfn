@@ -361,7 +361,7 @@ class Trainer:
             preds = self._predict_boosting(X_te, X_tr, y_tr, env_template, use_policy, policy_inference_trees)
         
         if c.task == "classification":
-            if c.n_classes == 2: preds.max(1).cpu().numpy()
+            if c.n_classes == 2: preds.argmax(1).cpu().numpy()
             return preds.cpu().numpy()
         else:
             return preds.cpu().numpy()
