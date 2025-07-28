@@ -438,8 +438,8 @@ class Trainer:
         
         final_preds = sum_preds / len(trees_to_use)
         
-        if c.task == "classification" and c.n_classes == 2:
-            return final_preds[:, 1]
+        #if c.task == "classification" and c.n_classes == 2:
+        #    return final_preds[:, 1]
         return final_preds
 
     ##
