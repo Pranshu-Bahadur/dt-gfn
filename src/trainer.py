@@ -146,6 +146,8 @@ class Trainer:
             forward_tuples = self._collect_rollouts(env_template, temp=1.0, residuals=y_true, beta=beta)
             new_trees = [seq for seq, _ in forward_tuples if seq]
             self.ensemble.extend(new_trees)
+
+            forward_tuples += self.sample_replay(c.top_k_trees)
             
             if not forward_tuples:
                 tqdm.write(f"Update {upd}/{c.updates} | No valid trees generated.")
@@ -248,8 +250,8 @@ class Trainer:
                 for result in batch_results:
                     if result:
                         seq, prior, idxs = result
-                        if not self.cfg.random_forest:
-                            self.replay_buffer.add(0.0, seq, prior, idxs)
+                        #if not self.cfg.random_forest:
+                        self.replay_buffer.add(0.0, seq, prior, idxs)
                         forward_tuples.append((seq, prior))
                 rollouts_done += batch_size
                 pbar.update(batch_size)
