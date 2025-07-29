@@ -251,7 +251,7 @@ class Trainer:
                 log_pf, log_pb = self.pf.log_prob(tok), self.pb.log_prob(torch.flip(tok, dims=[1]))
                 
                 if c.task == "classification":
-                    R_t_per_step = deltaE_split_gain_classification(tok, self.tokenizer, reward_env)
+                    R_t_per_step = deltaE_split_gain_classification(tok, self.tokenizer, reward_env) if c.reward_function is "gini" else calculate_bayesian_reward(tok, self.tokenizer, reward_env, 0.1)
                 else: # Regression
                     R_t_per_step = deltaE_split_gain_regression(tok, self.tokenizer, reward_env)
                 
