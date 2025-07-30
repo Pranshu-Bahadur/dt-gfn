@@ -31,21 +31,137 @@ def fl_loss(logF: torch.Tensor, log_pf: torch.Tensor, log_pb: torch.Tensor, dR: 
 
 # --- Tree & Reward Utilities ---
 
+def _traverse_and_get_leaves(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularEnv") -> Tuple[List[torch.Tensor], int]:
+    """Helper function to robustly build a tree and return leaf indices and the number of decision nodes."""
+    decoded_actions = tok.decode(tokens[0, 1:-1].tolist())
+    
+    tree_nodes = {0: {'indices': env.idxs, 'children': []}}
+    node_counter = 0
+    n_decision_nodes = 0
+    action_iter = iter(decoded_actions)
+    
+    while True:
+        try:
+            leaf_node_id = -1
+            for nid, node in sorted(tree_nodes.items()):
+                if not node['children']:
+                    leaf_node_id = nid
+                    break
+            
+            if leaf_node_id == -1:
+                break
+
+            kind, val = next(action_iter)
+            
+            if kind == 'feat':
+                n_decision_nodes += 1
+                _, threshold = next(action_iter)
+                parent_indices = tree_nodes[leaf_node_id]['indices']
+
+                if len(parent_indices) == 0:
+                    tree_nodes[leaf_node_id]['children'] = [-1, -1]
+                    continue
+                
+                fv = env.X_full[parent_indices, val]
+                mask = fv <= threshold
+                
+                left_indices = parent_indices[mask]
+                right_indices = parent_indices[~mask]
+
+                if len(left_indices) == 0 or len(right_indices) == 0:
+                    tree_nodes[leaf_node_id]['children'] = [-1, -1]
+                    continue
+
+                node_counter += 1; left_child_id = node_counter
+                tree_nodes[left_child_id] = {'indices': left_indices, 'children': []}
+                
+                node_counter += 1; right_child_id = node_counter
+                tree_nodes[right_child_id] = {'indices': right_indices, 'children': []}
+                
+                tree_nodes[leaf_node_id]['children'] = [left_child_id, right_child_id]
+            else:
+                tree_nodes[leaf_node_id]['children'] = [-1, -1]
+                
+        except StopIteration:
+            break
+    
+    leaves_indices = [node['indices'] for node in tree_nodes.values() if not node['children']]
+    return leaves_indices, n_decision_nodes
+
+def calculate_bayesian_reward(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularEnv", beta: float) -> torch.Tensor:
+    """Computes reward for a completed tree based on Bayesian marginal likelihood (for CLASSIFICATION)."""
+    leaves_indices, n_decision_nodes = _traverse_and_get_leaves(tokens, tok, env)
+    
+    alpha = 0.1 
+    alphas = torch.full((env.n_classes,), alpha, device=env.device)
+    
+    log_likelihood = torch.tensor(0.0, device=env.device)
+    log_gamma_alpha_sum = torch.lgamma(alphas.sum())
+    log_gamma_alpha_prod = torch.lgamma(alphas).sum()
+    
+    num_leaves = len(leaves_indices)
+    log_dirichlet_norm = num_leaves * (log_gamma_alpha_sum - log_gamma_alpha_prod)
+    log_likelihood += log_dirichlet_norm
+
+    for leaf_indices in leaves_indices:
+        if len(leaf_indices) == 0: continue
+        leaf_labels = env.y_full[leaf_indices]
+        n_l_c = torch.bincount(leaf_labels, minlength=env.n_classes).float()
+        n_l = n_l_c.sum()
+        
+        log_numerator = torch.lgamma(n_l_c + alphas).sum()
+        log_denominator = torch.lgamma(n_l + alphas.sum())
+        log_likelihood += log_numerator - log_denominator
+        
+    log_reward = log_likelihood - beta * n_decision_nodes
+    reward = torch.exp(log_reward)
+    
+    return reward.unsqueeze(0)
+
+def calculate_bayesian_reward_regression(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularEnv", beta: float) -> torch.Tensor:
+    """Computes reward for a completed tree based on Bayesian marginal likelihood (for REGRESSION)."""
+    leaves_indices, n_decision_nodes = _traverse_and_get_leaves(tokens, tok, env)
+    
+    # Priors for Normal-Inverse-Gamma model
+    mu0 = 0.0
+    kappa0 = 1.0
+    a0 = torch.tensor(0.1, device=env.device)
+    b0 = torch.tensor(beta, device=env.device)
+    
+    log_marginal_likelihood = torch.tensor(0.0, device=env.device)
+    
+    for leaf_indices in leaves_indices:
+        n_l = len(leaf_indices)
+        if n_l == 0: continue
+        
+        y_leaf = env.y_full[leaf_indices]
+        y_bar = y_leaf.mean(dim=0, keepdim=True)
+        sse = ((y_leaf - y_bar)**2).sum()
+
+        kappa_n = kappa0 + n_l
+        beta_n = b0 + 0.5 * sse + (kappa0 * n_l) * (y_bar - mu0)**2 / (2 * kappa_n)
+
+        log_ml_leaf = (
+            torch.lgamma(a0 + n_l / 2) - torch.lgamma(a0) +
+            a0 * torch.log(b0) - (a0 + n_l / 2) * torch.log(beta_n) +
+            0.5 * (math.log(kappa0) - math.log(kappa_n)) -
+            (n_l / 2) * math.log(2 * math.pi)
+        )
+        log_marginal_likelihood += log_ml_leaf.sum() # Sum over target dimensions if multi-output
+
+    log_reward = log_marginal_likelihood #- beta * n_decision_nodes
+    reward = torch.exp(log_reward)
+    
+    return reward.unsqueeze(0)
+
 def deltaE_split_gain_regression(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularEnv") -> torch.Tensor:
-    """
-    Computes the reward (ΔR) as the MSE reduction (split gain) for each split
-    action in a trajectory. Used for REGRESSION tasks.
-    """
     y: torch.Tensor = env.y[env.idxs]
-    # FIX: Use shape[0] for multi-dimensional y (classification residuals)
     N: int = y.shape[0] 
     dR: torch.Tensor = torch.zeros(tokens.shape[1] - 1, device=y.device)
 
     def mse(rows: torch.Tensor) -> float:
         if rows.numel() < 2: return 0.0
         yy = y[rows]
-        # For centered residuals (y-p), Var(yy) = E[yy^2] - (E[yy])^2 ~= E[yy^2]
-        # If y is multi-dimensional (n, C), this correctly computes the mean squared value.
         return ((yy * yy).mean()).item()
 
     full_mse = mse(torch.arange(N, device=y.device))
@@ -67,8 +183,6 @@ def deltaE_split_gain_regression(tokens: torch.Tensor, tok: "Tokenizer", env: "T
             parent_rows = stack_rows.pop()
             parent_mse = stack_mse.pop()
 
-            # `env.idxs[parent_rows]` correctly maps the relative indices of the
-            # current node back to the absolute indices of the full dataset.
             fv = env.X_full[env.idxs[parent_rows], idx]
             mask = fv <= th
             L_rows, R_rows = parent_rows[mask], parent_rows[~mask]
@@ -91,10 +205,6 @@ def deltaE_split_gain_regression(tokens: torch.Tensor, tok: "Tokenizer", env: "T
     return dR.unsqueeze(0)
 
 def deltaE_split_gain_classification(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularEnv") -> torch.Tensor:
-    """
-    Computes the reward (ΔR) as the Gini impurity reduction for each split action
-    in a trajectory. Used for CLASSIFICATION tasks.
-    """
     y: torch.Tensor = env.y_full[env.idxs]
     N: int = y.numel()
     dR: torch.Tensor = torch.zeros(tokens.shape[1] - 1, device=y.device)
@@ -151,97 +261,7 @@ def deltaE_split_gain_classification(tokens: torch.Tensor, tok: "Tokenizer", env
             token_idx += 1
     return dR.unsqueeze(0)
 
-def calculate_bayesian_reward(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularEnv", beta: float) -> torch.Tensor:
-    """
-    Computes reward for a completed tree based on Bayesian marginal likelihood.
-    """
-    alpha = 0.1
-    alphas = torch.full((env.n_classes,), alpha, device=env.device)
-
-    decoded_actions = tok.decode(tokens[0, 1:-1].tolist())
-    
-    leaves_indices = []
-    n_decision_nodes = 0
-    
-    tree_nodes = {0: {'indices': env.idxs, 'children': []}}
-    node_counter = 0
-
-    action_iter = iter(decoded_actions)
-    
-    while True:
-        try:
-            leaf_node_id = -1
-            for nid, node in sorted(tree_nodes.items()):
-                if not node['children']:
-                    leaf_node_id = nid
-                    break
-            
-            if leaf_node_id == -1: break
-
-            kind, val = next(action_iter)
-            parent_indices = tree_nodes[leaf_node_id]['indices']
-
-            if kind == 'feat':
-                if len(parent_indices) == 0:
-                    next(action_iter)
-                    continue
-
-                n_decision_nodes += 1
-                _, threshold = next(action_iter)
-                
-                fv = env.X_full[parent_indices, val]
-                mask = fv <= threshold
-                
-                left_indices = parent_indices[mask]
-                right_indices = parent_indices[~mask]
-
-                if len(left_indices) == 0 or len(right_indices) == 0:
-                    tree_nodes[leaf_node_id]['children'] = [-1, -1]
-                    continue
-
-                node_counter += 1; left_child_id = node_counter
-                tree_nodes[left_child_id] = {'indices': left_indices, 'children': []}
-                
-                node_counter += 1; right_child_id = node_counter
-                tree_nodes[right_child_id] = {'indices': right_indices, 'children': []}
-                
-                tree_nodes[leaf_node_id]['children'] = [left_child_id, right_child_id]
-            else:
-                tree_nodes[leaf_node_id]['children'] = [-1, -1]
-                
-        except StopIteration:
-            break
-            
-    for nid, node in tree_nodes.items():
-        if not node['children']:
-            leaves_indices.append(node['indices'])
-
-    log_likelihood = 0.0
-    log_gamma_alpha_sum = torch.lgamma(alphas.sum())
-    log_gamma_alpha_prod = torch.lgamma(alphas).sum()
-    log_dirichlet_norm = len(leaves_indices) * (log_gamma_alpha_sum - log_gamma_alpha_prod)
-    log_likelihood += log_dirichlet_norm
-
-    for leaf_indices in leaves_indices:
-        if len(leaf_indices) == 0: continue
-        leaf_labels = env.y_full[leaf_indices]
-        n_l_c = torch.bincount(leaf_labels, minlength=env.n_classes).float()
-        n_l = n_l_c.sum()
-        
-        log_numerator = torch.lgamma(n_l_c + alphas).sum()
-        log_denominator = torch.lgamma(n_l + alphas.sum())
-        log_likelihood += log_numerator - log_denominator
-        
-    log_reward = log_likelihood
-    reward = torch.exp(log_reward) + 1e-9
-    
-    return reward.unsqueeze(0)
-
-
 def get_tree_predictor(traj: List[int], X_binned: torch.Tensor, y_target: torch.Tensor, tok: "Tokenizer") -> Callable[[torch.Tensor], torch.Tensor]:
-    """
-    Decodes a token trajectory into a callable tree predictor function.
-    """
     path_iter = iter(tok.decode(traj[1:-1]))
     def build_recursive() -> Optional[dict]:
         try:
