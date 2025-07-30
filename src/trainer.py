@@ -49,6 +49,7 @@ class Config:
     max_depth: int = 7
     top_k_trees: int = 10
     boosting_lr: float = 0.1
+    redundancy_aware: bool = False
 
     # Policy network architecture
     lstm_hidden: int = 256
@@ -82,7 +83,6 @@ class Trainer:
     def fit(self, df_train: pd.DataFrame) -> "Trainer":
         c = self.cfg
         
-        # --- Initialization ---
         v = Vocab(len(c.feature_cols), c.n_bins, 1)
         self.tokenizer = Tokenizer(v)
         env_template = TabularEnv(
@@ -116,7 +116,6 @@ class Trainer:
             c.beta = math.log(4) + math.log(len(c.feature_cols)) + math.log(c.n_bins)
             print(f"Using beta derived from the paper's formula: {c.beta:.4f}")
 
-        # --- Training ---
         if c.random_forest:
             self._fit_dt_gfn_random_forest(env_template, y_true, X_binned, optimizers, schedulers)
         else:
@@ -125,17 +124,16 @@ class Trainer:
         return self
 
     def _calculate_reward(self, tok: torch.Tensor, reward_env: TabularEnv) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Helper to calculate reward based on config."""
         c = self.cfg
         
         if c.reward_function == 'bayesian':
             reward_func = calculate_bayesian_reward if c.task == 'classification' else calculate_bayesian_reward_regression
             R_t = reward_func(tok, self.tokenizer, reward_env, c.beta)
             return R_t, None
-        else: # Split-gain rewards
+        else:
             if c.task == 'classification':
                 reward_func = deltaE_split_gain_classification if c.reward_function == 'gini' else deltaE_split_gain_regression
-            else: # Regression
+            else:
                 reward_func = deltaE_split_gain_regression
             
             R_t_per_step = reward_func(tok, self.tokenizer, reward_env)
@@ -143,33 +141,35 @@ class Trainer:
             return R_t, R_t_per_step
 
     def _update_policy(self, all_tuples: List, reward_env: TabularEnv, optimizers: List) -> Tuple[float, float]:
-        """Helper for the GFN policy update step."""
+        c = self.cfg
         tb_loss_acc, fl_loss_acc = 0.0, 0.0
         
         for opt in optimizers: opt.zero_grad()
 
         for seq, prior in all_tuples:
-            tok = torch.tensor([seq], device=self.cfg.device)
+            tok = torch.tensor([seq], device=c.device)
+            prior_tensor = torch.tensor([prior], device=c.device)
             log_pf, log_pb = self.pf.log_prob(tok), self.pb.log_prob(torch.flip(tok, dims=[1]))
             
             R_t, R_t_per_step = self._calculate_reward(tok, reward_env)
             
-            l_tb = tb_loss(log_pf, log_pb, self.log_z, R_t, torch.tensor([prior], device=self.cfg.device))
-            total_loss = l_tb
-            
-            if R_t_per_step is not None:
+            if c.reward_function == 'bayesian':
+                total_loss = tb_loss(log_pf, log_pb, self.log_z, R_t, prior_tensor)
+                tb_loss_acc += total_loss.item()
+            else:
+                l_tb = tb_loss(log_pf, log_pb, self.log_z, R_t, prior_tensor)
                 l_fl = fl_loss(self.pf.log_F(tok), log_pf, log_pb, R_t_per_step)
-                total_loss += l_fl
+                total_loss = l_tb + l_fl
+                tb_loss_acc += l_tb.item()
                 fl_loss_acc += l_fl.item()
 
-            tb_loss_acc += l_tb.item()
             total_loss.backward()
 
         for opt in optimizers:
             torch.nn.utils.clip_grad_norm_(opt.param_groups[0]['params'], 1.0)
             opt.step()
         
-        avg_tb = tb_loss_acc / len(all_tuples) if all_tuples else 0
+        avg_tb = tb_loss_acc / len(all_tuples) if all_tuples and tb_loss_acc > 0 else 0
         avg_fl = fl_loss_acc / len(all_tuples) if all_tuples and fl_loss_acc > 0 else 0
         return avg_tb, avg_fl
 
@@ -269,11 +269,16 @@ class Trainer:
     def _collect_rollouts(self, env_template, temp, residuals, beta):
         forward_tuples = []
         rollouts_done = 0
+        
+        ras_counts = {} if self.cfg.redundancy_aware else None
+
         with tqdm(total=self.cfg.rollouts, desc="Rollouts", leave=False) as pbar:
             while rollouts_done < self.cfg.rollouts:
+                if ras_counts is not None: ras_counts.clear()
+                
                 batch_size = min(self.cfg.num_parallel, self.cfg.rollouts - rollouts_done)
                 envs = [copy.copy(env_template) for _ in range(batch_size)]
-                batch_results = self.batched_rollout(envs, temp, residuals, beta)
+                batch_results = self.batched_rollout(envs, temp, residuals, beta, ras_counts)
                 for result in batch_results:
                     if result:
                         seq, prior, idxs = result
@@ -300,7 +305,7 @@ class Trainer:
             idxs = random.sample(range(len(entries)), k)
         return [(entries[i][1], entries[i][2]) for i in idxs]
 
-    def batched_rollout(self, envs, temp, residuals, beta):
+    def batched_rollout(self, envs, temp, residuals, beta, ras_counts: Optional[dict] = None):
         c, v, device = self.cfg, self.tokenizer.v, self.cfg.device
         num = len(envs)
         END_TOKEN = 2 
@@ -314,6 +319,13 @@ class Trainer:
                 batch_seqs_tensors = torch.nn.utils.rnn.pad_sequence([torch.tensor(seqs[i], device=device) for i in active_indices], batch_first=True, padding_value=v.PAD)
                 logits_batch, _ = self.pf(batch_seqs_tensors)
                 last_logits = logits_batch[:, -1, :]
+                
+                if ras_counts is not None:
+                    for i, original_idx in enumerate(active_indices):
+                        path_tuple = tuple(seqs[original_idx])
+                        if path_tuple in ras_counts:
+                            last_logits[i, :] -= ras_counts[path_tuple] * 1e9
+                
                 masks = torch.zeros((len(active_indices), v.size()), dtype=torch.bool, device=device)
                 for i, original_idx in enumerate(active_indices):
                     d = depths[original_idx][-1] if depths[original_idx] else c.max_depth
@@ -326,6 +338,10 @@ class Trainer:
                 for i, original_idx in enumerate(active_indices):
                     token = toks1[i].item()
                     seqs[original_idx].append(token)
+                    
+                    if ras_counts is not None:
+                        path_tuple = tuple(seqs[original_idx])
+                        ras_counts[path_tuple] = ras_counts.get(path_tuple, 0) + 1
                     
                     if token == END_TOKEN:
                         envs[original_idx].done = True
@@ -395,7 +411,8 @@ class Trainer:
             for _ in tqdm(range(num_batches), desc="Policy-based Tree Generation", leave=False):
                 trees_in_batch = min(c.num_parallel, total_trees - len(trees_to_use))
                 if trees_in_batch <= 0: break
-                batch_results = self.batched_rollout([copy.copy(env_template) for _ in range(trees_in_batch)], temp=1.0, residuals=y_tr, beta=c.beta)
+                ras_counts = {} if c.redundancy_aware else None
+                batch_results = self.batched_rollout([copy.copy(env_template) for _ in range(trees_in_batch)], temp=1.0, residuals=y_tr, beta=c.beta, ras_counts=ras_counts)
                 trees_to_use.extend([res[0] for res in batch_results if res])
         else:
             trees_to_use = self.ensemble
@@ -429,10 +446,12 @@ class Trainer:
             env_template.y = initial_residuals.clone()
             
             candidate_trees = []
+            ras_counts = {} if c.redundancy_aware else None
             for _ in tqdm(range(num_batches), desc="Policy-based Tree Generation", leave=False):
+                if ras_counts is not None: ras_counts.clear()
                 batch_results = self.batched_rollout(
                     [copy.copy(env_template) for _ in range(c.num_parallel)],
-                    temp=1.0, residuals=initial_residuals, beta=c.beta
+                    temp=1.0, residuals=initial_residuals, beta=c.beta, ras_counts=ras_counts
                 )
                 candidate_trees.extend([res[0] for res in batch_results if res])
 

@@ -18,7 +18,7 @@ def tb_loss(log_pf: torch.Tensor, log_pb: torch.Tensor, log_z: torch.Tensor, R: 
     """
     Calculates the Trajectory Balance (TB) loss, batched.
     """
-    rhs = torch.log(R) + log_pb.sum(1)
+    rhs = torch.log(R) + prior + log_pb.sum(1)
     diff = log_z + log_pf.sum(1) - rhs
     return (diff * diff).mean()
 
@@ -196,7 +196,7 @@ def deltaE_split_gain_regression(tokens: torch.Tensor, tok: "Tokenizer", env: "T
             parent_N = wL + wR
             if parent_N > 0:
                 gain = parent_mse - (wL / parent_N * mseL + wR / parent_N * mseR)
-                dR[token_idx] = gain
+                dR[token_idx] = gain / (float(env.idxs.numel() or 1))
             token_idx += 2
         else:
             if stack_rows:
@@ -253,7 +253,7 @@ def deltaE_split_gain_classification(tokens: torch.Tensor, tok: "Tokenizer", env
             parent_N = wL + wR
             if parent_N > 0:
                 gain = parent_metric - (wL / parent_N * metricL + wR / parent_N * metricR)
-                dR[token_idx] = gain
+                dR[token_idx] = gain / (float(env.idxs.numel() or 1))
             token_idx += 2
         else:
             if stack_rows:
