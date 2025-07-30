@@ -18,7 +18,7 @@ def tb_loss(log_pf: torch.Tensor, log_pb: torch.Tensor, log_z: torch.Tensor, R: 
     """
     Calculates the Trajectory Balance (TB) loss, batched.
     """
-    loss = (log_z + log_pf.sum(1) - (torch.log(R) + prior + log_pb.sum(1)))**2
+    loss = (log_z + log_pf.sum(1) - (torch.log(R) + log_pb.sum(1)))**2
     return loss.mean()
 
 @torch.jit.script
@@ -149,7 +149,7 @@ def calculate_bayesian_reward_regression(tokens: torch.Tensor, tok: "Tokenizer",
         )
         log_marginal_likelihood += log_ml_leaf.sum() # Sum over target dimensions if multi-output
 
-    log_reward = log_marginal_likelihood #- beta * n_decision_nodes
+    log_reward = log_marginal_likelihood - beta * n_decision_nodes
     reward = torch.exp(log_reward)
     
     return reward.unsqueeze(0)
