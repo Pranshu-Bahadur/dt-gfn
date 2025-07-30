@@ -54,7 +54,7 @@ class Config:
     lstm_hidden: int = 256
     mlp_layers: int = 3
     mlp_width: int = 256
-    lr: float = 1e-5
+    lr: float = 1e-4
 
     # Priors & annealing
     beta: Optional[float] = None
@@ -96,7 +96,7 @@ class Trainer:
 
         self.pf = torch.jit.script(PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device))
         self.pb = torch.jit.script(PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device))
-        self.log_z = torch.nn.Parameter(torch.tensor(1.0, device=c.device))
+        self.log_z = torch.nn.Parameter(torch.tensor(150.0 / 64, device=c.device))
         
         optimizers = [
             torch.optim.AdamW(self.pf.parameters(), lr=c.lr, weight_decay=1e-1),
@@ -221,7 +221,10 @@ class Trainer:
         print("--- Starting Boost-GFN Training ---")
         
         if c.task == "classification":
-            base_pred = torch.zeros((len(y_true), c.n_classes), device=c.device)
+            class_counts = torch.bincount(y_true, minlength=c.n_classes).float()
+            class_probs = class_counts / class_counts.sum()
+            initial_logits = torch.log(class_probs + 1e-9)
+            base_pred = initial_logits.unsqueeze(0).repeat(len(y_true), 1)
         else:
             self.y_mean = y_true.mean().item()
             base_pred = torch.full_like(y_true, self.y_mean, dtype=torch.float32)
@@ -248,9 +251,8 @@ class Trainer:
                 base_pred += c.boosting_lr * best_predictor(X_binned)
                 self.boosting_ensemble.append(best_predictor)
 
-            # Policy Update
             all_tuples = self.sample_replay(c.top_k_trees) + [(seq, 0.0) for seq in candidate_seqs]
-            reward_env = reward_env_true_y if c.reward_function == 'bayesian' else env_template
+            reward_env = reward_env_true_y
             avg_tb_loss, avg_fl_loss = self._update_policy(all_tuples, reward_env, optimizers)
             for sch in schedulers: sch.step()
 
@@ -301,7 +303,7 @@ class Trainer:
     def batched_rollout(self, envs, temp, residuals, beta):
         c, v, device = self.cfg, self.tokenizer.v, self.cfg.device
         num = len(envs)
-        END_TOKEN = 2 # From utils.py
+        END_TOKEN = 2 
         for env in envs: 
             env.y = residuals
             env.reset(c.batch_size)
@@ -345,7 +347,7 @@ class Trainer:
                     sub_batch_seqs = torch.nn.utils.rnn.pad_sequence([torch.tensor(seqs[i], device=device) for i in sub_batch_indices], batch_first=True, padding_value=v.PAD)
                     sub_logits, _ = self.pf(sub_batch_seqs)
                     th_mask = torch.zeros_like(sub_logits[:, -1, :], dtype=torch.bool, device=device)
-                    th_mask[:, v.split_start + v.num_feat : v.split_start + v.num_feat + v.num_th] = True
+                    th_mask[:, v.split_start + v.num_feat : v.split_start + v.num_th] = True
                     
                     toks2 = _safe_sample(sub_logits[:, -1, :], th_mask, temp)
                     for i, original_idx in enumerate(sub_batch_indices):
