@@ -54,7 +54,7 @@ class Config:
     lstm_hidden: int = 256
     mlp_layers: int = 3
     mlp_width: int = 256
-    lr: float = 1e-2
+    lr: float = 1e-5
 
     # Priors & annealing
     beta: Optional[float] = None
