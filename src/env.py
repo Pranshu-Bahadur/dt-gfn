@@ -46,6 +46,7 @@ class TabularEnv:
             self.y_full = torch.tensor(
                 df_train[target_col].values, dtype=torch.float32, device=device
             )
+            self.n_classes=1
 
         self.y = self.y_full.clone()
         

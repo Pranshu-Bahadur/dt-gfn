@@ -288,14 +288,18 @@ class Trainer:
                     total_loss = l_tb
                     tb_loss_acc += l_tb.item()
                 else:
-                    R_t_per_step = deltaE_split_gain_regression(tok, self.tokenizer, reward_env_residuals)
+                    R_t_per_step = deltaE_split_gain_regression(tok, self.tokenizer, reward_env_residuals) if not c.reward_function == 'bayesian' else calculate_bayesian_reward(tok, self.tokenizer, reward_env_residuals, 0.1)
                     R_t = R_t_per_step.sum()
                     R_t = torch.clamp(R_t, min=1e-9)
                     l_tb = tb_loss(log_pf, log_pb, self.log_z, R_t, torch.tensor([prior], device=device))
-                    l_fl = fl_loss(self.pf.log_F(tok), log_pf, log_pb, R_t_per_step)
-                    total_loss = l_tb + l_fl
+                    if c.reward_function == 'bayesian':
+                      total_loss = l_tb
+                    else:
+                      l_fl = fl_loss(self.pf.log_F(tok), log_pf, log_pb, R_t_per_step)
+                      total_loss = l_tb + l_fl
+                      fl_loss_acc += l_fl.item()
                     tb_loss_acc += l_tb.item()
-                    fl_loss_acc += l_fl.item()
+                    
                 
                 total_loss.backward()
             
