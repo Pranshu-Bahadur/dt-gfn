@@ -18,8 +18,9 @@ def tb_loss(log_pf: torch.Tensor, log_pb: torch.Tensor, log_z: torch.Tensor, R: 
     """
     Calculates the Trajectory Balance (TB) loss, batched.
     """
-    loss = (log_z + log_pf.sum(1) - (torch.log(R) + log_pb.sum(1)))**2
-    return loss.mean()
+    rhs = torch.log(R) + log_pb.sum(1)
+    diff = log_z + log_pf.sum(1) - rhs
+    return (diff * diff).mean()
 
 @torch.jit.script
 def fl_loss(logF: torch.Tensor, log_pf: torch.Tensor, log_pb: torch.Tensor, dR: torch.Tensor) -> torch.Tensor:
@@ -113,8 +114,8 @@ def calculate_bayesian_reward(tokens: torch.Tensor, tok: "Tokenizer", env: "Tabu
         log_denominator = torch.lgamma(n_l + alphas.sum())
         log_likelihood += log_numerator - log_denominator
         
-    log_reward = log_likelihood - beta * n_decision_nodes
-    reward = torch.exp(log_reward).clamp(min=1e-9) # Clamp to prevent log(0)
+    log_reward = (log_likelihood - beta * n_decision_nodes) / float(env.idxs.numel() or 1)
+    reward = torch.exp(log_reward).clamp(min=1e-9)
     
     return reward.unsqueeze(0)
 
@@ -148,7 +149,7 @@ def calculate_bayesian_reward_regression(tokens: torch.Tensor, tok: "Tokenizer",
         )
         log_marginal_likelihood += log_ml_leaf.sum()
 
-    log_reward = log_marginal_likelihood - beta * n_decision_nodes
+    log_reward = (log_marginal_likelihood - beta * n_decision_nodes) / float(env.idxs.numel() or 1)
     reward = torch.exp(log_reward).clamp(min=1e-9)
     
     return reward.unsqueeze(0)
@@ -162,7 +163,7 @@ def deltaE_split_gain_regression(tokens: torch.Tensor, tok: "Tokenizer", env: "T
     def mse(rows: torch.Tensor) -> float:
         if rows.numel() < 2: return 0.0
         yy = y[rows]
-        return ((yy * yy).mean()).item()
+        return ((yy.float()**2).mean()).item()
 
     full_mse = mse(torch.arange(N, device=y.device))
     stack_rows: Deque[torch.Tensor] = deque([torch.arange(N, device=y.device)])

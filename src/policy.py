@@ -51,7 +51,7 @@ class PolicyPaperMLP(PolicyBase):
         self.rnn = nn.LSTM(
             input_size=lstm_hidden,
             hidden_size=lstm_hidden,
-            num_layers=1,
+            num_layers=3,
             batch_first=True,
         )
 

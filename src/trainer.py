@@ -96,11 +96,11 @@ class Trainer:
 
         self.pf = torch.jit.script(PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device))
         self.pb = torch.jit.script(PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device))
-        self.log_z = torch.nn.Parameter(torch.tensor(150.0 / 64, device=c.device))
+        self.log_z = torch.nn.Parameter(torch.tensor(1.0, device=c.device))
         
         optimizers = [
-            torch.optim.AdamW(self.pf.parameters(), lr=c.lr, weight_decay=1e-1),
-            torch.optim.AdamW(self.pb.parameters(), lr=c.lr, weight_decay=1e-1),
+            torch.optim.AdamW(self.pf.parameters(), lr=c.lr),
+            torch.optim.AdamW(self.pb.parameters(), lr=c.lr),
             torch.optim.Adam([self.log_z], lr=c.lr / 10)
         ]
 
