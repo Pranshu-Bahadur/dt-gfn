@@ -18,7 +18,7 @@ def tb_loss(log_pf: torch.Tensor, log_pb: torch.Tensor, log_z: torch.Tensor, R: 
     """
     Calculates the Trajectory Balance (TB) loss, batched.
     """
-    loss = (log_z + log_pf.sum(1) - (torch.log(R) + log_pb.sum(1)))**2
+    loss = (log_z + log_pf.sum(1) - (torch.log(R) + prior + log_pb.sum(1)))**2
     return loss.mean()
 
 @torch.jit.script
@@ -114,7 +114,7 @@ def calculate_bayesian_reward(tokens: torch.Tensor, tok: "Tokenizer", env: "Tabu
         log_likelihood += log_numerator - log_denominator
         
     log_reward = log_likelihood - beta * n_decision_nodes
-    reward = torch.exp(log_reward)
+    reward = torch.exp(log_reward).clamp(min=1e-9) # Clamp to prevent log(0)
     
     return reward.unsqueeze(0)
 
@@ -122,11 +122,10 @@ def calculate_bayesian_reward_regression(tokens: torch.Tensor, tok: "Tokenizer",
     """Computes reward for a completed tree based on Bayesian marginal likelihood (for REGRESSION)."""
     leaves_indices, n_decision_nodes = _traverse_and_get_leaves(tokens, tok, env)
     
-    # Priors for Normal-Inverse-Gamma model
     mu0 = 0.0
     kappa0 = 1.0
-    a0 = torch.tensor(0.1, device=env.device)
-    b0 = torch.tensor(beta, device=env.device)
+    a0 = torch.tensor(1.0, device=env.device)
+    b0 = torch.tensor(1.0, device=env.device)
     
     log_marginal_likelihood = torch.tensor(0.0, device=env.device)
     
@@ -147,12 +146,13 @@ def calculate_bayesian_reward_regression(tokens: torch.Tensor, tok: "Tokenizer",
             0.5 * (math.log(kappa0) - math.log(kappa_n)) -
             (n_l / 2) * math.log(2 * math.pi)
         )
-        log_marginal_likelihood += log_ml_leaf.sum() # Sum over target dimensions if multi-output
+        log_marginal_likelihood += log_ml_leaf.sum()
 
     log_reward = log_marginal_likelihood - beta * n_decision_nodes
-    reward = torch.exp(log_reward)
+    reward = torch.exp(log_reward).clamp(min=1e-9)
     
     return reward.unsqueeze(0)
+
 
 def deltaE_split_gain_regression(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularEnv") -> torch.Tensor:
     y: torch.Tensor = env.y[env.idxs]
