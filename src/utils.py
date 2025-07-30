@@ -37,10 +37,18 @@ def deltaE_split_gain_regression(tokens: torch.Tensor, tok: "Tokenizer", env: "T
     action in a trajectory. Used for REGRESSION tasks.
     """
     y: torch.Tensor = env.y[env.idxs]
-    N: int = y.numel()
+    # FIX: Use shape[0] for multi-dimensional y (classification residuals)
+    N: int = y.shape[0] 
     dR: torch.Tensor = torch.zeros(tokens.shape[1] - 1, device=y.device)
 
-    full_mse = (y.mul(y).mean() - y.mean()**2).item() if N > 1 else 0.0
+    def mse(rows: torch.Tensor) -> float:
+        if rows.numel() < 2: return 0.0
+        yy = y[rows]
+        # For centered residuals (y-p), Var(yy) = E[yy^2] - (E[yy])^2 ~= E[yy^2]
+        # If y is multi-dimensional (n, C), this correctly computes the mean squared value.
+        return ((yy * yy).mean()).item()
+
+    full_mse = mse(torch.arange(N, device=y.device))
     stack_rows: Deque[torch.Tensor] = deque([torch.arange(N, device=y.device)])
     stack_mse: Deque[float] = deque([full_mse])
 
@@ -59,14 +67,11 @@ def deltaE_split_gain_regression(tokens: torch.Tensor, tok: "Tokenizer", env: "T
             parent_rows = stack_rows.pop()
             parent_mse = stack_mse.pop()
 
+            # `env.idxs[parent_rows]` correctly maps the relative indices of the
+            # current node back to the absolute indices of the full dataset.
             fv = env.X_full[env.idxs[parent_rows], idx]
             mask = fv <= th
             L_rows, R_rows = parent_rows[mask], parent_rows[~mask]
-
-            def mse(rows: torch.Tensor) -> float:
-                if rows.numel() < 2: return 0.0
-                yy = y[rows]
-                return ((yy * yy).mean() - yy.mean()**2).item()
 
             mseL, mseR = mse(L_rows), mse(R_rows)
             stack_rows.extend([R_rows, L_rows])
@@ -148,10 +153,9 @@ def deltaE_split_gain_classification(tokens: torch.Tensor, tok: "Tokenizer", env
 
 def calculate_bayesian_reward(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularEnv", beta: float) -> torch.Tensor:
     """
-    Computes reward for a completed tree based on Bayesian marginal likelihood, as per the paper[cite: 324].
-    Used for CLASSIFICATION tasks with the 'bayesian' reward function.
+    Computes reward for a completed tree based on Bayesian marginal likelihood.
     """
-    alpha = 0.1 # Dirichlet prior, as specified in the paper's hyperparameter table [cite: 895]
+    alpha = 0.1
     alphas = torch.full((env.n_classes,), alpha, device=env.device)
 
     decoded_actions = tok.decode(tokens[0, 1:-1].tolist())
@@ -212,7 +216,6 @@ def calculate_bayesian_reward(tokens: torch.Tensor, tok: "Tokenizer", env: "Tabu
         if not node['children']:
             leaves_indices.append(node['indices'])
 
-    # Calculate Log Marginal Likelihood from Proposition 3.2 
     log_likelihood = 0.0
     log_gamma_alpha_sum = torch.lgamma(alphas.sum())
     log_gamma_alpha_prod = torch.lgamma(alphas).sum()
@@ -229,9 +232,7 @@ def calculate_bayesian_reward(tokens: torch.Tensor, tok: "Tokenizer", env: "Tabu
         log_denominator = torch.lgamma(n_l + alphas.sum())
         log_likelihood += log_numerator - log_denominator
         
-    # Calculate Structure Prior from Section 4.2 
-    #log_prior = -beta * n_decision_nodes
-    log_reward = log_likelihood #+ log_prior
+    log_reward = log_likelihood
     reward = torch.exp(log_reward) + 1e-9
     
     return reward.unsqueeze(0)
