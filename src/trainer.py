@@ -458,6 +458,7 @@ class Trainer:
                 candidate_trees.extend([res[0] for res in batch_results if res])
 
             # Step 2: Score all candidates against initial residuals and sort them
+            """
             scored_trees = []
             for seq in tqdm(candidate_trees, desc="Scoring Trees", leave=False):
                 pred_fun = get_tree_predictor(seq, X_tr, initial_residuals, self.tokenizer)
@@ -466,9 +467,10 @@ class Trainer:
                 scored_trees.append((gain, seq))
 
             sorted_trees = sorted(scored_trees, key=lambda x: x[0], reverse=True)
+            """
 
             # Step 3: Apply the sorted trees sequentially
-            for _, seq in tqdm(sorted_trees, desc="Sequential Boosting Prediction", leave=False):
+            for seq in tqdm(candidate_trees, desc="Sequential Boosting Prediction", leave=False):
                 if c.task == "classification":
                     probs = torch.softmax(train_preds, dim=1)
                     residuals = torch.nn.functional.one_hot(y_tr, num_classes=c.n_classes).to(torch.float) - probs
