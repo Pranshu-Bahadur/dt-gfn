@@ -30,6 +30,21 @@ def fl_loss(logF: torch.Tensor, log_pf: torch.Tensor, log_pb: torch.Tensor, dR: 
     loss = (logF[:, :-1] + log_pf - (logF[:, 1:] + log_pb + dR))**2
     return loss.mean()
 
+@torch.jit.script
+def subtb_loss(log_pf: torch.Tensor, log_pb: torch.Tensor, log_z: torch.Tensor, dR: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
+    """
+    Calculates the Sub-Trajectory Balance (SubTB) loss.
+    """
+    cum_log_pf = torch.cumsum(log_pf, dim=1)
+    cum_log_pb_flipped = torch.cumsum(torch.flip(log_pb, dims=[1]), dim=1)
+    cum_log_pb = torch.flip(cum_log_pb_flipped, dims=[1])
+    
+    sub_rewards = torch.cumsum(dR, dim=1)
+    
+    loss_terms = (log_z + cum_log_pf - (torch.log(torch.clamp(sub_rewards, min=1e-9)) + cum_log_pb + prior.unsqueeze(1)))**2
+    return loss_terms.mean()
+
+
 # --- Tree & Reward Utilities ---
 
 def _traverse_and_get_leaves(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularEnv") -> Tuple[List[torch.Tensor], int]:
@@ -322,16 +337,20 @@ def get_tree_predictor(traj: List[int], X_binned: torch.Tensor, y_target: torch.
 class ReplayBuffer:
     def __init__(self, capacity: int = 10000):
         self.capacity = capacity
-        self.data: List[Tuple[float, List[int], float, torch.Tensor]] = []
+        self.data: Deque[Tuple[float, List[int], float, torch.Tensor, Optional[float]]] = deque(maxlen=capacity)
 
     def add(self, r: float, t: List[int], p: float, idxs: torch.Tensor):
-        self.data.append((r, t, p, idxs))
-        self.data.sort(key=lambda x: x[0], reverse=True)
-        if len(self.data) > self.capacity:
-            self.data.pop()
+        # Skip re-inserting duplicates to keep buffer diverse
+        if any(t == traj for _, traj, _, _, _ in self.data):
+            return
+        self.data.append((r, t, p, idxs, None)) # Add entry with uncached weight
 
     def sample(self, k: int) -> list:
-        return random.sample(self.data, min(k, len(self.data)))
+        return random.sample(list(self.data), min(k, len(self.data)))
+    
+    def invalidate_weights(self):
+        """Invalidates all cached weights, marking them for re-computation."""
+        self.data = deque([(r, t, p, i, None) for r, t, p, i, _ in self.data], maxlen=self.capacity)
 
 END_TOKEN = 2
 EPS = 1e-9

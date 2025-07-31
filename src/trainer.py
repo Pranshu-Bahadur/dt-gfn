@@ -21,6 +21,7 @@ from src.utils import (
     ReplayBuffer,
     tb_loss,
     fl_loss,
+    subtb_loss,
     _safe_sample,
     get_tree_predictor,
     deltaE_split_gain_regression,
@@ -169,6 +170,8 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(opt.param_groups[0]['params'], 1.0)
             opt.step()
         
+        self.replay_buffer.invalidate_weights()
+        
         avg_tb = tb_loss_acc / len(all_tuples) if all_tuples and tb_loss_acc > 0 else 0
         avg_fl = fl_loss_acc / len(all_tuples) if all_tuples and fl_loss_acc > 0 else 0
         return avg_tb, avg_fl
@@ -263,8 +266,6 @@ class Trainer:
             else:
                 corr = torch.corrcoef(torch.stack([base_pred.squeeze(), y_true.squeeze()]))[0, 1].item()
                 tqdm.write(f"{log_str} | Train Corr: {corr:+.4f}")
-            
-            self.replay_buffer.data.clear()
 
     def _collect_rollouts(self, env_template, temp, residuals, beta):
         forward_tuples = []
@@ -291,19 +292,39 @@ class Trainer:
     def sample_replay(self, k: int) -> list[tuple[list[int], float]]:
         buf = self.replay_buffer
         if not buf or not buf.data: return []
+        
+        uncached_indices = [i for i, entry in enumerate(buf.data) if entry[4] is None]
+        if uncached_indices:
+            uncached_seqs = [buf.data[i][1] for i in uncached_indices]
+            with torch.no_grad():
+                flipped_seqs = [torch.tensor(seq, device=self.cfg.device).flip(dims=[0]) for seq in uncached_seqs]
+                padded_bwd_seqs = torch.nn.utils.rnn.pad_sequence(flipped_seqs, batch_first=True, padding_value=self.tokenizer.v.PAD)
+                log_probs = self.pb.log_prob(padded_bwd_seqs)
+                mask = (padded_bwd_seqs != self.tokenizer.v.PAD).float()
+
+                if log_probs.shape[1] != mask.shape[1]:
+                    mask = mask[:, :-1]
+
+                new_weights = (log_probs * mask).sum(dim=1).exp()
+                
+                for i, weight in zip(uncached_indices, new_weights):
+                    entry = list(buf.data[i])
+                    entry[4] = weight.item()
+                    buf.data[i] = tuple(entry)
+
         entries = list(buf.data)
-        weights = []
-        with torch.no_grad():
-            for _, seq, _, _ in entries:
-                tok_bwd = torch.flip(torch.tensor([seq], device=self.cfg.device), dims=[1])
-                weights.append(self.pb.log_prob(tok_bwd).sum().exp().item())
-        total = sum(weights)
+        weights = np.array([entry[4] for entry in entries], dtype=np.float32)
+        
+        total_weight = weights.sum()
         k = min(k, len(entries))
-        if total > 0:
-            idxs = random.choices(range(len(entries)), weights=[w / total for w in weights], k=k)
+
+        if total_weight > 0:
+            probabilities = weights / total_weight
+            sampled_indices = np.random.choice(len(entries), size=k, p=probabilities, replace=True)
         else:
-            idxs = random.sample(range(len(entries)), k)
-        return [(entries[i][1], entries[i][2]) for i in idxs]
+            sampled_indices = random.sample(range(len(entries)), k)
+            
+        return [(entries[i][1], entries[i][2]) for i in sampled_indices]
 
     def batched_rollout(self, envs, temp, residuals, beta, ras_counts: Optional[dict] = None):
         c, v, device = self.cfg, self.tokenizer.v, self.cfg.device
