@@ -110,10 +110,10 @@ class Trainer:
             for opt in optimizers
         ]
 
-        self.replay_buffer = ReplayBuffer(capacity=100000)
+        self.replay_buffer = ReplayBuffer(capacity=100)
         
         if c.beta is None:
-            c.beta = math.log(4) + math.log(len(c.feature_cols)) + math.log(c.n_bins)
+            c.beta = math.log(4) + math.log(len(c.feature_cols)) + math.log(c.n_bins)# to reproduce experiments comment n_bins
             print(f"Using beta derived from the paper's formula: {c.beta:.4f}")
 
         if c.random_forest:
@@ -181,7 +181,7 @@ class Trainer:
         sum_preds = torch.zeros((len(y_true), c.n_classes), device=c.device) if c.task == "classification" else torch.zeros_like(y_true, dtype=torch.float32)
 
         for upd in tqdm(range(1, c.updates + 1), desc="Policy Training & Tree Generation"):
-            forward_tuples = self._collect_rollouts(env_template, temp=1.0, residuals=y_true, beta=c.beta)
+            forward_tuples = self._collect_rollouts(env_template, temp=0.1, residuals=y_true, beta=c.beta)
             new_trees = [seq for seq, _ in forward_tuples if seq]
             self.ensemble.extend(new_trees)
             
@@ -236,7 +236,7 @@ class Trainer:
             residuals = (torch.nn.functional.one_hot(y_true, num_classes=c.n_classes).to(torch.float) - torch.softmax(base_pred, dim=1)) if c.task == "classification" else (y_true - base_pred)
             env_template.y = residuals.clone()
             
-            candidate_seqs = [r[0] for r in self._collect_rollouts(env_template, 1.0, residuals, c.beta) if r]
+            candidate_seqs = [r[0] for r in self._collect_rollouts(env_template, 0.1, residuals, c.beta) if r]
             if not candidate_seqs: continue
 
             best_gain, best_predictor = -float("inf"), None
@@ -264,7 +264,6 @@ class Trainer:
                 corr = torch.corrcoef(torch.stack([base_pred.squeeze(), y_true.squeeze()]))[0, 1].item()
                 tqdm.write(f"{log_str} | Train Corr: {corr:+.4f}")
             
-            self.replay_buffer.data.clear()
 
     def _collect_rollouts(self, env_template, temp, residuals, beta):
         forward_tuples = []
@@ -412,7 +411,7 @@ class Trainer:
                 trees_in_batch = min(c.num_parallel, total_trees - len(trees_to_use))
                 if trees_in_batch <= 0: break
                 ras_counts = {} if c.redundancy_aware else None
-                batch_results = self.batched_rollout([copy.copy(env_template) for _ in range(trees_in_batch)], temp=1.0, residuals=y_tr, beta=c.beta, ras_counts=ras_counts)
+                batch_results = self.batched_rollout([copy.copy(env_template) for _ in range(trees_in_batch)], temp=0.1, residuals=y_tr, beta=c.beta, ras_counts=ras_counts)
                 trees_to_use.extend([res[0] for res in batch_results if res])
         else:
             trees_to_use = self.ensemble
@@ -451,7 +450,7 @@ class Trainer:
                 if ras_counts is not None: ras_counts.clear()
                 batch_results = self.batched_rollout(
                     [copy.copy(env_template) for _ in range(c.num_parallel)],
-                    temp=1.0, residuals=initial_residuals, beta=c.beta, ras_counts=ras_counts
+                    temp=0.1, residuals=initial_residuals, beta=c.beta, ras_counts=ras_counts
                 )
                 candidate_trees.extend([res[0] for res in batch_results if res])
 
