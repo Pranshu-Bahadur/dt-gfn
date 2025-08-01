@@ -263,79 +263,108 @@ def deltaE_split_gain_classification(tokens: torch.Tensor, tok: "Tokenizer", env
     return dR.unsqueeze(0)
 
 def get_tree_predictor(traj: List[int], X_binned: torch.Tensor, y_target: torch.Tensor, tok: "Tokenizer") -> Callable[[torch.Tensor], torch.Tensor]:
+    # Detach from grad and cache device/dtype info
+    y_target = y_target.detach().to(dtype=torch.float32)
+    device = X_binned.device
+    all_idx = torch.arange(X_binned.size(0), device=device)
+
+    # -------- build tree --------------------------------------------------
     path_iter = iter(tok.decode(traj[1:-1]))
-    def build_recursive() -> Optional[dict]:
+    def build():
         try:
             kind, idx = next(path_iter)
+            if kind == 'feat':
+                return {
+                    'type': 'split', 'f': idx, 't': next(path_iter)[1],
+                    'L': build(), 'R': build()
+                }
+            return {'type': 'leaf'}
         except StopIteration:
-            return None
-        if kind == 'feat':
-            return {'type': 'split', 'f': idx, 't': next(path_iter)[1], 'L': build_recursive(), 'R': build_recursive()}
-        return {'type': 'leaf', 'value': 0}
+            return None # Handle malformed or truncated trajectories
 
-    tree_structure = build_recursive()
-    if tree_structure is None:
-        if y_target.ndim > 1:
-            return lambda X: torch.zeros(X.size(0), y_target.size(1), device=X.device)
-        return lambda X: torch.zeros(X.size(0), device=X.device)
+    tree_root = build()
+    # If the trajectory is empty or malformed, return a predictor that always predicts zeros
+    if tree_root is None:
+        return lambda X: torch.zeros(X.size(0), *(y_target.shape[1:]), device=X.device, dtype=y_target.dtype)
 
-    leaf_values = {}
-    q = deque([(tree_structure, torch.arange(X_binned.size(0), device=X_binned.device))])
-    leaf_idx_counter = 0
+    # -------- fit leaves ---------------------------------------------------
+    leaf_val = {}
+    q = deque([(tree_root, all_idx)])
+    # Create a zero vector with the correct dtype and device for default values
+    zero_vec = torch.zeros_like(y_target[0])
+
     while q:
-        node, indices = q.popleft()
-        if not node or not indices.numel(): continue
+        node, idxs = q.popleft()
+        
+        # Handle cases where a branch might be missing after a bad split
+        if node is None:
+            continue
 
-        if node['type'] == 'split':
-            mask = X_binned[indices, node['f']] <= node['t']
-            if node.get('L'): q.append((node['L'], indices[mask]))
-            if node.get('R'): q.append((node['R'], indices[~mask]))
-        else:
-            node['leaf_idx'] = leaf_idx_counter
-            if y_target.ndim > 1:
-                value = y_target[indices].mean(dim=0) if indices.numel() > 0 else torch.zeros(y_target.size(1), device=y_target.device)
-            else:
-                value = y_target[indices].mean().item() if indices.numel() > 0 else 0.0
-            leaf_values[leaf_idx_counter] = value
-            leaf_idx_counter += 1
+        if not idxs.numel():
+            if 'leaf' not in node: # Assign a leaf_id if it doesn't have one
+                node['leaf'] = len(leaf_val)
+                leaf_val[node['leaf']] = zero_vec
+            continue
 
-    def predict(X_test: torch.Tensor) -> torch.Tensor:
-        if y_target.ndim > 1:
-             preds = torch.zeros(X_test.size(0), y_target.size(1), device=X_test.device)
-        else:
-             preds = torch.zeros(X_test.size(0), device=X_test.device)
+        if node.get('type') == 'split':
+            # Ensure both children exist before proceeding
+            if node.get('L') is not None and node.get('R') is not None:
+                m = X_binned[idxs, node['f']] <= node['t']
+                q.append((node['L'], idxs[m]))
+                q.append((node['R'], idxs[~m]))
+            else: # If a split node is malformed, treat it as a leaf
+                node['type'] = 'leaf'
+                node['leaf'] = len(leaf_val)
+                leaf_val[node['leaf']] = y_target[idxs].mean(dim=0, keepdim=False)
+        else: # Leaf node
+            node['leaf'] = len(leaf_val)
+            leaf_val[node['leaf']] = y_target[idxs].mean(dim=0, keepdim=False)
 
-        q = deque([(tree_structure, torch.arange(X_test.size(0), device=X_test.device))])
-        while q:
-            node, indices = q.popleft()
-            if not node or not indices.numel(): continue
-            if node['type'] == 'leaf':
-                preds[indices] = leaf_values.get(node.get('leaf_idx'), 0.0)
-            else:
-                mask = X_test[indices, node['f']] <= node['t']
-                if node.get('L'): q.append((node['L'], indices[mask]))
-                if node.get('R'): q.append((node['R'], indices[~mask]))
-        return preds
+    # -------- predictor ----------------------------------------------------
+    def predict(X: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            # Initialize output tensor with correct shape, device, and dtype
+            out = torch.zeros(X.size(0), *leaf_val.get(0, zero_vec).shape, device=X.device, dtype=y_target.dtype)
+            q = deque([(tree_root, torch.arange(X.size(0), device=X.device))])
+            
+            while q:
+                node, idxs = q.popleft()
+                if not idxs.numel() or node is None: continue
+                
+                if node.get('type') == 'leaf':
+                    out[idxs] = leaf_val.get(node.get('leaf'), zero_vec)
+                elif node.get('type') == 'split' and node.get('L') and node.get('R'):
+                    m = X[idxs, node['f']] <= node['t']
+                    q.append((node['L'], idxs[m]))
+                    q.append((node['R'], idxs[~m]))
+                else: # Fallback for any other malformed node
+                    out[idxs] = zero_vec
+            return out
     return predict
 
 # --- Sampling & Buffer ---
 class ReplayBuffer:
     def __init__(self, capacity: int = 10000):
         self.capacity = capacity
-        self.data: Deque[Tuple[float, List[int], float, torch.Tensor, Optional[float]]] = deque(maxlen=capacity)
+        self.data: List[Tuple[float, List[int], float, torch.Tensor, Optional[float], int]] = []
+        self.step = 0
 
     def add(self, r: float, t: List[int], p: float, idxs: torch.Tensor):
-        if any(t == traj for _, traj, _, _, _ in self.data):
+        if any(t == traj for _, traj, _, _, _, _ in self.data):
             return
-        self.data.append((r, t, p, idxs, None))
+        # Entry: (reward, traj, prior, idxs, weight, cached_step)
+        self.data.append((r, t, p, idxs, None, -1))
+        # Keep the buffer sorted by reward (descending)
+        self.data.sort(key=lambda x: x[0], reverse=True)
+        if len(self.data) > self.capacity:
+            self.data.pop()
 
     def sample(self, k: int) -> list:
-        return random.sample(list(self.data), min(k, len(self.data)))
+        return random.sample(self.data, min(k, len(self.data)))
     
-    def invalidate_weights(self):
-        """Invalidates all cached weights, marking them for re-computation."""
-        self.data = deque([(r, t, p, i, None) for r, t, p, i, _ in self.data], maxlen=self.capacity)
-
+    def mark_policy_update(self):
+        """Increments the policy update counter."""
+        self.step += 1
 
 END_TOKEN = 2
 EPS = 1e-9

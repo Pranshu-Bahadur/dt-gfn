@@ -169,9 +169,12 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(opt.param_groups[0]['params'], 1.0)
             opt.step()
         
+        self.replay_buffer.mark_policy_update()
+        
         avg_tb = tb_loss_acc / len(all_tuples) if all_tuples and tb_loss_acc > 0 else 0
         avg_fl = fl_loss_acc / len(all_tuples) if all_tuples and fl_loss_acc > 0 else 0
         return avg_tb, avg_fl
+
 
     def _fit_dt_gfn_random_forest(self, env_template, y_true, X_binned, optimizers, schedulers):
         c = self.cfg
@@ -299,15 +302,20 @@ class Trainer:
                 pbar.update(batch_size)
         return forward_tuples
 
-    def sample_replay(self, k: int) -> list[tuple[list[int], float]]:
+    def sample_replay(self, k: int, REFRESH_INTERVAL: int = 5) -> list[tuple[list[int], float]]:
         buf = self.replay_buffer
         if not buf or not buf.data: return []
         
-        uncached_indices = [i for i, entry in enumerate(buf.data) if entry[4] is None]
-        if uncached_indices:
-            uncached_seqs = [buf.data[i][1] for i in uncached_indices]
+        # --- 1. Locate entries that need (re)computation ----------
+        stale_indices = [
+            i for i, entry in enumerate(buf.data)
+            if entry[4] is None or buf.step - entry[5] >= REFRESH_INTERVAL
+        ]
+        
+        if stale_indices:
+            stale_seqs = [buf.data[i][1] for i in stale_indices]
             with torch.no_grad():
-                flipped_seqs = [torch.tensor(seq, device=self.cfg.device).flip(dims=[0]) for seq in uncached_seqs]
+                flipped_seqs = [torch.tensor(seq, device=self.cfg.device).flip(dims=[0]) for seq in stale_seqs]
                 padded_bwd_seqs = torch.nn.utils.rnn.pad_sequence(flipped_seqs, batch_first=True, padding_value=self.tokenizer.v.PAD)
                 log_probs = self.pb.log_prob(padded_bwd_seqs)
                 mask = (padded_bwd_seqs != self.tokenizer.v.PAD).float()
@@ -317,13 +325,13 @@ class Trainer:
 
                 new_weights = (log_probs * mask).sum(dim=1).exp()
                 
-                for i, weight in zip(uncached_indices, new_weights):
-                    entry = list(buf.data[i])
-                    entry[4] = weight.item()
-                    buf.data[i] = tuple(entry)
+                for i, weight in zip(stale_indices, new_weights):
+                    r, t, p, idxs, _, _ = buf.data[i]
+                    buf.data[i] = (r, t, p, idxs, weight.item(), buf.step)
 
+        # --- 2. Draw k indices proportional to cached weights -------
         entries = list(buf.data)
-        weights = np.array([entry[4] for entry in entries], dtype=np.float32)
+        weights = np.array([e[4] for e in entries], dtype=np.float32)
         
         total_weight = weights.sum()
         k = min(k, len(entries))
@@ -332,7 +340,7 @@ class Trainer:
             probabilities = weights / total_weight
             sampled_indices = np.random.choice(len(entries), size=k, p=probabilities, replace=True)
         else:
-            sampled_indices = random.sample(range(len(entries)), k)
+            sampled_indices = np.random.randint(0, len(entries), size=k)
             
         return [(entries[i][1], entries[i][2]) for i in sampled_indices]
 
