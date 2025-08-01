@@ -322,16 +322,20 @@ def get_tree_predictor(traj: List[int], X_binned: torch.Tensor, y_target: torch.
 class ReplayBuffer:
     def __init__(self, capacity: int = 10000):
         self.capacity = capacity
-        self.data: List[Tuple[float, List[int], float, torch.Tensor]] = []
+        self.data: Deque[Tuple[float, List[int], float, torch.Tensor, Optional[float]]] = deque(maxlen=capacity)
 
     def add(self, r: float, t: List[int], p: float, idxs: torch.Tensor):
-        self.data.append((r, t, p, idxs))
-        #self.data.sort(key=lambda x: x[0], reverse=True)
-        if len(self.data) > self.capacity:
-            self.data.pop()
+        if any(t == traj for _, traj, _, _, _ in self.data):
+            return
+        self.data.append((r, t, p, idxs, None))
 
     def sample(self, k: int) -> list:
-        return random.sample(self.data, min(k, len(self.data)))
+        return random.sample(list(self.data), min(k, len(self.data)))
+    
+    def invalidate_weights(self):
+        """Invalidates all cached weights, marking them for re-computation."""
+        self.data = deque([(r, t, p, i, None) for r, t, p, i, _ in self.data], maxlen=self.capacity)
+
 
 END_TOKEN = 2
 EPS = 1e-9
