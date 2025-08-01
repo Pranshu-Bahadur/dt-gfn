@@ -113,7 +113,7 @@ class Trainer:
         self.replay_buffer = ReplayBuffer(capacity=100000)
         
         if c.beta is None:
-            c.beta = math.log(4) + math.log(len(c.feature_cols)) #+ math.log(c.n_bins)# to reproduce experiments comment n_bins
+            c.beta = math.log(4) + math.log(len(c.feature_cols)) + math.log(c.n_bins)# to reproduce experiments comment n_bins
             print(f"Using beta derived from the paper's formula: {c.beta:.4f}")
 
         if c.random_forest:
@@ -206,15 +206,10 @@ class Trainer:
             if current_ensemble_for_metrics:
                 y_target = torch.nn.functional.one_hot(y_true, num_classes=c.n_classes).to(torch.float) if c.task == "classification" else y_true
                 
-                # --- Map-Reduce for Parallel Prediction ---
-                # 1. Map Step: Create a predictor function for each tree sequence.
                 predictors = [get_tree_predictor(seq, X_binned, y_target, self.tokenizer) for seq in current_ensemble_for_metrics]
                 
-                # 2. Map Step (Parallel Execution): Apply each predictor to the data. The GPU runs these in parallel.
-                #    Reduce Step (Part 1): Stack the results into a single tensor.
                 all_preds = torch.stack([p(X_binned) for p in predictors])
                 
-                # 3. Reduce Step (Part 2): Compute the final average prediction.
                 train_preds = all_preds.mean(dim=0)
                 # -----------------------------------------
 

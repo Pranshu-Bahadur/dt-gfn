@@ -67,7 +67,7 @@ class PolicyPaperMLP(PolicyBase):
 
     def forward(self, seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # seq: (B, T)
-        emb, _ = self.rnn(self.embedding(seq))               # (B, T, H)
+        emb = self.embedding(seq)               # (B, T, H)
         h = self.shared_mlp(emb)                              # (B, T, W)
         logits = self.head_tok(h)                             # (B, T, V)
         flow   = self.head_flow(h).squeeze(-1)                # (B, T)
@@ -137,7 +137,7 @@ class PolicyTransformer(PolicyBase):
             dim_feedforward = d_ff,
             dropout   = dropout,
             batch_first = True,            # (B, T, D)
-            activation = "relu",
+            activation = "gelu",
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
