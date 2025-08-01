@@ -178,7 +178,6 @@ class Trainer:
         print("--- Starting DT-GFN (Random Forest) Training ---")
         
         env_template.y = y_true.clone()
-        sum_preds = torch.zeros((len(y_true), c.n_classes), device=c.device) if c.task == "classification" else torch.zeros_like(y_true, dtype=torch.float32)
 
         for upd in tqdm(range(1, c.updates + 1), desc="Policy Training & Tree Generation"):
             forward_tuples = self._collect_rollouts(env_template, temp=0.1, residuals=y_true, beta=c.beta)
@@ -188,8 +187,8 @@ class Trainer:
             all_tuples_for_policy_update = forward_tuples + replay_tuples
             if not all_tuples_for_policy_update: continue
 
-            # The ensemble is now defined as only the trees from this update step
-            self.ensemble = [seq for seq, _ in all_tuples_for_policy_update if seq]
+            # The ensemble for this update step is the latest rollouts + top-k from replay
+            current_ensemble_for_metrics = [seq for seq, _ in all_tuples_for_policy_update if seq]
 
             reward_env = copy.copy(env_template)
             reward_env.reset(len(y_true))
@@ -199,17 +198,22 @@ class Trainer:
             avg_tb_loss, avg_fl_loss = self._update_policy(all_tuples_for_policy_update, reward_env, optimizers)
             for sch in schedulers: sch.step()
 
-            log_str = f"Update {upd}/{c.updates} | TB: {avg_tb_loss:.4f} | FL: {avg_fl_loss:.4f} | Forest Size: {len(self.ensemble)}"
+            log_str = f"Update {upd}/{c.updates} | TB: {avg_tb_loss:.4f} | FL: {avg_fl_loss:.4f} | Step Forest Size: {len(current_ensemble_for_metrics)}"
             
-            if self.ensemble:
-                # Reset sum_preds to calculate metrics on the new ensemble for this step
-                sum_preds.zero_() 
+            if current_ensemble_for_metrics:
                 y_target = torch.nn.functional.one_hot(y_true, num_classes=c.n_classes).to(torch.float) if c.task == "classification" else y_true
                 
-                for seq in self.ensemble:
-                    sum_preds += get_tree_predictor(seq, X_binned, y_target, self.tokenizer)(X_binned)
+                # --- Map-Reduce for Parallel Prediction ---
+                # 1. Map Step: Create a predictor function for each tree sequence.
+                predictors = [get_tree_predictor(seq, X_binned, y_target, self.tokenizer) for seq in current_ensemble_for_metrics]
                 
-                train_preds = sum_preds / len(self.ensemble)
+                # 2. Map Step (Parallel Execution): Apply each predictor to the data. The GPU runs these in parallel.
+                #    Reduce Step (Part 1): Stack the results into a single tensor.
+                all_preds = torch.stack([p(X_binned) for p in predictors])
+                
+                # 3. Reduce Step (Part 2): Compute the final average prediction.
+                train_preds = all_preds.mean(dim=0)
+                # -----------------------------------------
 
                 if c.task == "classification":
                     acc = (train_preds.argmax(1) == y_true).float().mean().item()
@@ -217,10 +221,11 @@ class Trainer:
                 else:
                     if train_preds.std() > 0 and y_true.std() > 0:
                         corr = torch.corrcoef(torch.stack([train_preds.squeeze(), y_true.squeeze()]))[0, 1].item()
-                        log_str += f" | Train Corr: {corr:+.4f}"
+                        log_str += f" | Train Corr: {corr:.4f}"
             tqdm.write(log_str)
-
-        # The final ensemble is simply the one from the last training step
+        
+        # Set the final ensemble to be the one generated in the last training step
+        self.ensemble = current_ensemble_for_metrics
         print(f"--- RF Training Finished. Final forest size: {len(self.ensemble)} trees. ---")
 
     def _fit_boost_gfn(self, env_template, y_true, X_binned, optimizers, schedulers):
