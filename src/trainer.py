@@ -183,7 +183,7 @@ class Trainer:
         env_template.y = y_true.clone()
 
         for upd in tqdm(range(1, c.updates + 1), desc="Policy Training & Tree Generation"):
-            forward_tuples = self._collect_rollouts(env_template, temp=0.1, residuals=y_true, beta=c.beta)
+            forward_tuples = self._collect_rollouts(env_template, temp=1.0, residuals=y_true, beta=c.beta)
             
             # Combine latest rollouts with top samples from replay buffer
             replay_tuples = self.sample_replay(c.top_k_trees)
@@ -243,17 +243,23 @@ class Trainer:
         else:
             self.y_mean = y_true.mean().item()
             base_pred = torch.full_like(y_true, self.y_mean, dtype=torch.float32)
-        
-        reward_env_true_y = copy.copy(env_template)
-        reward_env_true_y.y = y_true.clone()
 
         for upd in tqdm(range(1, c.updates + 1), desc="Boost Updates"):
-            residuals = (torch.nn.functional.one_hot(y_true, num_classes=c.n_classes).to(torch.float) - torch.softmax(base_pred, dim=1)) if c.task == "classification" else (y_true - base_pred)
+            # Step 1: Calculate residuals based on the current ensemble's predictions
+            if c.task == "classification":
+                probs = torch.softmax(base_pred, dim=1)
+                residuals = torch.nn.functional.one_hot(y_true, num_classes=c.n_classes).to(torch.float) - probs
+            else:
+                residuals = y_true - base_pred
+            
+            # The environment for rollouts should always be based on the current residuals
             env_template.y = residuals.clone()
             
-            candidate_seqs = [r[0] for r in self._collect_rollouts(env_template, 0.1, residuals, c.beta) if r]
+            # Step 2: Generate a batch of candidate trees that are trained to predict these residuals
+            candidate_seqs = [r[0] for r in self._collect_rollouts(env_template, 1.0, residuals, c.beta) if r]
             if not candidate_seqs: continue
 
+            # Step 3: Select the single best tree from the candidates based on MSE reduction on residuals
             best_gain, best_predictor = -float("inf"), None
             for seq in candidate_seqs:
                 pred_fun = get_tree_predictor(seq, X_binned, residuals, self.tokenizer)
@@ -262,13 +268,19 @@ class Trainer:
                 if gain > best_gain:
                     best_gain, best_predictor = gain, pred_fun
             
+            # Step 4: Add the best tree to the ensemble and update the base prediction
             if best_predictor:
                 base_pred += c.boosting_lr * best_predictor(X_binned)
                 self.boosting_ensemble.append(best_predictor)
 
+            # Step 5: Update the policy. The reward for the policy should also be based on fitting the residuals.
             all_tuples = self.sample_replay(c.top_k_trees) + [(seq, 0.0) for seq in candidate_seqs]
-            reward_env = reward_env_true_y
-            avg_tb_loss, avg_fl_loss = self._update_policy(all_tuples, reward_env, optimizers)
+            
+            # ** FIX: The reward environment for the policy update MUST use the residuals **
+            reward_env_for_policy = env_template 
+            reward_env_for_policy.reset(len(y_true))
+
+            avg_tb_loss, avg_fl_loss = self._update_policy(all_tuples, reward_env_for_policy, optimizers)
             for sch in schedulers: sch.step()
 
             log_str = f"Update {upd}/{c.updates} | TB: {avg_tb_loss:.4f} | FL: {avg_fl_loss:.4f}"
@@ -490,7 +502,7 @@ class Trainer:
                 trees_in_batch = min(c.num_parallel, total_trees - len(trees_to_use))
                 if trees_in_batch <= 0: break
                 ras_counts = {} if c.redundancy_aware else None
-                batch_results = self.batched_rollout([copy.copy(env_template) for _ in range(trees_in_batch)], temp=0.1, residuals=y_tr, beta=c.beta, ras_counts=ras_counts)
+                batch_results = self.batched_rollout([copy.copy(env_template) for _ in range(trees_in_batch)], temp=1.0, residuals=y_tr, beta=c.beta, ras_counts=ras_counts)
                 trees_to_use.extend([res[0] for res in batch_results if res])
         else:
             trees_to_use = self.ensemble
@@ -529,7 +541,7 @@ class Trainer:
                 if ras_counts is not None: ras_counts.clear()
                 batch_results = self.batched_rollout(
                     [copy.copy(env_template) for _ in range(c.num_parallel)],
-                    temp=0.1, residuals=initial_residuals, beta=c.beta, ras_counts=ras_counts
+                    temp=1.0, residuals=initial_residuals, beta=c.beta, ras_counts=ras_counts
                 )
                 candidate_trees.extend([res[0] for res in batch_results if res])
 
