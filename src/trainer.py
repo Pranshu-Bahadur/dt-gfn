@@ -113,7 +113,7 @@ class Trainer:
         self.replay_buffer = ReplayBuffer(capacity=100)
         
         if c.beta is None:
-            c.beta = math.log(4) + math.log(len(c.feature_cols)) + math.log(c.n_bins)# to reproduce experiments comment n_bins
+            c.beta = math.log(4) + math.log(len(c.feature_cols)) #+ math.log(c.n_bins)# to reproduce experiments comment n_bins
             print(f"Using beta derived from the paper's formula: {c.beta:.4f}")
 
         if c.random_forest:
@@ -182,28 +182,35 @@ class Trainer:
 
         for upd in tqdm(range(1, c.updates + 1), desc="Policy Training & Tree Generation"):
             forward_tuples = self._collect_rollouts(env_template, temp=0.1, residuals=y_true, beta=c.beta)
-            new_trees = [seq for seq, _ in forward_tuples if seq]
-            self.ensemble.extend(new_trees)
             
-            all_tuples = forward_tuples + self.sample_replay(c.top_k_trees)
-            if not all_tuples: continue
+            # Combine latest rollouts with top samples from replay buffer
+            replay_tuples = self.sample_replay(c.top_k_trees)
+            all_tuples_for_policy_update = forward_tuples + replay_tuples
+            if not all_tuples_for_policy_update: continue
+
+            # The ensemble is now defined as only the trees from this update step
+            self.ensemble = [seq for seq, _ in all_tuples_for_policy_update if seq]
 
             reward_env = copy.copy(env_template)
             reward_env.reset(len(y_true))
-            if c.task == 'classification' and c.reward_function == 'mse':
+            if c.task == 'classification':
                 reward_env.y = torch.nn.functional.one_hot(y_true, num_classes=c.n_classes).to(torch.float)
             
-            avg_tb_loss, avg_fl_loss = self._update_policy(all_tuples, reward_env, optimizers)
+            avg_tb_loss, avg_fl_loss = self._update_policy(all_tuples_for_policy_update, reward_env, optimizers)
             for sch in schedulers: sch.step()
 
-            log_str = f"Update {upd}/{c.updates} | TB: {avg_tb_loss:.4f} | FL: {avg_fl_loss:.4f} | Forest: {len(self.ensemble)}"
+            log_str = f"Update {upd}/{c.updates} | TB: {avg_tb_loss:.4f} | FL: {avg_fl_loss:.4f} | Forest Size: {len(self.ensemble)}"
             
-            if new_trees:
+            if self.ensemble:
+                # Reset sum_preds to calculate metrics on the new ensemble for this step
+                sum_preds.zero_() 
                 y_target = torch.nn.functional.one_hot(y_true, num_classes=c.n_classes).to(torch.float) if c.task == "classification" else y_true
-                for seq in new_trees:
+                
+                for seq in self.ensemble:
                     sum_preds += get_tree_predictor(seq, X_binned, y_target, self.tokenizer)(X_binned)
                 
                 train_preds = sum_preds / len(self.ensemble)
+
                 if c.task == "classification":
                     acc = (train_preds.argmax(1) == y_true).float().mean().item()
                     log_str += f" | Train Acc: {acc:.4f}"
@@ -213,8 +220,8 @@ class Trainer:
                         log_str += f" | Train Corr: {corr:+.4f}"
             tqdm.write(log_str)
 
-        self.ensemble = [list(t) for t in set(tuple(i) for i in self.ensemble)]
-        print(f"--- RF Training Finished. Final forest size: {len(self.ensemble)} unique trees. ---")
+        # The final ensemble is simply the one from the last training step
+        print(f"--- RF Training Finished. Final forest size: {len(self.ensemble)} trees. ---")
 
     def _fit_boost_gfn(self, env_template, y_true, X_binned, optimizers, schedulers):
         c = self.cfg
@@ -304,40 +311,63 @@ class Trainer:
             idxs = random.sample(range(len(entries)), k)
         return [(entries[i][1], entries[i][2]) for i in idxs]
 
-    def batched_rollout(self, envs, temp, residuals, beta, ras_counts: Optional[dict] = None):
+    def batched_rollout(
+        self,
+        envs,
+        temp,
+        residuals,
+        beta,
+        ras_counts: Optional[dict] = None,
+    ):
         c, v, device = self.cfg, self.tokenizer.v, self.cfg.device
         num = len(envs)
-        END_TOKEN = 2 
-        for env in envs: 
+        END_TOKEN = 2
+
+        # --- Initialize envs & state trackers ---
+        for env in envs:
             env.y = residuals
             env.reset(c.batch_size)
+
+        # Use Python lists and deques for robust, individual state tracking
         seqs, depths = [[v.BOS] for _ in range(num)], [deque([0]) for _ in range(num)]
         active_indices, final_results = list(range(num)), [None] * num
+
         with torch.no_grad():
             while active_indices:
-                batch_seqs_tensors = torch.nn.utils.rnn.pad_sequence([torch.tensor(seqs[i], device=device) for i in active_indices], batch_first=True, padding_value=v.PAD)
+                # --- Batched Forward Pass ---
+                # This is the most expensive step and it remains fully parallel
+                batch_seqs_tensors = torch.nn.utils.rnn.pad_sequence(
+                    [torch.tensor(seqs[i], device=device) for i in active_indices],
+                    batch_first=True,
+                    padding_value=v.PAD
+                )
                 logits_batch, _ = self.pf(batch_seqs_tensors)
                 last_logits = logits_batch[:, -1, :]
-                
+
+                # --- Masking and Sampling (Batched) ---
                 if ras_counts is not None:
                     for i, original_idx in enumerate(active_indices):
                         path_tuple = tuple(seqs[original_idx])
                         if path_tuple in ras_counts:
                             last_logits[i, :] -= ras_counts[path_tuple] * 1e9
-                
+
                 masks = torch.zeros((len(active_indices), v.size()), dtype=torch.bool, device=device)
                 for i, original_idx in enumerate(active_indices):
+                    # Correctly use the depth of the current shallowest leaf
                     d = depths[original_idx][-1] if depths[original_idx] else c.max_depth
-                    if envs[original_idx].open_leaves > 0 and d < c.max_depth: masks[i, v.split_start : v.split_start + v.num_feat] = True
-                    if envs[original_idx].open_leaves > 0: masks[i, v.split_start + v.num_feat + v.num_th :] = True
+                    if envs[original_idx].open_leaves > 0 and d < c.max_depth:
+                        masks[i, v.split_start : v.split_start + v.num_feat] = True
+                    if envs[original_idx].open_leaves > 0:
+                        masks[i, v.split_start + v.num_feat + v.num_th :] = True
                 
                 toks1 = _safe_sample(last_logits, masks, temp)
-                needs_threshold, still_active = {}, []
                 
+                # --- State Update (Iterative but Correct) ---
+                needs_threshold, still_active = {}, []
                 for i, original_idx in enumerate(active_indices):
                     token = toks1[i].item()
                     seqs[original_idx].append(token)
-                    
+
                     if ras_counts is not None:
                         path_tuple = tuple(seqs[original_idx])
                         ras_counts[path_tuple] = ras_counts.get(path_tuple, 0) + 1
@@ -348,21 +378,30 @@ class Trainer:
 
                     kind, idx = self.tokenizer.decode_one(token)
                     envs[original_idx].step((kind, idx))
+
+                    # Correctly manage the stack of leaf depths
                     if kind == 'feat':
                         d0 = depths[original_idx].pop()
                         depths[original_idx].extend([d0 + 1, d0 + 1])
                         needs_threshold[len(needs_threshold)] = i
-                    else:
-                        if depths[original_idx]: depths[original_idx].pop()
-                    if not depths[original_idx]: envs[original_idx].done = True
-                    if not envs[original_idx].done: still_active.append(original_idx)
+                    else: # leaf token
+                        if depths[original_idx]:
+                            depths[original_idx].pop()
+                    
+                    if not depths[original_idx]:
+                        envs[original_idx].done = True
+                    
+                    if not envs[original_idx].done:
+                        still_active.append(original_idx)
 
+                # --- Handle Thresholds (Batched Forward Pass) ---
                 if needs_threshold:
                     sub_batch_indices = [active_indices[i] for i in needs_threshold.values()]
                     sub_batch_seqs = torch.nn.utils.rnn.pad_sequence([torch.tensor(seqs[i], device=device) for i in sub_batch_indices], batch_first=True, padding_value=v.PAD)
                     sub_logits, _ = self.pf(sub_batch_seqs)
+                    
                     th_mask = torch.zeros_like(sub_logits[:, -1, :], dtype=torch.bool, device=device)
-                    th_mask[:, v.split_start + v.num_feat : v.split_start + v.num_th] = True
+                    th_mask[:, v.split_start + v.num_feat : v.split_start + v.num_feat + v.num_th] = True
                     
                     toks2 = _safe_sample(sub_logits[:, -1, :], th_mask, temp)
                     for i, original_idx in enumerate(sub_batch_indices):
@@ -374,13 +413,20 @@ class Trainer:
                             continue
                         
                         envs[original_idx].step(self.tokenizer.decode_one(token))
+                
                 active_indices = still_active
 
+        # --- Finalize Trajectories ---
         for i in range(num):
             if envs[i].done and envs[i].open_leaves == 0:
-                seqs[i].append(v.EOS)
+                if seqs[i][-1] != v.EOS:
+                    seqs[i].append(v.EOS)
                 final_results[i] = (seqs[i], envs[i].get_prior(beta).item(), envs[i].idxs.clone())
+        
         return final_results
+
+
+
 
     def predict(self, df_test, df_train, use_policy=False, policy_inference_trees=None):
         ensemble_exists = self.ensemble or self.boosting_ensemble

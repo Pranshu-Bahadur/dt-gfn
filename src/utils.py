@@ -114,7 +114,7 @@ def calculate_bayesian_reward(tokens: torch.Tensor, tok: "Tokenizer", env: "Tabu
         log_denominator = torch.lgamma(n_l + alphas.sum())
         log_likelihood += log_numerator - log_denominator
         
-    log_reward = (log_likelihood - beta * n_decision_nodes) / float(env.idxs.numel() or 1)
+    log_reward = (log_likelihood)/ float(env.idxs.numel() or 1)
     reward = torch.exp(log_reward).clamp(min=1e-9)
     
     return reward.unsqueeze(0)
@@ -149,7 +149,7 @@ def calculate_bayesian_reward_regression(tokens: torch.Tensor, tok: "Tokenizer",
         )
         log_marginal_likelihood += log_ml_leaf.sum()
 
-    log_reward = (log_marginal_likelihood - beta * n_decision_nodes) / float(env.idxs.numel() or 1)
+    log_reward = (log_marginal_likelihood) / float(env.idxs.numel() or 1)
     reward = torch.exp(log_reward).clamp(min=1e-9)
     
     return reward.unsqueeze(0)
@@ -326,7 +326,7 @@ class ReplayBuffer:
 
     def add(self, r: float, t: List[int], p: float, idxs: torch.Tensor):
         self.data.append((r, t, p, idxs))
-        self.data.sort(key=lambda x: x[0], reverse=True)
+        #self.data.sort(key=lambda x: x[0], reverse=True)
         if len(self.data) > self.capacity:
             self.data.pop()
 
