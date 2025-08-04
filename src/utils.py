@@ -262,9 +262,26 @@ def deltaE_split_gain_classification(tokens: torch.Tensor, tok: "Tokenizer", env
             token_idx += 1
     return dR.unsqueeze(0)
 
-def get_tree_predictor(traj: List[int], X_binned: torch.Tensor, y_target: torch.Tensor, tok: "Tokenizer") -> Callable[[torch.Tensor], torch.Tensor]:
-    # Detach from grad and cache device/dtype info
-    y_target = y_target.detach().to(dtype=torch.float32)
+
+def get_tree_predictor(
+    traj: List[int],
+    X_binned: torch.Tensor,
+    y_target: torch.Tensor,
+    tok: "Tokenizer",
+    task: str = "classification",
+    n_classes: Optional[int] = None,
+    alpha: float = 0.1,
+    sample_leaf_params: bool = False
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """
+    Builds a predictor function from a trajectory. This version includes
+    fixes for NameError on empty trees and shape consistency for outputs.
+    """
+    # Auto-detect residual fitting for boosting in classification mode.
+    if task == "classification" and y_target.ndim > 1:
+        task = "regression"
+
+    y_target = y_target.detach()
     device = X_binned.device
     all_idx = torch.arange(X_binned.size(0), device=device)
 
@@ -280,64 +297,93 @@ def get_tree_predictor(traj: List[int], X_binned: torch.Tensor, y_target: torch.
                 }
             return {'type': 'leaf'}
         except StopIteration:
-            return None # Handle malformed or truncated trajectories
+            return None
 
     tree_root = build()
-    # If the trajectory is empty or malformed, return a predictor that always predicts zeros
+
+    # FIX: Handle empty trajectory case robustly to avoid NameError.
     if tree_root is None:
-        return lambda X: torch.zeros(X.size(0), *(y_target.shape[1:]), device=X.device, dtype=y_target.dtype)
+        def _zero_pred(X: torch.Tensor) -> torch.Tensor:
+            if task == "classification":
+                return torch.zeros(X.size(0), n_classes,
+                                   device=X.device, dtype=torch.float32)
+            else:  # regression / residuals
+                target_dim = y_target.shape[1] if y_target.ndim > 1 else 1
+                # Squeeze only if the target dimension is truly 1
+                squeeze_dim = 1 if target_dim == 1 else -1 # -1 means no squeeze
+                return torch.zeros(X.size(0), target_dim,
+                                   device=X.device, dtype=torch.float32).squeeze(squeeze_dim)
+        return _zero_pred
 
     # -------- fit leaves ---------------------------------------------------
-    leaf_val = {}
+    leaf_params = {}
     q = deque([(tree_root, all_idx)])
-    # Create a zero vector with the correct dtype and device for default values
-    zero_vec = torch.zeros_like(y_target[0])
+    if task == "classification":
+        zero_vec = torch.zeros(n_classes, device=device, dtype=torch.float32)
+    else:
+        target_dim = y_target.shape[1] if y_target.ndim > 1 else 1
+        zero_vec = torch.zeros(target_dim, device=device, dtype=torch.float32)
+
 
     while q:
         node, idxs = q.popleft()
-        
-        # Handle cases where a branch might be missing after a bad split
-        if node is None:
-            continue
+        if node is None: continue
+
+        if 'leaf_id' not in node:
+            node['leaf_id'] = len(leaf_params)
 
         if not idxs.numel():
-            if 'leaf' not in node: # Assign a leaf_id if it doesn't have one
-                node['leaf'] = len(leaf_val)
-                leaf_val[node['leaf']] = zero_vec
-            continue
+             leaf_params[node['leaf_id']] = zero_vec
+             continue
 
         if node.get('type') == 'split':
-            # Ensure both children exist before proceeding
-            if node.get('L') is not None and node.get('R') is not None:
+            if node.get('L') and node.get('R'):
                 m = X_binned[idxs, node['f']] <= node['t']
                 q.append((node['L'], idxs[m]))
                 q.append((node['R'], idxs[~m]))
-            else: # If a split node is malformed, treat it as a leaf
+            else:
                 node['type'] = 'leaf'
-                node['leaf'] = len(leaf_val)
-                leaf_val[node['leaf']] = y_target[idxs].mean(dim=0, keepdim=False)
-        else: # Leaf node
-            node['leaf'] = len(leaf_val)
-            leaf_val[node['leaf']] = y_target[idxs].mean(dim=0, keepdim=False)
+
+        if node.get('type') == 'leaf':
+            if task == "classification":
+                counts = torch.bincount(y_target[idxs].long(), minlength=n_classes)
+                posterior_params = counts + alpha
+                if sample_leaf_params:
+                    leaf_params[node['leaf_id']] = torch.distributions.Dirichlet(posterior_params).sample()
+                else:
+                    leaf_params[node['leaf_id']] = posterior_params / posterior_params.sum()
+            else:
+                leaf_params[node['leaf_id']] = y_target[idxs].mean(dim=0)
+
 
     # -------- predictor ----------------------------------------------------
     def predict(X: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            # Initialize output tensor with correct shape, device, and dtype
-            out = torch.zeros(X.size(0), *leaf_val.get(0, zero_vec).shape, device=X.device, dtype=y_target.dtype)
+            # FIX: Ensure output shape is consistent with zero_vec logic
+            if task == "classification":
+                out = torch.zeros(X.size(0), n_classes,
+                                  device=X.device, dtype=torch.float32)
+            else:
+                target_dim = y_target.shape[1] if y_target.ndim > 1 else 1
+                out = torch.zeros(X.size(0), target_dim,
+                                  device=X.device, dtype=torch.float32)
+                # FIX: Only squeeze if target_dim is 1 to avoid shape errors
+                if target_dim == 1:
+                    out = out.squeeze(1)
+
             q = deque([(tree_root, torch.arange(X.size(0), device=X.device))])
-            
+
             while q:
                 node, idxs = q.popleft()
                 if not idxs.numel() or node is None: continue
-                
+
                 if node.get('type') == 'leaf':
-                    out[idxs] = leaf_val.get(node.get('leaf'), zero_vec)
+                    out[idxs] = leaf_params.get(node.get('leaf_id'), zero_vec)
                 elif node.get('type') == 'split' and node.get('L') and node.get('R'):
                     m = X[idxs, node['f']] <= node['t']
                     q.append((node['L'], idxs[m]))
                     q.append((node['R'], idxs[~m]))
-                else: # Fallback for any other malformed node
+                else:
                     out[idxs] = zero_vec
             return out
     return predict
