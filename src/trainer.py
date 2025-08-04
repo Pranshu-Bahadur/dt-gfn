@@ -140,15 +140,24 @@ class Trainer:
             R_t = torch.clamp(R_t_per_step.sum(), min=1e-9)
             return R_t, R_t_per_step
 
-    def _update_policy(self, all_tuples: List, reward_env: TabularEnv, optimizers: List) -> Tuple[float, float]:
+    def _update_policy(self, all_tuples_with_targets: List, env_template: TabularEnv, optimizers: List) -> Tuple[float, float]:
         c = self.cfg
         tb_loss_acc, fl_loss_acc = 0.0, 0.0
-        
-        for opt in optimizers: opt.zero_grad()
+        if not all_tuples_with_targets:
+            return 0.0, 0.0
 
-        for seq, prior in all_tuples:
+        for opt in optimizers:
+            opt.zero_grad()
+
+        reward_env = copy.copy(env_template)
+
+        for seq, prior, target in all_tuples_with_targets:
             tok = torch.tensor([seq], device=c.device)
             prior_tensor = torch.tensor([prior], device=c.device)
+
+            reward_env.y = target
+            reward_env.reset(len(target))
+
             log_pf, log_pb = self.pf.log_prob(tok), self.pb.log_prob(torch.flip(tok, dims=[1]))
             
             R_t, R_t_per_step = self._calculate_reward(tok, reward_env)
@@ -171,8 +180,8 @@ class Trainer:
         
         self.replay_buffer.mark_policy_update()
         
-        avg_tb = tb_loss_acc / len(all_tuples) if all_tuples and tb_loss_acc > 0 else 0
-        avg_fl = fl_loss_acc / len(all_tuples) if all_tuples and fl_loss_acc > 0 else 0
+        avg_tb = tb_loss_acc / len(all_tuples_with_targets)
+        avg_fl = fl_loss_acc / len(all_tuples_with_targets) if fl_loss_acc > 0 else 0
         return avg_tb, avg_fl
 
 
@@ -180,38 +189,34 @@ class Trainer:
         c = self.cfg
         print("--- Starting DT-GFN (Random Forest) Training ---")
         
+        if c.task == 'classification':
+            y_target_for_reward = torch.nn.functional.one_hot(y_true, num_classes=c.n_classes).to(torch.float)
+        else:
+            y_target_for_reward = y_true.clone()
+
         env_template.y = y_true.clone()
 
         for upd in tqdm(range(1, c.updates + 1), desc="Policy Training & Tree Generation"):
             forward_tuples = self._collect_rollouts(env_template, temp=1.0, residuals=y_true, beta=c.beta)
             
-            # Combine latest rollouts with top samples from replay buffer
             replay_tuples = self.sample_replay(c.top_k_trees)
             all_tuples_for_policy_update = forward_tuples + replay_tuples
             if not all_tuples_for_policy_update: continue
 
-            # The ensemble for this update step is the latest rollouts + top-k from replay
-            current_ensemble_for_metrics = [seq for seq, _ in all_tuples_for_policy_update if seq]
-
-            reward_env = copy.copy(env_template)
-            reward_env.reset(len(y_true))
-            if c.task == 'classification':
-                reward_env.y = torch.nn.functional.one_hot(y_true, num_classes=c.n_classes).to(torch.float)
+            all_tuples_with_targets = [(seq, prior, y_target_for_reward) for seq, prior in all_tuples_for_policy_update]
             
-            avg_tb_loss, avg_fl_loss = self._update_policy(all_tuples_for_policy_update, reward_env, optimizers)
+            avg_tb_loss, avg_fl_loss = self._update_policy(all_tuples_with_targets, env_template, optimizers)
             for sch in schedulers: sch.step()
 
+            current_ensemble_for_metrics = [seq for seq, _ in all_tuples_for_policy_update if seq]
             log_str = f"Update {upd}/{c.updates} | TB: {avg_tb_loss:.4f} | FL: {avg_fl_loss:.4f} | Step Forest Size: {len(current_ensemble_for_metrics)}"
             
             if current_ensemble_for_metrics:
-                y_target = torch.nn.functional.one_hot(y_true, num_classes=c.n_classes).to(torch.float) if c.task == "classification" else y_true
-                
-                predictors = [get_tree_predictor(seq, X_binned, y_target, self.tokenizer) for seq in current_ensemble_for_metrics]
+                predictors = [get_tree_predictor(seq, X_binned, y_target_for_reward, self.tokenizer) for seq in current_ensemble_for_metrics]
                 
                 all_preds = torch.stack([p(X_binned) for p in predictors])
                 
                 train_preds = all_preds.mean(dim=0)
-                # -----------------------------------------
 
                 if c.task == "classification":
                     acc = (train_preds.argmax(1) == y_true).float().mean().item()
@@ -222,14 +227,13 @@ class Trainer:
                         log_str += f" | Train Corr: {corr:.4f}"
             tqdm.write(log_str)
         
-        # Set the final ensemble to be the one generated in the last training step
-        self.ensemble = current_ensemble_for_metrics
+        self.ensemble = [seq for seq, _ in all_tuples_for_policy_update if seq]
         print(f"--- RF Training Finished. Final forest size: {len(self.ensemble)} trees. ---")
 
     def _fit_boost_gfn(self, env_template, y_true, X_binned, optimizers, schedulers):
         c = self.cfg
         print("--- Starting Boost-GFN Training ---")
-        
+    
         if c.task == "classification":
             class_counts = torch.bincount(y_true, minlength=c.n_classes).float()
             class_probs = class_counts / class_counts.sum()
@@ -240,52 +244,57 @@ class Trainer:
             base_pred = torch.full_like(y_true, self.y_mean, dtype=torch.float32)
 
         for upd in tqdm(range(1, c.updates + 1), desc="Boost Updates"):
-            # Step 1: Calculate residuals based on the current ensemble's predictions
+
+            
+            # At the start of each update, calculate the residuals against the cumulative model built so far.
+            # This effectively "resets" the target for the current boosting stage.
             if c.task == "classification":
                 probs = torch.softmax(base_pred, dim=1)
-                residuals = torch.nn.functional.one_hot(y_true, num_classes=c.n_classes).to(torch.float) - probs
+                step_residuals = torch.nn.functional.one_hot(y_true, num_classes=c.n_classes).to(torch.float) - probs
             else:
-                residuals = y_true - base_pred
+                step_residuals = y_true - base_pred
             
-            # The environment for rollouts should always be based on the current residuals
-            env_template.y = residuals.clone()
-            
-            # Step 2: Generate a batch of candidate trees that are trained to predict these residuals
-            candidate_seqs = [r[0] for r in self._collect_rollouts(env_template, 1.0, residuals, c.beta) if r]
-            if not candidate_seqs: continue
+            replay_candidates = []#self.sample_replay(c.top_k_trees)
 
-            # Step 3: Select the single best tree from the candidates based on MSE reduction on residuals
-            best_gain, best_predictor = -float("inf"), None
-            for seq in candidate_seqs:
-                pred_fun = get_tree_predictor(seq, X_binned, residuals, self.tokenizer)
-                leaf_train = pred_fun(X_binned)
-                gain = ((residuals.float()**2).mean() - ((residuals.float() - leaf_train)**2).mean()).item()
-                if gain > best_gain:
-                    best_gain, best_predictor = gain, pred_fun
-            
-            # Step 4: Add the best tree to the ensemble and update the base prediction
-            if best_predictor:
-                base_pred += c.boosting_lr * best_predictor(X_binned)
-                self.boosting_ensemble.append(best_predictor)
+            env_template.y = step_residuals.clone()
+            new_candidates = self._collect_rollouts(env_template, 1.0, step_residuals, c.beta)
 
-            # Step 5: Update the policy. The reward for the policy should also be based on fitting the residuals.
-            all_tuples = self.sample_replay(c.top_k_trees) + [(seq, 0.0) for seq in candidate_seqs]
+            all_candidate_tuples = replay_candidates + new_candidates
+            #random.shuffle(all_candidate_tuples)
             
-            # ** FIX: The reward environment for the policy update MUST use the residuals **
-            reward_env_for_policy = env_template 
-            reward_env_for_policy.reset(len(y_true))
+            if not all_candidate_tuples:
+                continue
 
-            avg_tb_loss, avg_fl_loss = self._update_policy(all_tuples, reward_env_for_policy, optimizers)
+            tuples_for_policy_update = []
+            current_predictor_residuals = step_residuals.clone()
+            
+            for seq, prior in all_candidate_tuples:
+                tuples_for_policy_update.append((seq, prior, current_predictor_residuals.clone()))
+                
+                predictor = get_tree_predictor(seq, X_binned, current_predictor_residuals, self.tokenizer)
+                self.boosting_ensemble.append(predictor)
+                base_pred += c.boosting_lr * predictor(X_binned)
+                
+                if c.task == "classification":
+                    probs = torch.softmax(base_pred, dim=1)
+                    current_predictor_residuals = torch.nn.functional.one_hot(y_true, num_classes=c.n_classes).to(torch.float) - probs
+                else:
+                    current_predictor_residuals = y_true - base_pred
+
+            avg_tb_loss, avg_fl_loss = self._update_policy(tuples_for_policy_update, env_template, optimizers)
             for sch in schedulers: sch.step()
-
+    
             log_str = f"Update {upd}/{c.updates} | TB: {avg_tb_loss:.4f} | FL: {avg_fl_loss:.4f}"
             if c.task == "classification":
                 acc = (base_pred.argmax(1) == y_true).float().mean().item()
                 tqdm.write(f"{log_str} | Train Acc: {acc:.4f}")
             else:
-                corr = torch.corrcoef(torch.stack([base_pred.squeeze(), y_true.squeeze()]))[0, 1].item()
-                tqdm.write(f"{log_str} | Train Corr: {corr:+.4f}")
-            
+                if base_pred.std() > 0 and y_true.std() > 0:
+                    corr = torch.corrcoef(torch.stack([base_pred.squeeze(), y_true.squeeze()]))[0, 1].item()
+                    tqdm.write(f"{log_str} | Train Corr: {corr:+.4f}")
+                else:
+                    tqdm.write(f"{log_str} | Train Corr: nan")
+
 
     def _collect_rollouts(self, env_template, temp, residuals, beta):
         forward_tuples = []
@@ -313,7 +322,6 @@ class Trainer:
         buf = self.replay_buffer
         if not buf or not buf.data: return []
         
-        # --- 1. Locate entries that need (re)computation ----------
         stale_indices = [
             i for i, entry in enumerate(buf.data)
             if entry[4] is None or buf.step - entry[5] >= REFRESH_INTERVAL
@@ -336,18 +344,21 @@ class Trainer:
                     r, t, p, idxs, _, _ = buf.data[i]
                     buf.data[i] = (r, t, p, idxs, weight.item(), buf.step)
 
-        # --- 2. Draw k indices proportional to cached weights -------
         entries = list(buf.data)
-        weights = np.array([e[4] for e in entries], dtype=np.float32)
-        
-        total_weight = weights.sum()
-        k = min(k, len(entries))
+        valid_indices = [i for i, e in enumerate(entries) if e[4] is not None]
+        if not valid_indices: return []
 
+        weights = np.array([entries[i][4] for i in valid_indices], dtype=np.float32)
+        
+        k = min(k, len(valid_indices))
+
+        total_weight = weights.sum()
         if total_weight > 0:
             probabilities = weights / total_weight
-            sampled_indices = np.random.choice(len(entries), size=k, p=probabilities, replace=True)
+            sampled_idx_into_valid = np.random.choice(len(valid_indices), size=k, p=probabilities, replace=True)
+            sampled_indices = [valid_indices[i] for i in sampled_idx_into_valid]
         else:
-            sampled_indices = np.random.randint(0, len(entries), size=k)
+            sampled_indices = np.random.choice(valid_indices, size=k, replace=True)
             
         return [(entries[i][1], entries[i][2]) for i in sampled_indices]
 
@@ -363,19 +374,15 @@ class Trainer:
         num = len(envs)
         END_TOKEN = 2
 
-        # --- Initialize envs & state trackers ---
         for env in envs:
             env.y = residuals
             env.reset(c.batch_size)
 
-        # Use Python lists and deques for robust, individual state tracking
         seqs, depths = [[v.BOS] for _ in range(num)], [deque([0]) for _ in range(num)]
         active_indices, final_results = list(range(num)), [None] * num
 
         with torch.no_grad():
             while active_indices:
-                # --- Batched Forward Pass ---
-                # This is the most expensive step and it remains fully parallel
                 batch_seqs_tensors = torch.nn.utils.rnn.pad_sequence(
                     [torch.tensor(seqs[i], device=device) for i in active_indices],
                     batch_first=True,
@@ -384,7 +391,6 @@ class Trainer:
                 logits_batch, _ = self.pf(batch_seqs_tensors)
                 last_logits = logits_batch[:, -1, :]
 
-                # --- Masking and Sampling (Batched) ---
                 if ras_counts is not None:
                     for i, original_idx in enumerate(active_indices):
                         path_tuple = tuple(seqs[original_idx])
@@ -393,7 +399,6 @@ class Trainer:
 
                 masks = torch.zeros((len(active_indices), v.size()), dtype=torch.bool, device=device)
                 for i, original_idx in enumerate(active_indices):
-                    # Correctly use the depth of the current shallowest leaf
                     d = depths[original_idx][-1] if depths[original_idx] else c.max_depth
                     if envs[original_idx].open_leaves > 0 and d < c.max_depth:
                         masks[i, v.split_start : v.split_start + v.num_feat] = True
@@ -402,7 +407,6 @@ class Trainer:
                 
                 toks1 = _safe_sample(last_logits, masks, temp)
                 
-                # --- State Update (Iterative but Correct) ---
                 needs_threshold, still_active = {}, []
                 for i, original_idx in enumerate(active_indices):
                     token = toks1[i].item()
@@ -419,12 +423,11 @@ class Trainer:
                     kind, idx = self.tokenizer.decode_one(token)
                     envs[original_idx].step((kind, idx))
 
-                    # Correctly manage the stack of leaf depths
                     if kind == 'feat':
                         d0 = depths[original_idx].pop()
                         depths[original_idx].extend([d0 + 1, d0 + 1])
                         needs_threshold[len(needs_threshold)] = i
-                    else: # leaf token
+                    else:
                         if depths[original_idx]:
                             depths[original_idx].pop()
                     
@@ -434,7 +437,6 @@ class Trainer:
                     if not envs[original_idx].done:
                         still_active.append(original_idx)
 
-                # --- Handle Thresholds (Batched Forward Pass) ---
                 if needs_threshold:
                     sub_batch_indices = [active_indices[i] for i in needs_threshold.values()]
                     sub_batch_seqs = torch.nn.utils.rnn.pad_sequence([torch.tensor(seqs[i], device=device) for i in sub_batch_indices], batch_first=True, padding_value=v.PAD)
@@ -456,7 +458,6 @@ class Trainer:
                 
                 active_indices = still_active
 
-        # --- Finalize Trajectories ---
         for i in range(num):
             if envs[i].done and envs[i].open_leaves == 0:
                 if seqs[i][-1] != v.EOS:
