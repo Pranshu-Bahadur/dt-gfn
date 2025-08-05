@@ -225,6 +225,7 @@ def deltaE_split_gain_classification(tokens: torch.Tensor, tok: "Tokenizer", env
                 stack_metric.pop()
             token_idx += 1
     return dR.unsqueeze(0)
+    
 def get_tree_predictor(traj: List[int], X_binned: torch.Tensor, y_target: torch.Tensor, tok: "Tokenizer") -> Callable[[torch.Tensor], torch.Tensor]:
     # Detach from grad and cache device/dtype info
     y_target = y_target.detach().to(dtype=torch.float32)
@@ -255,6 +256,7 @@ def get_tree_predictor(traj: List[int], X_binned: torch.Tensor, y_target: torch.
     alpha = 0.1  # Consistent with reward calculation
     is_classification = (y_target.dim() > 1 and y_target.shape[1] > 1)
     n_classes = y_target.shape[1] if is_classification else 1
+    has_negatives = (y_target < 0).any()
     while q:
         node, idxs = q.popleft()
        
@@ -276,17 +278,31 @@ def get_tree_predictor(traj: List[int], X_binned: torch.Tensor, y_target: torch.
                 node['type'] = 'leaf'
                 node['leaf'] = len(leaf_val)
                 if is_classification:
-                    counts = y_target[idxs].sum(0)
-                    dirichlet = torch.distributions.Dirichlet(counts + alpha)
-                    leaf_val[node['leaf']] = dirichlet.sample()
+                    if has_negatives:
+                        leaf_val[node['leaf']] = y_target[idxs].mean(dim=0)
+                    else:
+                        counts = y_target[idxs].sum(0)
+                        concentrations = counts + alpha
+                        if (concentrations <= 0).any():
+                            leaf_val[node['leaf']] = torch.full((n_classes,), 1.0 / n_classes, device=device)
+                        else:
+                            dirichlet = torch.distributions.Dirichlet(concentrations)
+                            leaf_val[node['leaf']] = dirichlet.sample()
                 else:
                     leaf_val[node['leaf']] = y_target[idxs].mean(dim=0, keepdim=False)
         else: # Leaf node
             node['leaf'] = len(leaf_val)
             if is_classification:
-                counts = y_target[idxs].sum(0)
-                dirichlet = torch.distributions.Dirichlet(counts + alpha)
-                leaf_val[node['leaf']] = dirichlet.sample()
+                if has_negatives:
+                    leaf_val[node['leaf']] = y_target[idxs].mean(dim=0)
+                else:
+                    counts = y_target[idxs].sum(0)
+                    concentrations = counts + alpha
+                    if (concentrations <= 0).any():
+                        leaf_val[node['leaf']] = torch.full((n_classes,), 1.0 / n_classes, device=device)
+                    else:
+                        dirichlet = torch.distributions.Dirichlet(concentrations)
+                        leaf_val[node['leaf']] = dirichlet.sample()
             else:
                 leaf_val[node['leaf']] = y_target[idxs].mean(dim=0, keepdim=False)
     # -------- predictor ----------------------------------------------------

@@ -98,7 +98,7 @@ class Trainer:
             SequentialLR(opt, schedulers=[LambdaLR(opt, lambda u: min(1.0, u / warmup)), CosineAnnealingLR(opt, T_max=tmax)], milestones=[warmup])
             for opt in optimizers
         ]
-        self.replay_buffer = ReplayBuffer(capacity=100000)
+        self.replay_buffer = ReplayBuffer(capacity=100)
        
         if c.beta is None:
             c.beta = math.log(4) + math.log(len(c.feature_cols)) #+ math.log(c.n_bins)# to reproduce experiments comment n_bins
