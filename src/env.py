@@ -27,7 +27,7 @@ class TabularEnv:
         self.target_col = target_col
         self.n_bins = n_bins
         self.task = task
-        self.shuffle_on_reset = shuffle_on_reset
+        self.shuffle_on_reset = True#shuffle_on_reset
         self.binning_strategy = binning_strategy
         self.le = None
         self.n_classes: Optional[int] = None
@@ -77,21 +77,29 @@ class TabularEnv:
         df_target_processed = df_target[feats].copy()
         df_source_processed = df_source[feats].copy()
         
-        if self.task == "classification":
+        if self.task == "classification" and self.binning_strategy != "quantile":
             if self.feature_scaler is None:
                 self.feature_scaler = MinMaxScaler()
                 self.feature_scaler.fit(df_source_processed)
             
             df_target_processed[:] = self.feature_scaler.transform(df_target_processed)
             if not df_source.equals(df_target):
-                 df_source_processed[:] = self.feature_scaler.transform(df_source_processed)
+                df_source_processed[:] = self.feature_scaler.transform(df_source_processed)
 
         X_binned = []
         
         if self.binning_strategy == "quantile":
             for f in feats:
-                s_source = df_source_processed[f].replace([np.inf, -np.inf], np.nan).fillna(df_source_processed[f].median()).values
-                s_eval = df_target_processed[f].replace([np.inf, -np.inf], np.nan).fillna(df_target_processed[f].median()).values
+                # Compute median from source (train) for consistent imputation
+                source_series = df_source_processed[f].replace([np.inf, -np.inf], np.nan)
+                source_median = source_series.median()
+                
+                # Impute source with source median
+                s_source = source_series.fillna(source_median).values
+                
+                # Impute target with source median (to avoid leakage)
+                target_series = df_target_processed[f].replace([np.inf, -np.inf], np.nan)
+                s_eval = target_series.fillna(source_median).values
 
                 quantiles = np.linspace(0, 1, bins + 1)
                 edges = np.quantile(s_source, quantiles)
