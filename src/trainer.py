@@ -233,7 +233,7 @@ class Trainer:
               
             replay_candidates = []
             env_template.y = step_residuals.clone()
-            new_candidates = self._collect_rollouts(env_template, 1.0, step_residuals, c.beta)
+            new_candidates = self._collect_rollouts(env_template, 0.0, step_residuals, c.beta)
             all_candidate_tuples = replay_candidates + new_candidates
               
             if not all_candidate_tuples:
@@ -498,7 +498,7 @@ class Trainer:
                 if ras_counts is not None: ras_counts.clear()
                 batch_results = self.batched_rollout(
                     [copy.copy(env_template) for _ in range(c.num_parallel)],
-                    temp=1.0, residuals=initial_residuals, beta=c.beta, ras_counts=ras_counts
+                    temp=0.0, residuals=initial_residuals, beta=c.beta, ras_counts=ras_counts
                 )
                 candidate_trees.extend([res[0] for res in batch_results if res])
             for seq in tqdm(candidate_trees, desc="Sequential Boosting Prediction", leave=False):

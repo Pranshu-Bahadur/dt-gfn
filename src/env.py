@@ -27,7 +27,7 @@ class TabularEnv:
         self.target_col = target_col
         self.n_bins = n_bins
         self.task = task
-        self.shuffle_on_reset = True#shuffle_on_reset
+        self.shuffle_on_reset = shuffle_on_reset
         self.binning_strategy = binning_strategy
         self.le = None
         self.n_classes: Optional[int] = None
