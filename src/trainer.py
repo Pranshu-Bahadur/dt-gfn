@@ -253,7 +253,7 @@ class Trainer:
                     current_predictor_residuals = torch.nn.functional.one_hot(y_true, num_classes=c.n_classes).to(torch.float) - probs
                 else:
                     current_predictor_residuals = y_true - base_pred
-            avg_tb_loss, avg_fl_loss = self._update_policy(tuples_for_policy_update, env_template, optimizers)
+            avg_tb_loss, avg_fl_loss = 0, 0#self._update_policy(tuples_for_policy_update, env_template, optimizers)
             for sch in schedulers: sch.step()
       
             log_str = f"Update {upd}/{c.updates} | TB: {avg_tb_loss:.4f} | FL: {avg_fl_loss:.4f}"
