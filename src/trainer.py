@@ -242,6 +242,7 @@ class Trainer:
             current_predictor_residuals = step_residuals.clone()
               
             for seq, prior in all_candidate_tuples:
+                #print(seq)
                 tuples_for_policy_update.append((seq, prior, current_predictor_residuals.clone()))
                   
                 predictor = get_tree_predictor(seq, X_binned, current_predictor_residuals, self.tokenizer)
@@ -385,13 +386,15 @@ class Trainer:
                 masks = torch.zeros((len(active_indices), v.size()), dtype=torch.bool, device=device)
                 for i, original_idx in enumerate(active_indices):
                     d = depths[original_idx][-1] if depths[original_idx] else c.max_depth
+                    # Allow splitting if the max depth has not been reached
                     if envs[original_idx].open_leaves > 0 and d < c.max_depth:
                         masks[i, v.split_start : v.split_start + v.num_feat] = True
-                    if envs[original_idx].open_leaves > 0:
+                    # **FIX**: Allow leaf selection only after the first split (depth > 0)
+                    if envs[original_idx].open_leaves > 0 and d > 0:
                         masks[i, v.split_start + v.num_feat + v.num_th :] = True
-               
+              
                 toks1 = _safe_sample(last_logits, masks, temp)
-               
+              
                 needs_threshold, still_active = {}, []
                 for i, original_idx in enumerate(active_indices):
                     token = toks1[i].item()
@@ -399,7 +402,7 @@ class Trainer:
                     if ras_counts is not None:
                         path_tuple = tuple(seqs[original_idx])
                         ras_counts[path_tuple] = ras_counts.get(path_tuple, 0) + 1
-                   
+                  
                     if token == END_TOKEN:
                         envs[original_idx].done = True
                         continue
@@ -412,38 +415,38 @@ class Trainer:
                     else:
                         if depths[original_idx]:
                             depths[original_idx].pop()
-                   
+                  
                     if not depths[original_idx]:
                         envs[original_idx].done = True
-                   
+                  
                     if not envs[original_idx].done:
                         still_active.append(original_idx)
                 if needs_threshold:
                     sub_batch_indices = [active_indices[i] for i in needs_threshold.values()]
                     sub_batch_seqs = torch.nn.utils.rnn.pad_sequence([torch.tensor(seqs[i], device=device) for i in sub_batch_indices], batch_first=True, padding_value=v.PAD)
                     sub_logits, _ = self.pf(sub_batch_seqs)
-                   
+                  
                     th_mask = torch.zeros((sub_logits.shape[0], v.size()), dtype=torch.bool, device=device)
                     th_mask[:, v.split_start + v.num_feat : v.split_start + v.num_feat + v.num_th] = True
-                   
+                  
                     toks2 = _safe_sample(sub_logits[:, -1, :], th_mask, temp)
                     for i, original_idx in enumerate(sub_batch_indices):
                         token = toks2[i].item()
                         seqs[original_idx].append(token)
-                       
+                      
                         if token == END_TOKEN:
                             envs[original_idx].done = True
                             continue
-                       
+                      
                         envs[original_idx].step(self.tokenizer.decode_one(token))
-               
+              
                 active_indices = still_active
         for i in range(num):
             if envs[i].done and envs[i].open_leaves == 0:
                 if seqs[i][-1] != v.EOS:
                     seqs[i].append(v.EOS)
                 final_results[i] = (seqs[i], envs[i].get_prior(beta).item(), envs[i].idxs.clone())
-       
+      
         return final_results
     def predict(self, df_test, df_train, use_policy=False, policy_inference_trees=None):
         ensemble_exists = self.ensemble or self.boosting_ensemble
