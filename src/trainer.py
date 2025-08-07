@@ -231,7 +231,7 @@ class Trainer:
             else:
                 step_residuals = y_true - base_pred
               
-            replay_candidates = []
+            replay_candidates = self.sample_replay(c.top_k_trees)
             env_template.y = step_residuals.clone()
             new_candidates = self._collect_rollouts(env_template, 0.0, step_residuals, c.beta)
             all_candidate_tuples = replay_candidates + new_candidates
@@ -287,44 +287,71 @@ class Trainer:
                 rollouts_done += batch_size
                 pbar.update(batch_size)
         return forward_tuples
+    
+
     def sample_replay(self, k: int, REFRESH_INTERVAL: int = 5) -> list[tuple[list[int], float]]:
+        """
+        Samples trajectories from the replay buffer.
+
+        This function re-weights "stale" trajectories in the buffer before sampling.
+        The weight is a combination of the trajectory's reward and its backward
+        probability, ensuring that high-reward trajectories are preferentially sampled
+        for training the policy networks. This breaks the feedback loop of sampling
+        low-reward, degenerate trees.
+        """
         buf = self.replay_buffer
         if not buf or not buf.data: return []
-       
+      
+        # Find trajectories that haven't been re-weighted recently
         stale_indices = [
             i for i, entry in enumerate(buf.data)
             if entry[4] is None or buf.step - entry[5] >= REFRESH_INTERVAL
         ]
-       
+      
         if stale_indices:
             stale_seqs = [buf.data[i][1] for i in stale_indices]
             with torch.no_grad():
+                # Calculate the backward log probabilities for stale sequences
                 flipped_seqs = [torch.tensor(seq, device=self.cfg.device).flip(dims=[0]) for seq in stale_seqs]
                 padded_bwd_seqs = torch.nn.utils.rnn.pad_sequence(flipped_seqs, batch_first=True, padding_value=self.tokenizer.v.PAD)
                 log_probs = self.pb.log_prob(padded_bwd_seqs)
                 mask = (padded_bwd_seqs != self.tokenizer.v.PAD).float()
+                
+                # Ensure mask and log_probs align, accounting for the sequence length difference
                 if log_probs.shape[1] != mask.shape[1]:
                     mask = mask[:, :-1]
-                new_weights = (log_probs * mask).sum(dim=1).exp()
-               
-                for i, weight in zip(stale_indices, new_weights):
+                    
+                # Calculate backward probabilities
+                new_pb_weights = (log_probs * mask).sum(dim=1).exp()
+              
+                # Update the weights in the buffer
+                for i, pb_weight in zip(stale_indices, new_pb_weights):
+                    # The new weight is Reward * P_backward(trajectory)
                     r, t, p, idxs, _, _ = buf.data[i]
-                    buf.data[i] = (r, t, p, idxs, weight.item(), buf.step)
+                    # Ensure reward is non-negative before multiplying
+                    combined_weight = max(r, 0) * pb_weight.item()
+                    buf.data[i] = (r, t, p, idxs, combined_weight, buf.step)
+
+        # Proceed with sampling based on the updated weights
         entries = list(buf.data)
         valid_indices = [i for i, e in enumerate(entries) if e[4] is not None]
         if not valid_indices: return []
+
         weights = np.array([entries[i][4] for i in valid_indices], dtype=np.float32)
-       
+      
         k = min(k, len(valid_indices))
         total_weight = weights.sum()
-        if total_weight > 0:
+
+        if total_weight > 1e-9: # Use a small epsilon for floating point stability
             probabilities = weights / total_weight
-            sampled_idx_into_valid = np.random.choice(len(valid_indices), size=k, p=probabilities, replace=True)
+            sampled_idx_into_valid = np.random.choice(len(valid_indices), size=k, p=probabilities, replace=False)
             sampled_indices = [valid_indices[i] for i in sampled_idx_into_valid]
         else:
-            sampled_indices = np.random.choice(valid_indices, size=k, replace=True)
-           
+            # Fallback to uniform sampling if all weights are zero
+            sampled_indices = np.random.choice(valid_indices, size=k, replace=False)
+          
         return [(entries[i][1], entries[i][2]) for i in sampled_indices]
+
     def batched_rollout(
         self,
         envs,
