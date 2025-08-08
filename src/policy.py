@@ -75,8 +75,8 @@ class PolicyPaperMLP(PolicyBase):
           flow  : (B, T)
         """
         emb = self.embedding(seq)            # (B, T, H)
-        h, _ = self.rnn(emb)                 # (B, T, H)
-        h = self.shared_mlp(h)               # (B, T, W)
+        #h, _ = self.rnn(emb)                 # (B, T, H)
+        h = self.shared_mlp(emb)               # (B, T, W)
         logits = self.head_tok(h)            # (B, T, V)
         flow   = self.head_flow(h).squeeze(-1)  # (B, T)
         return logits, flow

@@ -236,7 +236,7 @@ class Trainer:
         env_template.y = y_true.clone()
 
         for upd in tqdm(range(1, c.updates + 1), desc="Policy Training & Tree Generation"):
-            forward_tuples = self._collect_rollouts(env_template, temp=1.0, residuals=y_true, beta=c.beta)
+            forward_tuples = self._collect_rollouts(env_template, temp=0.0, residuals=y_true, beta=c.beta)
             replay_tuples = self.sample_replay(c.top_k_trees)
             all_tuples_for_policy_update = forward_tuples + replay_tuples
             if not all_tuples_for_policy_update:
