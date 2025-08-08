@@ -35,9 +35,9 @@ def tb_loss(log_pf: torch.Tensor,
 
     if log_z.dim() == 0: log_z = log_z.expand_as(lp)
     if logR.dim()  == 0: logR  = logR.expand_as(lp)
-    if prior.dim() == 0: prior = prior.expand_as(lp)
+    #if prior.dim() == 0: prior = prior.expand_as(lp)
 
-    diff = log_z + lp - (logR + prior + lb)
+    diff = log_z + lp - (logR + lb)
     return (diff * diff).mean()
 
 
