@@ -556,7 +556,10 @@ class Trainer:
             total_weight += weight
 
         if total_weight > 0:
-            return sum_preds / total_weight
+            preds = sum_preds / total_weight
+            if c.task == "classification":
+              return torch.softmax(preds, dim=1)
+            return preds
         else:
             raise RuntimeError("Total weight is zero.")
 
