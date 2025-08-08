@@ -1,402 +1,558 @@
 from __future__ import annotations
-import random
 import math
+import random
 from collections import deque
-from typing import Callable, List, Optional, Tuple, Deque
-import lightgbm as lgb
+from typing import Callable, List, Optional, Tuple, Deque, Iterator
+
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-# --- Loss Functions ---
+import lightgbm as lgb
+
+# --------------------
+# Loss Functions
+# --------------------
+
 @torch.jit.script
-def tb_loss(log_pf: torch.Tensor, log_pb: torch.Tensor, log_z: torch.Tensor, R: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
+def tb_loss(log_pf: torch.Tensor,
+            log_pb: torch.Tensor,
+            log_z: torch.Tensor,
+            R: torch.Tensor,
+            prior: torch.Tensor) -> torch.Tensor:
     """
-    Calculates the Trajectory Balance (TB) loss, batched.
+    Trajectory Balance (batched).
+    Shapes:
+      log_pf, log_pb: [B, T-1] or [T-1]
+      log_z, R, prior: [B] or scalar
     """
-    rhs = torch.log(R) + prior + log_pb.sum(1)
-    diff = log_z + log_pf.sum(1) - rhs
+    if log_pf.dim() == 1: log_pf = log_pf.unsqueeze(0)
+    if log_pb.dim() == 1: log_pb = log_pb.unsqueeze(0)
+
+    lp = log_pf.sum(dim=-1)  # [B]
+    lb = log_pb.sum(dim=-1)  # [B]
+    logR = torch.log(R + 1e-9)
+
+    if log_z.dim() == 0: log_z = log_z.expand_as(lp)
+    if logR.dim()  == 0: logR  = logR.expand_as(lp)
+    if prior.dim() == 0: prior = prior.expand_as(lp)
+
+    diff = log_z + lp - (logR + prior + lb)
     return (diff * diff).mean()
+
+
 @torch.jit.script
-def fl_loss(logF: torch.Tensor, log_pf: torch.Tensor, log_pb: torch.Tensor, dR: torch.Tensor) -> torch.Tensor:
+def fl_loss(logF: torch.Tensor,
+            log_pf: torch.Tensor,
+            log_pb: torch.Tensor,
+            dR: torch.Tensor) -> torch.Tensor:
     """
-    Calculates the Flow-Matching (FM) or Detailed Balance loss.
+    Flow Matching / Detailed Balance (batched).
+    dR is the per-edge delta reward (can be shaped gains); shapes:
+      logF:  [B, T]
+      log_pf, log_pb, dR: [B, T-1]
     """
-    loss = (logF[:, :-1] + log_pf - (logF[:, 1:] + log_pb + dR))**2
-    return loss.mean()
-# --- Tree & Reward Utilities ---
-def _traverse_and_get_leaves(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularEnv") -> Tuple[List[torch.Tensor], int]:
-    """Helper function to robustly build a tree and return leaf indices and the number of decision nodes."""
-    decoded_actions = tok.decode(tokens[0, 1:-1].tolist())
-   
-    tree_nodes = {0: {'indices': env.idxs, 'children': []}}
-    node_counter = 0
-    n_decision_nodes = 0
-    action_iter = iter(decoded_actions)
-   
-    while True:
-        try:
-            leaf_node_id = -1
-            for nid, node in sorted(tree_nodes.items()):
-                if not node['children']:
-                    leaf_node_id = nid
-                    break
-           
-            if leaf_node_id == -1:
-                break
-            kind, val = next(action_iter)
-           
-            if kind == 'feat':
-                n_decision_nodes += 1
-                _, threshold = next(action_iter)
-                parent_indices = tree_nodes[leaf_node_id]['indices']
-                if len(parent_indices) == 0:
-                    tree_nodes[leaf_node_id]['children'] = [-1, -1]
-                    continue
-               
-                fv = env.X_full[parent_indices, val]
-                mask = fv <= threshold
-               
-                left_indices = parent_indices[mask]
-                right_indices = parent_indices[~mask]
-                if len(left_indices) == 0 or len(right_indices) == 0:
-                    tree_nodes[leaf_node_id]['children'] = [-1, -1]
-                    continue
-                node_counter += 1; left_child_id = node_counter
-                tree_nodes[left_child_id] = {'indices': left_indices, 'children': []}
-               
-                node_counter += 1; right_child_id = node_counter
-                tree_nodes[right_child_id] = {'indices': right_indices, 'children': []}
-               
-                tree_nodes[leaf_node_id]['children'] = [left_child_id, right_child_id]
-            else:
-                tree_nodes[leaf_node_id]['children'] = [-1, -1]
-               
-        except StopIteration:
-            break
-   
-    leaves_indices = [node['indices'] for node in tree_nodes.values() if not node['children']]
-    return leaves_indices, n_decision_nodes
-def calculate_bayesian_reward(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularEnv", beta: float) -> torch.Tensor:
-    """Computes reward for a completed tree based on Bayesian marginal likelihood (for CLASSIFICATION)."""
-    leaves_indices, n_decision_nodes = _traverse_and_get_leaves(tokens, tok, env)
-   
-    alpha = 0.1
-    alphas = torch.full((env.n_classes,), alpha, device=env.device)
-   
-    log_likelihood = torch.tensor(0.0, device=env.device)
-    log_gamma_alpha_sum = torch.lgamma(alphas.sum())
-    log_gamma_alpha_prod = torch.lgamma(alphas).sum()
-   
-    num_leaves = len(leaves_indices)
-    log_dirichlet_norm = num_leaves * (log_gamma_alpha_sum - log_gamma_alpha_prod)
-    log_likelihood += log_dirichlet_norm
-    for leaf_indices in leaves_indices:
-        if len(leaf_indices) == 0: continue
-        leaf_labels = env.y_full[leaf_indices]
-        n_l_c = torch.bincount(leaf_labels, minlength=env.n_classes).float()
-        n_l = n_l_c.sum()
-       
-        log_numerator = torch.lgamma(n_l_c + alphas).sum()
-        log_denominator = torch.lgamma(n_l + alphas.sum())
-        log_likelihood += log_numerator - log_denominator
-       
-    log_reward = (log_likelihood)/ float(env.idxs.numel() or 1)
-    reward = torch.exp(log_reward).clamp(min=1e-9)
-   
-    return reward.unsqueeze(0)
-def calculate_bayesian_reward_regression(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularEnv", beta: float) -> torch.Tensor:
-    """Computes reward for a completed tree based on Bayesian marginal likelihood (for REGRESSION)."""
-    leaves_indices, n_decision_nodes = _traverse_and_get_leaves(tokens, tok, env)
-   
-    mu0 = 0.0
-    kappa0 = 1.0
-    a0 = torch.tensor(1.0, device=env.device)
-    b0 = torch.tensor(1.0, device=env.device)
-   
-    log_marginal_likelihood = torch.tensor(0.0, device=env.device)
-   
-    for leaf_indices in leaves_indices:
-        n_l = len(leaf_indices)
-        if n_l == 0: continue
-       
-        y_leaf = env.y_full[leaf_indices]
-        y_bar = y_leaf.mean(dim=0, keepdim=True)
-        sse = ((y_leaf - y_bar)**2).sum()
-        kappa_n = kappa0 + n_l
-        beta_n = b0 + 0.5 * sse + (kappa0 * n_l) * (y_bar - mu0)**2 / (2 * kappa_n)
-        log_ml_leaf = (
-            torch.lgamma(a0 + n_l / 2) - torch.lgamma(a0) +
-            a0 * torch.log(b0) - (a0 + n_l / 2) * torch.log(beta_n) +
-            0.5 * (math.log(kappa0) - math.log(kappa_n)) -
-            (n_l / 2) * math.log(2 * math.pi)
-        )
-        log_marginal_likelihood += log_ml_leaf.sum()
-    log_reward = (log_marginal_likelihood) / float(env.idxs.numel() or 1)
-    reward = torch.exp(log_reward).clamp(min=1e-9)
-   
-    return reward.unsqueeze(0)
-def deltaE_split_gain_regression(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularEnv") -> torch.Tensor:
-    y: torch.Tensor = env.y[env.idxs]
-    N: int = y.shape[0]
-    dR: torch.Tensor = torch.zeros(tokens.shape[1] - 1, device=y.device)
-    def mse(rows: torch.Tensor) -> float:
-        if rows.numel() < 2: return 0.0
-        yy = y[rows]
-        return ((yy.float()**2).mean()).item()
-    full_mse = mse(torch.arange(N, device=y.device))
-    stack_rows: Deque[torch.Tensor] = deque([torch.arange(N, device=y.device)])
-    stack_mse: Deque[float] = deque([full_mse])
-    action_sequence: List[int] = tokens[0, 1:-1].tolist()
-    it = iter(tok.decode(action_sequence))
-    token_idx = 0
-    for kind, idx in it:
-        if kind == "feat":
-            try:
-                _, th = next(it)
-            except StopIteration:
-                break
-            if not stack_rows: continue
-            parent_rows = stack_rows.pop()
-            parent_mse = stack_mse.pop()
-            fv = env.X_full[env.idxs[parent_rows], idx]
-            mask = fv <= th
-            L_rows, R_rows = parent_rows[mask], parent_rows[~mask]
-            mseL, mseR = mse(L_rows), mse(R_rows)
-            stack_rows.extend([R_rows, L_rows])
-            stack_mse.extend([mseR, mseL])
-            wL, wR = L_rows.numel(), R_rows.numel()
-            parent_N = wL + wR
-            if parent_N > 0:
-                gain = parent_mse - (wL / parent_N * mseL + wR / parent_N * mseR)
-                dR[token_idx] = gain / (float(env.idxs.numel() or 1))
-            token_idx += 2
+    return ((logF[:, :-1] + log_pf) - (logF[:, 1:] + log_pb + dR)).pow(2).mean()
+
+# --------------------
+# Tree Build & Traverse
+# --------------------
+
+def _build_tree_recursively(path_iter: Iterator, token_cursor: List[int]) -> Optional[dict]:
+    """
+    Build a binary tree from decoded tokens. Assumes sequence like:
+      ('feat', f), ('th', t), <left subtree>, <right subtree>, ...
+    A 'leaf' token yields a leaf node.
+    """
+    try:
+        start_token_idx = token_cursor[0]
+        kind, val = next(path_iter)          # ('feat', f) | ('th', t) | ('leaf', _)
+        token_cursor[0] += 1
+
+        if kind == 'feat':
+            # Immediately expect a threshold token
+            th_kind, thr = next(path_iter)
+            token_cursor[0] += 1
+            # If something odd came (not 'th'), treat as malformed and make leaf
+            if th_kind != 'th':
+                return {'type': 'leaf', 'token_idx': start_token_idx}
+            return {
+                'type': 'split',
+                'f': val,
+                't': thr,
+                'token_idx': start_token_idx,  # index of the 'feat' token in the decoded stream
+                'L': _build_tree_recursively(path_iter, token_cursor),
+                'R': _build_tree_recursively(path_iter, token_cursor),
+            }
         else:
-            if stack_rows:
-                stack_rows.pop()
-                stack_mse.pop()
-            token_idx += 1
-    return dR.unsqueeze(0)
-def deltaE_split_gain_classification(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularEnv") -> torch.Tensor:
-    y: torch.Tensor = env.y_full[env.idxs]
-    N: int = y.numel()
-    dR: torch.Tensor = torch.zeros(tokens.shape[1] - 1, device=y.device)
-    def gini_impurity(rows: torch.Tensor) -> float:
-        if rows.numel() == 0: return 0.0
-        labels = y[rows].long()
-        n_labels = len(labels)
-        if n_labels == 0: return 0.0
-       
-        clamped_labels = torch.clamp(labels, 0, env.n_classes - 1)
-        counts = torch.bincount(clamped_labels, minlength=env.n_classes)
-       
-        probs = counts.float() / n_labels
-        return 1 - torch.sum(probs**2).item()
-    full_gini = gini_impurity(torch.arange(N, device=y.device))
-    stack_rows: Deque[torch.Tensor] = deque([torch.arange(N, device=y.device)])
-    stack_metric: Deque[float] = deque([full_gini])
-    action_sequence: List[int] = tokens[0, 1:-1].tolist()
-    it = iter(tok.decode(action_sequence))
-    token_idx = 0
-    for kind, idx in it:
-        if kind == "feat":
-            try:
-                _, th = next(it)
-            except StopIteration:
-                break
-            if not stack_rows: continue
-            parent_rows = stack_rows.pop()
-            parent_metric = stack_metric.pop()
-            fv = env.X_full[env.idxs[parent_rows], idx]
-            mask = fv <= th
-            L_rows, R_rows = parent_rows[mask], parent_rows[~mask]
-            metricL, metricR = gini_impurity(L_rows), gini_impurity(R_rows)
-            stack_rows.extend([R_rows, L_rows])
-            stack_metric.extend([metricR, metricL])
-            wL, wR = L_rows.numel(), R_rows.numel()
-            parent_N = wL + wR
-            if parent_N > 0:
-                gain = parent_metric - (wL / parent_N * metricL + wR / parent_N * metricR)
-                dR[token_idx] = gain / (float(env.idxs.numel() or 1))
-            token_idx += 2
+            # 'th' or 'leaf' appearing here acts like a leaf sentinel
+            return {'type': 'leaf', 'token_idx': start_token_idx}
+    except StopIteration:
+        return None
+
+
+def build_tree(tokens: torch.Tensor, tok: "Tokenizer") -> Optional[dict]:
+    """
+    tokens: [T] or [1,T], includes BOS ... EOS
+    Decodes tokens[1:-1] to (kind,idx) pairs and builds a tree.
+    """
+    if tokens.dim() > 1:
+        if tokens.size(0) == 1:
+            tokens = tokens.squeeze(0)
         else:
-            if stack_rows:
-                stack_rows.pop()
-                stack_metric.pop()
-            token_idx += 1
-    return dR.unsqueeze(0)
-    
-def get_tree_predictor(traj: List[int], X_binned: torch.Tensor, y_target: torch.Tensor, tok: "Tokenizer") -> Callable[[torch.Tensor], torch.Tensor]:
-    # Detach from grad and cache device/dtype info
-    y_target = y_target.detach().to(dtype=torch.float32)
-    device = X_binned.device
-    all_idx = torch.arange(X_binned.size(0), device=device)
-    # -------- build tree --------------------------------------------------
-    path_iter = iter(tok.decode(traj[1:-1]))
-    def build():
-        try:
-            kind, idx = next(path_iter)
-            if kind == 'feat':
-                return {
-                    'type': 'split', 'f': idx, 't': next(path_iter)[1],
-                    'L': build(), 'R': build()
-                }
-            return {'type': 'leaf'}
-        except StopIteration:
-            return None # Handle malformed or truncated trajectories
-    tree_root = build()
-    # If the trajectory is empty or malformed, return a predictor that always predicts zeros
-    if tree_root is None:
-        return lambda X: torch.zeros(X.size(0), *(y_target.shape[1:]), device=X.device, dtype=y_target.dtype)
-    # -------- fit leaves ---------------------------------------------------
-    leaf_val = {}
-    q = deque([(tree_root, all_idx)])
-    # Create a zero vector with the correct dtype and device for default values
-    zero_vec = torch.zeros_like(y_target[0])
-    alpha = 0.1  # Consistent with reward calculation
-    is_classification = (y_target.dim() > 1 and y_target.shape[1] > 1)
-    n_classes = y_target.shape[1] if is_classification else 1
-    has_negatives = (y_target < 0).any()
+            raise ValueError("build_tree expects a 1D token tensor or batch size 1.")
+    decoded = tok.decode(tokens[1:-1].tolist())
+    return _build_tree_recursively(iter(decoded), [0])
+
+
+def _traverse_and_get_leaves(tokens: torch.Tensor,
+                             tok: "Tokenizer",
+                             env: "TabularEnv") -> Tuple[List[torch.Tensor], int]:
+    """
+    BFS traverse to map each leaf to row indices; also count decision nodes.
+    Returns (list_of_leaf_indices, n_decision_nodes).
+    """
+    root = build_tree(tokens, tok)
+    if root is None:
+        return [env.idxs], 0
+
+    leaves: List[torch.Tensor] = []
+    n_dec = 0
+    q: Deque = deque([(root, env.idxs)])
+
     while q:
         node, idxs = q.popleft()
-       
-        # Handle cases where a branch might be missing after a bad split
         if node is None:
             continue
         if not idxs.numel():
-            if 'leaf' not in node: # Assign a leaf_id if it doesn't have one
-                node['leaf'] = len(leaf_val)
-                leaf_val[node['leaf']] = zero_vec
+            if node.get('type') == 'leaf':
+                leaves.append(torch.empty(0, dtype=torch.long, device=env.device))
             continue
-        if node.get('type') == 'split':
-            # Ensure both children exist before proceeding
-            if node.get('L') is not None and node.get('R') is not None:
-                m = X_binned[idxs, node['f']] <= node['t']
-                q.append((node['L'], idxs[m]))
-                q.append((node['R'], idxs[~m]))
-            else: # If a split node is malformed, treat it as a leaf
-                node['type'] = 'leaf'
-                node['leaf'] = len(leaf_val)
-                if is_classification:
-                    if has_negatives:
-                        leaf_val[node['leaf']] = y_target[idxs].mean(dim=0)
-                    else:
-                        counts = y_target[idxs].sum(0)
-                        concentrations = counts + alpha
-                        if (concentrations <= 0).any():
-                            leaf_val[node['leaf']] = torch.full((n_classes,), 1.0 / n_classes, device=device)
-                        else:
-                            dirichlet = torch.distributions.Dirichlet(concentrations)
-                            leaf_val[node['leaf']] = dirichlet.sample()
-                else:
-                    leaf_val[node['leaf']] = y_target[idxs].mean(dim=0, keepdim=False)
-        else: # Leaf node
-            node['leaf'] = len(leaf_val)
-            if is_classification:
-                if has_negatives:
-                    leaf_val[node['leaf']] = y_target[idxs].mean(dim=0)
-                else:
-                    counts = y_target[idxs].sum(0)
-                    concentrations = counts + alpha
-                    if (concentrations <= 0).any():
-                        leaf_val[node['leaf']] = torch.full((n_classes,), 1.0 / n_classes, device=device)
-                    else:
-                        dirichlet = torch.distributions.Dirichlet(concentrations)
-                        leaf_val[node['leaf']] = dirichlet.sample()
+
+        if node.get('type') == 'split' and node.get('L') is not None and node.get('R') is not None:
+            fv = env.X_full[idxs, node['f']]
+            m = fv <= node['t']
+            L, R = idxs[m], idxs[~m]
+            if L.numel() == 0 or R.numel() == 0:
+                # invalid split — treat as leaf
+                leaves.append(idxs)
+                continue
+            n_dec += 1
+            q.append((node['L'], L))
+            q.append((node['R'], R))
+        else:
+            leaves.append(idxs)
+
+    if not leaves:
+        return [env.idxs], 0
+    return leaves, n_dec
+
+# --------------------
+# Bayesian Rewards (DT-GFN style)
+# --------------------
+
+@torch.no_grad()
+def calculate_bayesian_reward(tokens: torch.Tensor,
+                              tok: "Tokenizer",
+                              env: "TabularEnv",
+                              beta: float) -> torch.Tensor:
+    """
+    Classification reward: Dirichlet–Multinomial evidence with structure prior.
+      log R = [Σ_leaves log P(y_leaf | α) - log P(y_root | α)] / N  -  β * n_splits / N
+    Returns: [1] positive reward.
+    """
+    leaves, n_dec = _traverse_and_get_leaves(tokens, tok, env)
+    y = env.y_full[env.idxs]
+    if y.numel() == 0:
+        return torch.tensor([1e-9], device=env.device)
+
+    K = int(y.max().item() + 1)
+    alpha = torch.full((K,), 0.1, device=env.device)  # modest symmetric prior
+
+    def dm_log_ev(counts: torch.Tensor) -> torch.Tensor:
+        n0 = counts.sum()
+        a0 = alpha.sum()
+        return (torch.lgamma(a0) - torch.lgamma(a0 + n0)
+                + torch.lgamma(alpha + counts).sum()
+                - torch.lgamma(alpha).sum())
+
+    root_counts = torch.bincount(y, minlength=K).float()
+    L0 = dm_log_ev(root_counts)
+    L = torch.tensor(0.0, device=env.device)
+    for idx in leaves:
+        if idx.numel() == 0: continue
+        L = L + dm_log_ev(torch.bincount(y[idx], minlength=K).float())
+
+    N = max(1, int(y.numel()))
+    logR = (L - L0) / N - beta * (n_dec / N)
+    return logR.exp().clamp_min(1e-9).unsqueeze(0)
+
+
+@torch.no_grad()
+def calculate_bayesian_reward_regression(tokens: torch.Tensor,
+                                         tok: "Tokenizer",
+                                         env: "TabularEnv",
+                                         beta: float) -> torch.Tensor:
+    """
+    Regression reward: Normal–Inverse–Gamma evidence with structure prior.
+      log R = [Σ_leaves log P(y_leaf | μ0,κ0,a0,b0) - log P(y_root | ...)] / N  -  β * n_splits / N
+    Returns: [1]
+    """
+    leaves, n_dec = _traverse_and_get_leaves(tokens, tok, env)
+    y = env.y_full[env.idxs].float()
+    if y.numel() == 0:
+        return torch.tensor([1e-9], device=env.device)
+
+    def nig_log_ev(y_leaf: torch.Tensor,
+                   mu0: float, kappa0: float, a0: float, b0: float) -> torch.Tensor:
+        n = y_leaf.numel()
+        if n == 0: return torch.tensor(0.0, device=y_leaf.device)
+        ybar = y_leaf.mean()
+        sse = ((y_leaf - ybar)**2).sum()
+        kappa_n = kappa0 + n
+        a_n = a0 + 0.5 * n
+        b_n = b0 + 0.5 * sse + (kappa0 * n * (ybar - mu0)**2) / (2.0 * kappa_n)
+        return (torch.lgamma(torch.tensor(a_n, device=y_leaf.device)) - torch.lgamma(torch.tensor(a0, device=y_leaf.device))
+                + torch.log(torch.tensor(b0, device=y_leaf.device)) * a0
+                - torch.log(b_n) * a_n
+                + 0.5 * (math.log(kappa0) - math.log(kappa_n))
+                - 0.5 * n * math.log(2.0 * math.pi))
+
+    mu0, kappa0, a0, b0 = 0.0, 1.0, 1.0, 1.0
+    L0 = nig_log_ev(y, mu0, kappa0, a0, b0)
+    L = torch.tensor(0.0, device=y.device)
+    for idx in leaves:
+        if idx.numel() == 0: continue
+        L = L + nig_log_ev(y[idx], mu0, kappa0, a0, b0)
+
+    N = max(1, int(y.numel()))
+    logR = (L - L0) / N - beta * (n_dec / N)
+    return logR.exp().clamp_min(1e-9).unsqueeze(0)
+
+# --------------------
+# Per-step gains (optional, for FL shaping)
+# --------------------
+
+def deltaE_split_gain_regression(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularEnv") -> torch.Tensor:
+    """
+    Per-token variance-reduction gains as [1, T-1], placed at 'feat' token positions.
+    """
+    y = env.y_full[env.idxs].float()
+    dR = torch.zeros(tokens.size(-1) - 1, device=y.device)
+    root = build_tree(tokens, tok)
+    if root is None: return dR.unsqueeze(0)
+
+    def var(rows: torch.Tensor) -> torch.Tensor:
+        if rows.numel() < 2: return torch.tensor(0.0, device=y.device)
+        return y[rows].var(unbiased=False)
+
+    N = y.numel()
+    q = deque([(root, torch.arange(N, device=y.device))])
+    while q:
+        node, idxs = q.popleft()
+        if not (node and node.get('type') == 'split' and node.get('L') and node.get('R') and idxs.numel() > 1):
+            continue
+        parent_var = var(idxs)
+        fv = env.X_full[env.idxs[idxs], node['f']]
+        m = fv <= node['t']
+        L, R = idxs[m], idxs[~m]
+        if L.numel() == 0 or R.numel() == 0: continue
+        gain = parent_var - (L.numel()/idxs.numel()) * var(L) - (R.numel()/idxs.numel()) * var(R)
+        dR[node['token_idx']] = gain
+        q.append((node['L'], L)); q.append((node['R'], R))
+    return dR.unsqueeze(0)
+
+
+def deltaE_split_gain_classification(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularEnv") -> torch.Tensor:
+    """
+    Per-token Gini-impurity-reduction gains as [1, T-1], placed at 'feat' token positions.
+    """
+    y = env.y_full[env.idxs].long()
+    dR = torch.zeros(tokens.size(-1) - 1, device=y.device)
+    root = build_tree(tokens, tok)
+    if root is None: return dR.unsqueeze(0)
+
+    def gini(rows: torch.Tensor) -> torch.Tensor:
+        if rows.numel() < 2: return torch.tensor(0.0, device=y.device)
+        counts = torch.bincount(y[rows].clamp(0, env.n_classes - 1), minlength=env.n_classes)
+        p = counts.float() / counts.sum().clamp_min(1)
+        return 1.0 - (p * p).sum()
+
+    N = y.numel()
+    q = deque([(root, torch.arange(N, device=y.device))])
+    while q:
+        node, idxs = q.popleft()
+        if not (node and node.get('type') == 'split' and node.get('L') and node.get('R') and idxs.numel() > 1):
+            continue
+        parent_g = gini(idxs)
+        fv = env.X_full[env.idxs[idxs], node['f']]
+        m = fv <= node['t']
+        L, R = idxs[m], idxs[~m]
+        if L.numel() == 0 or R.numel() == 0: continue
+        gain = parent_g - (L.numel()/idxs.numel()) * gini(L) - (R.numel()/idxs.numel()) * gini(R)
+        dR[node['token_idx']] = gain
+        q.append((node['L'], L)); q.append((node['R'], R))
+    return dR.unsqueeze(0)
+
+# --------------------
+# Predictors (posterior-mean for probs; mean for residuals/regression)
+# --------------------
+
+def get_tree_predictor(traj: List[int],
+                       X_binned: torch.Tensor,
+                       y_target: torch.Tensor,
+                       tok: "Tokenizer") -> Callable[[torch.Tensor], torch.Tensor]:
+    """
+    Build the tree by *replaying tokens on training data* (LIFO expansion like rollout),
+    accept a split only if both children are non-empty on train, then:
+      - if y_target looks like class-probabilities (>=0, <=1, rows sum~1): **Dirichlet sample**
+        leaf probs (paper behavior)
+      - else (residuals/regression with negatives): **mean** vector per leaf.
+
+    Returns: predictor(X_binned_test) -> Tensor
+    """
+    device = X_binned.device
+    y_target = y_target.detach().to(dtype=torch.float32, device=device)
+    v = tok.v
+
+    # --- decode tokens (strip BOS/EOS if present) ---
+    if len(traj) > 0 and traj[0] == v.BOS: start = 1
+    else: start = 0
+    end = len(traj) - 1 if len(traj) and traj[-1] == v.EOS else len(traj)
+    decoded = tok.decode(traj[start:end])
+
+    N = X_binned.size(0)
+    all_idx = torch.arange(N, device=device, dtype=torch.long)
+
+    # --- classify target mode: probs vs residuals ---
+    is_matrix = (y_target.dim() == 2)
+    if is_matrix:
+        min_ok = float(y_target.min()) >= -1e-6
+        max_ok = float(y_target.max()) <= 1.0 + 1e-6
+        row_sums = y_target.sum(dim=1)
+        sums_ok = torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-3, rtol=0)
+        is_clf_probs = (min_ok and max_ok and bool(sums_ok))
+    else:
+        is_clf_probs = False
+
+    # --- build by data with LIFO expansion (matches rollout .pop()) ---
+    class Node(dict): pass
+    root = Node(type='leaf', idxs=all_idx)
+    # stack holds *leaf* nodes to expand (LIFO)
+    stack: List[Node] = [root]
+    pending: Optional[Tuple[Node, int]] = None  # (node_to_split, feature_id)
+
+    for kind, val in decoded:
+        if not stack and pending is None:
+            break
+
+        if pending is None:
+            if kind == 'feat':
+                # take the last (deepest) open leaf, like rollout
+                node = stack.pop() if stack else None
+                if node is None or node.get('type') != 'leaf':
+                    continue
+                pending = (node, int(val))
+            elif kind == 'leaf':
+                # finalize one leaf (consume one open leaf)
+                if stack:
+                    stack.pop()
             else:
-                leaf_val[node['leaf']] = y_target[idxs].mean(dim=0, keepdim=False)
-    # -------- predictor ----------------------------------------------------
+                # 'th' without a preceding 'feat' → ignore
+                continue
+        else:
+            # expecting a threshold for the pending feature
+            if kind != 'th':
+                # broken grammar -> drop pending and continue
+                pending = None
+                continue
+
+            node, f = pending
+            t = int(val)
+            idxs = node.get('idxs', all_idx)
+
+            # split on train data
+            fv = X_binned[idxs, f]
+            m = fv <= t
+            L_idx = idxs[m]
+            R_idx = idxs[~m]
+
+            if L_idx.numel() == 0 or R_idx.numel() == 0:
+                # reject split -> keep leaf
+                pending = None
+                continue
+
+            # accept split: mutate node into split, push children (R then L for LIFO → go left next)
+            node.clear()
+            node.update(type='split', f=f, t=t)
+            L = Node(type='leaf', idxs=L_idx)
+            R = Node(type='leaf', idxs=R_idx)
+            node['L'] = L; node['R'] = R
+            stack.append(R)
+            stack.append(L)
+            pending = None
+
+    # --- collect leaves (with training indices) ---
+    leaves: List[Tuple[Node, torch.Tensor]] = []
+    q: Deque[Node] = deque([root])
+    while q:
+        n = q.popleft()
+        if n.get('type') == 'split':
+            q.append(n['L']); q.append(n['R'])
+        else:
+            leaves.append((n, n.get('idxs', torch.empty(0, dtype=torch.long, device=device))))
+
+    # --- compute leaf values ---
+    if is_matrix and is_clf_probs:
+        K = y_target.size(1)
+        alpha = torch.full((K,), 0.1 / max(1, K), device=device)
+        for node, idxs in leaves:
+            if idxs.numel() == 0:
+                node['val'] = torch.full((K,), 1.0 / K, device=device)
+                continue
+            counts = y_target[idxs].sum(0)  # [K], one-hot sums
+            conc = counts + alpha
+            # Dirichlet *sampling* as requested
+            node['val'] = torch.distributions.Dirichlet(conc).sample()
+    else:
+        # regression / classification residuals: mean vector (handles 1D or 2D)
+        for node, idxs in leaves:
+            if idxs.numel() == 0:
+                node['val'] = torch.zeros_like(y_target[0]) if y_target.dim() > 1 else torch.tensor(0.0, device=device)
+            else:
+                node['val'] = y_target[idxs].mean(dim=0, keepdim=False)
+
+    # strip training indices to avoid leaks
+    for node, _ in leaves:
+        if 'idxs' in node: del node['idxs']
+
+    # --- prediction using the *accepted* training tree structure ---
     def predict(X: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            # Initialize output tensor with correct shape, device, and dtype
-            out = torch.zeros(X.size(0), *leaf_val.get(0, zero_vec).shape, device=X.device, dtype=y_target.dtype)
-            q = deque([(tree_root, torch.arange(X.size(0), device=X.device))])
-           
+            if is_matrix:
+                out = torch.zeros(X.size(0), y_target.size(1), device=X.device, dtype=y_target.dtype)
+            else:
+                out = torch.zeros(X.size(0), device=X.device, dtype=y_target.dtype)
+
+            q: Deque[Tuple[Node, torch.Tensor]] = deque([(root, torch.arange(X.size(0), device=X.device))])
             while q:
-                node, idxs = q.popleft()
-                if not idxs.numel() or node is None: continue
-               
-                if node.get('type') == 'leaf':
-                    out[idxs] = leaf_val.get(node.get('leaf'), zero_vec)
-                elif node.get('type') == 'split' and node.get('L') and node.get('R'):
-                    m = X[idxs, node['f']] <= node['t']
-                    q.append((node['L'], idxs[m]))
-                    q.append((node['R'], idxs[~m]))
-                else: # Fallback for any other malformed node
-                    out[idxs] = zero_vec
+                n, idxs = q.popleft()
+                if idxs.numel() == 0:
+                    continue
+                if n.get('type') == 'split':
+                    f = int(n['f']); t = int(n['t'])
+                    m = X[idxs, f] <= t
+                    L_rows, R_rows = idxs[m], idxs[~m]
+                    q.append((n['L'], L_rows))
+                    q.append((n['R'], R_rows))
+                else:
+                    out[idxs] = n['val']
             return out
     return predict
-# --- Sampling & Buffer ---
+
+
+# --------------------
+# Replay Buffer
+# --------------------
+
 class ReplayBuffer:
     def __init__(self, capacity: int = 10000):
         self.capacity = capacity
+        # entries: (reward_scalar, seq, prior_scalar, idxs_tensor, pb_weight, last_refresh_step)
         self.data: List[Tuple[float, List[int], float, torch.Tensor, Optional[float], int]] = []
         self.step = 0
+
     def add(self, r: float, t: List[int], p: float, idxs: torch.Tensor):
         if any(t == traj for _, traj, _, _, _, _ in self.data):
             return
-        # Entry: (reward, traj, prior, idxs, weight, cached_step)
         self.data.append((r, t, p, idxs, None, -1))
-        # Keep the buffer sorted by reward (descending)
         self.data.sort(key=lambda x: x[0], reverse=True)
         if len(self.data) > self.capacity:
             self.data.pop()
+
     def sample(self, k: int) -> list:
         return random.sample(self.data, min(k, len(self.data)))
-   
+
     def mark_policy_update(self):
-        """Increments the policy update counter."""
         self.step += 1
+
+# --------------------
+# Safe sample (token masking + temperature)
+# --------------------
+
 END_TOKEN = 2
 EPS = 1e-9
-def _safe_sample(logits: torch.Tensor, mask: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
-    if temperature > EPS:
-        logits = logits / temperature
+
+def _safe_sample(logits: torch.Tensor,
+                 mask: torch.Tensor,
+                 temperature: float = 1.0) -> torch.Tensor:
+    """
+    Apply mask and temperature, then sample multinomially.
+    If all tokens are masked on a row, force END_TOKEN to be selectable.
+    """
     logits = logits.masked_fill(~mask, -float("inf"))
     all_masked = (~mask).all(dim=-1)
     if all_masked.any():
-        logits[all_masked, END_TOKEN] = 0
+        logits[all_masked, END_TOKEN] = 0.0
+
+    if temperature is not None and temperature > EPS:
+        logits = logits / temperature
+
     probs = F.softmax(logits, dim=-1)
     return torch.multinomial(probs, 1).squeeze(1)
-def create_gain_bias(df_train: pd.DataFrame, feats: List[str], target: str, tok: "Tokenizer", bins: int, prior_scale: float = 0.5) -> torch.Tensor:
+
+# --------------------
+# Optional token prior (gain bias)
+# --------------------
+
+def create_gain_bias(df_train: pd.DataFrame,
+                     feats: List[str],
+                     target: str,
+                     tok: "Tokenizer",
+                     bins: int,
+                     prior_scale: float = 0.5) -> torch.Tensor:
+    """
+    LightGBM mining to produce a token prior over feature/threshold tokens.
+    """
     df_sample = df_train.sample(n=min(len(df_train), 200_000), random_state=42)
     X_binned_list = []
     for f in feats:
-        s = df_sample[f].replace([np.inf,-np.inf],np.nan).fillna(df_sample[f].median()).values
-        qs = np.linspace(0,1,bins+1)
-        edges = np.unique(np.quantile(s,qs))
-        edges[0] -= 1e-9
-        edges[-1] += 1e-9
-        X_binned_list.append(np.searchsorted(edges,s,side="right")-1)
+        s = df_sample[f].replace([np.inf, -np.inf], np.nan).fillna(df_sample[f].median()).values
+        qs = np.linspace(0, 1, bins + 1)
+        edges = np.unique(np.quantile(s, qs)) if len(np.unique(s)) > 1 else np.array([s[0] - 1, s[0] + 1])
+        edges[0] -= 1e-9; edges[-1] += 1e-9
+        X_binned_list.append(np.searchsorted(edges, s, side="right") - 1)
     X_binned = np.stack(X_binned_list, 1)
     y_train = df_sample[target].values
+
     lgb_train = lgb.Dataset(X_binned, y_train, feature_name=feats, free_raw_data=False)
-    params = { 'objective': 'regression_l1', 'metric': 'l1', 'n_estimators': 100, 'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8, 'bagging_freq': 1, 'num_leaves': 1024, 'max_depth': 10, 'verbose': -1, 'n_jobs': -1 }
+    params = dict(objective='regression_l1', metric='l1', n_estimators=100, learning_rate=0.05,
+                  feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
+                  num_leaves=1024, max_depth=10, verbose=-1, n_jobs=-1)
     gbm = lgb.train(params, lgb_train)
-    tree_info = gbm.dump_model()["tree_info"]
+    tree_info = gbm.dump_model()['tree_info']
+
     bias = torch.zeros(tok.v.size(), dtype=torch.float32)
     def parse_node(node: dict):
         nonlocal bias
-        if "split_gain" in node and node["split_gain"] > 0:
-            gain = node["split_gain"]
-            f_idx = node["split_feature"]
-            tok_id_feat = tok._feat(f_idx)
-            if tok_id_feat < tok.v.size():
-                bias[tok_id_feat] += gain
+        if 'split_gain' in node and node['split_gain'] > 0:
+            gain = node['split_gain']
+            f_idx = node['split_feature']
+            tok_feat = tok._feat(f_idx)
+            if tok_feat < tok.v.size(): bias[tok_feat] += gain
             try:
-                bin_idx = min(int(node["threshold"]), bins - 1)
-                tok_id_th = tok._th(bin_idx)
-                if tok_id_th < tok.v.size():
-                    bias[tok_id_th] += gain
-            except (ValueError, AttributeError):
+                bin_idx = int(node['threshold'])
+                tok_th = tok._th(min(bin_idx, bins - 1))
+                if tok_th < tok.v.size(): bias[tok_th] += gain
+            except Exception:
                 pass
-        if "left_child" in node: parse_node(node["left_child"])
-        if "right_child" in node: parse_node(node["right_child"])
+        if 'left_child' in node: parse_node(node['left_child'])
+        if 'right_child' in node: parse_node(node['right_child'])
+
     for tree in tree_info:
         parse_node(tree['tree_structure'])
-    bias_std = bias.std()
-    if bias_std > 1e-6:
-        bias /= bias_std
+
+    std = bias.std()
+    if std > 1e-6: bias /= std
     bias *= (prior_scale / 2.0)
-    bias = bias.to(dtype=torch.float32)
     return bias
