@@ -2,7 +2,7 @@ from __future__ import annotations
 import math
 import random
 from collections import deque
-from typing import Callable, List, Optional, Tuple, Deque, Iterator
+from typing import Callable, List, Optional, Tuple, Deque
 
 import numpy as np
 import pandas as pd
@@ -36,7 +36,6 @@ def tb_loss(log_pf: torch.Tensor,
     lb = log_pb.sum(dim=-1)                          # [B]
     logR = torch.log(R.clamp_min(1e-9))              # [B] or scalar
 
-    #print(logR)
     if log_z.dim() == 0: log_z = log_z.expand_as(lp)
     if logR.dim()  == 0: logR  = logR.expand_as(lp)
 
@@ -327,29 +326,218 @@ def deltaE_split_gain_classification(tokens: torch.Tensor, tok: "Tokenizer", env
     return dR.unsqueeze(0)
 
 # ============================================================
-# Predictor (Dirichlet sampling for probs; mean for residuals)
+# Ensemble reward (regression MSE) — for RF/Boost
 # ============================================================
 
-def get_tree_predictor(traj: List[int],
-                       X_binned: torch.Tensor,
-                       y_target: torch.Tensor,
-                       tok: "Tokenizer") -> Callable[[torch.Tensor], torch.Tensor]:
+@torch.no_grad()
+def ensemble_reward_mse(
+    seqs: List[List[int]],
+    X_binned: torch.Tensor,
+    y_true: torch.Tensor,
+    tok: "Tokenizer",
+    *,
+    min_child_size: int = 20,
+    min_gain: float = 0.0,
+    base_pred: Optional[torch.Tensor] = None,   # if provided, use directly (Boosting)
+    beta: float = 1.0,
+    sample_size: Optional[int] = None,          # optional subsample for speed
+) -> torch.Tensor:
     """
-    Build structure by *data replay* on TRAIN, then:
-      • If y_target is non-negative, ≤1 and rows sum≈1: Dirichlet-sample leaf probs
-        (deterministic per-tree via seed from traj).
-      • Else: per-leaf mean vector (regression / residuals).
+    Compute a single scalar reward for the whole batch of trees:
+      logR = beta * (MSE_baseline - MSE_ens) / (MSE_baseline + 1e-6)
+      R    = exp(clamp(logR))
+
+    If base_pred is provided (Boosting), we score that vector.
+    Otherwise (RF), we form an unweighted mean of tree predictors.
+
+    Returns a 0-dim tensor on X_binned.device.
+    """
+    device = X_binned.device
+    if y_true.numel() == 0:
+        return torch.tensor(1.0, device=device)
+
+    # optional subsample
+    if sample_size is not None and sample_size > 0 and y_true.numel() > sample_size:
+        idx = torch.randperm(y_true.numel(), device=device)[:sample_size]
+        Xb = X_binned[idx]
+        yb = y_true[idx].float()
+    else:
+        Xb = X_binned
+        yb = y_true.float()
+
+    if base_pred is None:
+        if not seqs:
+            return torch.tensor(1.0, device=device)
+        preds = []
+        for seq in seqs:
+            pred_fn = get_tree_predictor(
+                seq, Xb, yb, tok, min_child_size=min_child_size, min_gain=min_gain
+            )
+            preds.append(pred_fn(Xb))
+        ens_pred = torch.stack(preds, dim=0).mean(dim=0)
+    else:
+        ens_pred = base_pred.to(device)
+        if ens_pred.shape != y_true.shape:
+            # If caller gives full-length base_pred but we subsampled above, match shapes
+            if sample_size is not None and sample_size > 0 and y_true.numel() > sample_size:
+                idx = torch.randperm(y_true.numel(), device=device)[:sample_size]
+                ens_pred = ens_pred[idx]
+        ens_pred = ens_pred.float()
+
+    baseline = yb.mean()
+    mse_base = torch.mean((baseline - yb) ** 2)
+    mse_ens = torch.mean((ens_pred - yb) ** 2)
+    clip = (mse_base + 1e-6).detach()
+    logR = beta * ((mse_base - mse_ens) / clip)
+    logR = torch.clamp(logR, min=-50.0, max=50.0)
+    return torch.exp(logR).clamp_min(1e-9)
+
+# ============================================================
+# Predictor (Dirichlet sampling OR posterior mean for probs)
+# ============================================================
+
+def get_tree_predictor(
+    traj: List[int],
+    X_binned: torch.Tensor,
+    y_target: torch.Tensor,
+    tok: "Tokenizer",
+    *,
+    min_child_size: int = 20,
+    min_gain: float = 0.0,
+    predictor_mode: str = "dirichlet",   # "dirichlet" (sample) | "mean" (posterior mean)
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """
+    Rebuild the tree by replaying tokens on TRAIN data with stronger split checks:
+      • accept split only if both children have >= min_child_size
+      • and (optionally) gain >= min_gain
+    Leaf values:
+      • classification with probs (0..1, rows sum≈1):
+          - predictor_mode="dirichlet": sample from Dirichlet posterior
+          - predictor_mode="mean":     use posterior mean conc/sum(conc)
+      • otherwise (regression / residuals): per-leaf mean (vector OK)
+
+    Returns: predictor(X_binned_test) -> Tensor
     """
     device = X_binned.device
     y_target = y_target.detach().to(dtype=torch.float32, device=device)
+    v = tok.v
 
-    # build structure on TRAIN
-    toks = torch.tensor(traj, device=device, dtype=torch.long)
-    root, _ = _build_tree_by_data(toks, tok, X_binned, torch.arange(X_binned.size(0), device=device))
+    # --- decode tokens (strip BOS/EOS if present) ---
+    start = 1 if len(traj) and traj[0] == v.BOS else 0
+    end   = len(traj) - 1 if len(traj) and traj[-1] == v.EOS else len(traj)
+    decoded = tok.decode(traj[start:end])
 
-    # collect leaves’ train indices
-    leaves: List[Tuple[_Node, torch.Tensor]] = []
-    q: Deque[_Node] = deque([root])
+    N = X_binned.size(0)
+    all_idx = torch.arange(N, device=device, dtype=torch.long)
+
+    # --- detect mode: prob-matrix vs residuals/regression ---
+    is_matrix = (y_target.dim() == 2)
+    if is_matrix:
+        min_ok = float(y_target.min()) >= -1e-6
+        max_ok = float(y_target.max()) <= 1.0 + 1e-6
+        row_sums = y_target.sum(dim=1)
+        sums_ok = torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-3, rtol=0.0)
+        is_clf_probs = (min_ok and max_ok and bool(sums_ok))
+        K = y_target.size(1)
+    else:
+        is_clf_probs = False
+        K = None  # not used
+
+    # --- impurity helpers -------------------------------------------------
+    def node_sse(idxs: torch.Tensor) -> torch.Tensor:
+        if idxs.numel() <= 1:
+            return torch.tensor(0.0, device=device)
+        Y = y_target[idxs]
+        if Y.ndim == 1:
+            mu = Y.mean()
+            return ((Y - mu) ** 2).sum()
+        else:
+            mu = Y.mean(dim=0, keepdim=True)
+            return ((Y - mu) ** 2).sum()
+
+    def node_gini(idxs: torch.Tensor) -> torch.Tensor:
+        if idxs.numel() == 0:
+            return torch.tensor(0.0, device=device)
+        counts = y_target[idxs].sum(0)  # [K]
+        n = counts.sum().clamp_min(1.0)
+        p = counts / n
+        return 1.0 - (p * p).sum()
+
+    def split_gain(parent_idx: torch.Tensor, L_idx: torch.Tensor, R_idx: torch.Tensor) -> float:
+        nP = float(parent_idx.numel())
+        if nP <= 1:
+            return 0.0
+        if is_clf_probs:
+            gP = node_gini(parent_idx)
+            gL = node_gini(L_idx)
+            gR = node_gini(R_idx)
+            nL = float(L_idx.numel()); nR = float(R_idx.numel())
+            gain = gP * nP - (gL * nL + gR * nR)  # weighted Gini decrease
+        else:
+            sP = node_sse(parent_idx)
+            sL = node_sse(L_idx)
+            sR = node_sse(R_idx)
+            gain = float((sP - (sL + sR)).item())  # SSE decrease
+        return float(gain)
+
+    # --- build by data with LIFO expansion (matches rollout .pop()) -------
+    class Node(dict): pass
+    root = Node(type='leaf', idxs=all_idx)
+    stack: List[Node] = [root]
+    pending: Optional[Tuple[Node, int]] = None  # (node_to_split, feature_id)
+
+    for kind, val in decoded:
+        if not stack and pending is None:
+            break
+
+        if pending is None:
+            if kind == 'feat':
+                node = stack.pop() if stack else None
+                if node is None or node.get('type') != 'leaf':
+                    continue
+                pending = (node, int(val))
+            elif kind == 'leaf':
+                if stack:
+                    stack.pop()
+            else:
+                continue
+        else:
+            if kind != 'th':
+                pending = None
+                continue
+
+            node, f = pending
+            t = int(val)
+            idxs = node.get('idxs', all_idx)
+
+            fv = X_binned[idxs, f]
+            m = fv <= t
+            L_idx = idxs[m]
+            R_idx = idxs[~m]
+
+            # --- enforce min child size and optional min gain ------------
+            if (L_idx.numel() < min_child_size) or (R_idx.numel() < min_child_size):
+                pending = None
+                continue
+            if min_gain > 0.0:
+                g = split_gain(idxs, L_idx, R_idx)
+                if g < min_gain:
+                    pending = None
+                    continue
+
+            # accept split: mutate node into split, push children (R then L for LIFO)
+            node.clear()
+            node.update(type='split', f=f, t=t)
+            L = Node(type='leaf', idxs=L_idx)
+            R = Node(type='leaf', idxs=R_idx)
+            node['L'] = L; node['R'] = R
+            stack.append(R)
+            stack.append(L)
+            pending = None
+
+    # --- collect leaves (with training indices) ---------------------------
+    leaves: List[Tuple[Node, torch.Tensor]] = []
+    q: Deque[Node] = deque([root])
     while q:
         n = q.popleft()
         if n.get('type') == 'split':
@@ -357,50 +545,41 @@ def get_tree_predictor(traj: List[int],
         else:
             leaves.append((n, n.get('idxs', torch.empty(0, dtype=torch.long, device=device))))
 
-    # decide mode
-    is_matrix = (y_target.dim() == 2)
-    if is_matrix:
-        min_ok = float(y_target.min()) >= -1e-6
-        max_ok = float(y_target.max()) <= 1.0 + 1e-6
-        sums_ok = torch.allclose(y_target.sum(dim=1), torch.ones(y_target.size(0), device=device), atol=1e-3, rtol=0)
-        is_clf_probs = (min_ok and max_ok and bool(sums_ok))
-    else:
-        is_clf_probs = False
-
-    # fill leaf values
-    if is_matrix and is_clf_probs:
-        K = y_target.size(1)
+    # --- compute leaf values ----------------------------------------------
+    if is_clf_probs:
         alpha = torch.full((K,), 0.1 / max(1, K), device=device)
-        seed_val = int(sum(int(x) for x in traj)) & 0xFFFFFFFF
-        rng = np.random.default_rng(seed=seed_val if seed_val != 0 else 12345)
         for node, idxs in leaves:
             if idxs.numel() == 0:
                 node['val'] = torch.full((K,), 1.0 / K, device=device)
+                continue
+            counts = y_target[idxs].sum(0)  # [K]
+            conc = counts + alpha
+            if predictor_mode == "mean":
+                node['val'] = conc / conc.sum().clamp_min(1e-12)
             else:
-                counts = y_target[idxs].sum(0)
-                conc = (counts + alpha).clamp_min(1e-8)
-                sample = rng.dirichlet(conc.cpu().numpy())
-                node['val'] = torch.from_numpy(sample).to(device=device, dtype=y_target.dtype)
+                node['val'] = torch.distributions.Dirichlet(conc).sample()
     else:
         for node, idxs in leaves:
             if idxs.numel() == 0:
-                node['val'] = (torch.zeros_like(y_target[0]) if y_target.dim() > 1
+                node['val'] = (torch.zeros_like(y_target[0])
+                               if y_target.dim() > 1
                                else torch.tensor(0.0, device=device))
             else:
                 node['val'] = y_target[idxs].mean(dim=0, keepdim=False)
 
-    # remove train idxs to avoid leaking
+    # strip training indices
     for node, _ in leaves:
-        if 'idxs' in node: del node['idxs']
+        node.pop('idxs', None)
 
-    # predictor
+    # --- prediction -------------------------------------------------------
     def predict(X: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
             if is_matrix:
                 out = torch.zeros(X.size(0), y_target.size(1), device=X.device, dtype=y_target.dtype)
             else:
                 out = torch.zeros(X.size(0), device=X.device, dtype=y_target.dtype)
-            q: Deque[Tuple[_Node, torch.Tensor]] = deque([(root, torch.arange(X.size(0), device=X.device))])
+
+            q: Deque[Tuple[Node, torch.Tensor]] = deque([(root, torch.arange(X.size(0), device=X.device))])
             while q:
                 n, idxs = q.popleft()
                 if idxs.numel() == 0:
@@ -414,6 +593,7 @@ def get_tree_predictor(traj: List[int],
                     out[idxs] = n['val']
             return out
     return predict
+
 
 # ============================================================
 # Replay Buffer
