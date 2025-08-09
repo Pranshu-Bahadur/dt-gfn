@@ -536,13 +536,17 @@ class Trainer:
             idxs = np.random.choice(valid, size=k, replace=False)
         return [(entries[i][1], entries[i][2]) for i in idxs]
 
-    def batched_rollout(self, envs, temp, residuals, beta, ras_counts: Optional[Dict] = None):
+    def batched_rollout(self, envs, temp, residuals, beta, ras_counts: Optional[dict] = None):
         """
-        Grammar-correct tree generation to max_depth with range-tracking for thresholds.
+        Grammar-correct tree generation with *policy-chosen* early leaf closure.
+        At each open leaf, policy picks either:
+          • a valid feature (given current [lo,hi] per feature), or
+          • the LEAF token to close that branch.
+        If a feature is picked, a second call picks the threshold (constrained to [lo_f, hi_f]).
         """
         c, v, device = self.cfg, self.tokenizer.v, self.cfg.device
         num = len(envs)
-        END_TOKEN = v.EOS
+        END_TOKEN  = v.EOS
         LEAF_TOKEN = self.tokenizer._leaf(0)
 
         # init envs
@@ -550,33 +554,23 @@ class Trainer:
             env.y = residuals
             env.reset(c.batch_size)
 
+        # per-tree state
         seqs = [[v.BOS] for _ in range(num)]
         depths: List[Deque[int]] = [deque([0]) for _ in range(num)]
         lo_stacks: List[Deque[torch.Tensor]] = [deque([torch.zeros(v.num_feat, dtype=torch.long, device=device)]) for _ in range(num)]
         hi_stacks: List[Deque[torch.Tensor]] = [deque([torch.full((v.num_feat,), v.num_th - 1, dtype=torch.long, device=device)]) for _ in range(num)]
 
-        def _force_close_until_expandable(ti: int):
-            while depths[ti]:
-                d = depths[ti][-1]
-                lo_top, hi_top = lo_stacks[ti][-1], hi_stacks[ti][-1]
-                has_feat = (lo_top <= hi_top).any().item()
-                at_max_depth = (d >= c.max_depth)
-                if at_max_depth or not has_feat:
-                    seqs[ti].append(LEAF_TOKEN)
-                    envs[ti].step(('leaf', 0))
-                    depths[ti].pop(); lo_stacks[ti].pop(); hi_stacks[ti].pop()
-                else:
-                    break
+        # helper: auto-finish trees that have no open leaves
+        def _mark_done_if_finished(ti: int):
             if not depths[ti]:
                 envs[ti].done = True
 
-        for t_i in range(num):
-            _force_close_until_expandable(t_i)
-
-        active, out = [i for i in range(num) if not envs[i].done], [None] * num
+        active = [i for i in range(num) if not envs[i].done]
+        out = [None] * num
 
         with torch.no_grad():
             while active:
+                # --- 1) At each tree's current leaf, choose LEAF vs FEAT ---
                 pad = torch.nn.utils.rnn.pad_sequence(
                     [torch.tensor(seqs[i], device=device) for i in active],
                     batch_first=True, padding_value=v.PAD
@@ -590,40 +584,71 @@ class Trainer:
                         if path in ras_counts:
                             last[bi, :] -= ras_counts[path] * 1e9
 
-                feat_mask = torch.zeros((len(active), v.size()), dtype=torch.bool, device=device)
+                mask1 = torch.zeros((len(active), v.size()), dtype=torch.bool, device=device)
                 for bi, oidx in enumerate(active):
-                    d = depths[oidx][-1] if depths[oidx] else c.max_depth
+                    if not depths[oidx]:
+                        continue
+                    d = depths[oidx][-1]
                     lo_top, hi_top = lo_stacks[oidx][-1], hi_stacks[oidx][-1]
-                    if d < c.max_depth:
-                        valid_feats = (lo_top <= hi_top).nonzero(as_tuple=False).flatten()
-                        if valid_feats.numel() > 0:
-                            feat_ids = v.split_start + valid_feats
-                            feat_mask[bi, feat_ids] = True
-                    feat_mask[bi, v.EOS] = False
 
-                toks_feat = _safe_sample(last, feat_mask, temp)
+                    # valid feats: those with lo<=hi and depth < max_depth
+                    can_split = (d < c.max_depth)
+                    valid_feats = (lo_top <= hi_top).nonzero(as_tuple=False).flatten() if can_split else torch.empty(0, dtype=torch.long, device=device)
 
-                needs_threshold = []
-                still = []
+                    # allow LEAF always (closing early is a valid choice)
+                    mask1[bi, LEAF_TOKEN] = True
+
+                    # allow selectable features
+                    if valid_feats.numel() > 0:
+                        feat_ids = v.split_start + valid_feats
+                        mask1[bi, feat_ids] = True
+
+                    # never EOS here (we only end after all leaves are closed)
+                    mask1[bi, v.EOS] = False
+
+                    # if depth==max or no valid feats -> mask effectively reduces to just LEAF
+
+                toks1 = _safe_sample(last, mask1, temp)
+
+                # apply LEAF/FEAT choices
+                need_threshold: List[Tuple[int,int,int,torch.Tensor,torch.Tensor]] = []
+                still_for_round: List[int] = []
                 for bi, oidx in enumerate(active):
-                    if not feat_mask[bi].any():
+                    tok = toks1[bi].item()
+
+                    # if mask row was dead (shouldn't happen—safe_sample guards), just finish
+                    if not mask1[bi].any():
                         envs[oidx].done = True
                         continue
 
-                    f_tok = toks_feat[bi].item()
-                    seqs[oidx].append(f_tok)
+                    seqs[oidx].append(tok)
                     if ras_counts is not None:
-                        path = tuple(seqs[oidx]); ras_counts[path] = ras_counts.get(path, 0) + 1
+                        path = tuple(seqs[oidx])
+                        ras_counts[path] = ras_counts.get(path, 0) + 1
 
-                    kind, f_idx = self.tokenizer.decode_one(f_tok)
+                    if tok == LEAF_TOKEN:
+                        # close current leaf
+                        envs[oidx].step(('leaf', 0))
+                        depths[oidx].pop()
+                        lo_stacks[oidx].pop()
+                        hi_stacks[oidx].pop()
+                        _mark_done_if_finished(oidx)
+                        if not envs[oidx].done:
+                            still_for_round.append(oidx)
+                        continue
+
+                    # otherwise must be a feature
+                    kind, f_idx = self.tokenizer.decode_one(tok)  # 'feat'
                     envs[oidx].step((kind, f_idx))
 
                     d0 = depths[oidx].pop()
                     lo_top, hi_top = lo_stacks[oidx].pop(), hi_stacks[oidx].pop()
-                    needs_threshold.append((oidx, f_idx, d0, lo_top.clone(), hi_top.clone()))
+                    # remember context to select threshold next
+                    need_threshold.append((oidx, f_idx, d0, lo_top.clone(), hi_top.clone()))
 
-                if needs_threshold:
-                    sub_idx = [oidx for (oidx, _, _, _, _) in needs_threshold]
+                # --- 2) For those that chose a FEAT, choose TH ---
+                if need_threshold:
+                    sub_idx = [oidx for (oidx, _, _, _, _) in need_threshold]
                     sub_pad = torch.nn.utils.rnn.pad_sequence(
                         [torch.tensor(seqs[i], device=device) for i in sub_idx],
                         batch_first=True, padding_value=v.PAD
@@ -631,54 +656,62 @@ class Trainer:
                     sub_logits, _ = self.pf(sub_pad)
                     last_th = sub_logits[:, -1, :]
 
-                    th_mask = torch.zeros((len(sub_idx), v.size()), dtype=torch.bool, device=device)
+                    mask2 = torch.zeros((len(sub_idx), v.size()), dtype=torch.bool, device=device)
                     th_base = v.split_start + v.num_feat
-                    for si, (oidx, f_idx, d0, lo_top, hi_top) in enumerate(needs_threshold):
+                    for si, (oidx, f_idx, d0, lo_top, hi_top) in enumerate(need_threshold):
                         lo_f = int(lo_top[f_idx].item())
                         hi_f = int(hi_top[f_idx].item())
                         if lo_f <= hi_f:
                             th_ids = th_base + torch.arange(lo_f, hi_f + 1, device=device)
-                            th_mask[si, th_ids] = True
-                        th_mask[si, v.EOS] = False
+                            mask2[si, th_ids] = True
+                        # no EOS/LEAF at threshold step
+                        mask2[si, v.EOS] = False
+                        mask2[si, LEAF_TOKEN] = False
 
-                    toks_th = _safe_sample(last_th, th_mask, temp)
+                    toks2 = _safe_sample(last_th, mask2, temp)
 
-                    for si, (oidx, f_idx, d0, lo_top, hi_top) in enumerate(needs_threshold):
-                        t_tok = toks_th[si].item()
+                    # apply thresholds: push children ranges
+                    for si, (oidx, f_idx, d0, lo_top, hi_top) in enumerate(need_threshold):
+                        t_tok = toks2[si].item()
                         seqs[oidx].append(t_tok)
                         if ras_counts is not None:
-                            path = tuple(seqs[oidx]); ras_counts[path] = ras_counts.get(path, 0) + 1
+                            path = tuple(seqs[oidx])
+                            ras_counts[path] = ras_counts.get(path, 0) + 1
 
                         _, t_idx = self.tokenizer.decode_one(t_tok)
 
+                        # split ranges
                         lo_L, hi_L = lo_top.clone(), hi_top.clone()
                         hi_L[f_idx] = torch.minimum(hi_L[f_idx], torch.as_tensor(t_idx, device=device))
                         lo_R, hi_R = lo_top.clone(), hi_top.clone()
                         lo_R[f_idx] = torch.maximum(lo_R[f_idx], torch.as_tensor(t_idx + 1, device=device))
 
-                        # push Right then Left (LIFO -> expand Left next)
+                        # push Right then Left (so we expand Left next)
                         depths[oidx].append(d0 + 1); lo_stacks[oidx].append(lo_R); hi_stacks[oidx].append(hi_R)
                         depths[oidx].append(d0 + 1); lo_stacks[oidx].append(lo_L); hi_stacks[oidx].append(hi_L)
 
-                        envs[oidx].step(('th', t_idx))
-                        _force_close_until_expandable(oidx)
-                        if not envs[oidx].done:
-                            still.append(oidx)
+                        envs[oidx].step(('th', int(t_idx)))
 
-                active = still
+                        # if after pushing children the tree still has open leaves, keep it active
+                        if depths[oidx]:
+                            still_for_round.append(oidx)
+                        else:
+                            envs[oidx].done = True
 
+                # next round
+                active = still_for_round
+
+        # finalize outputs
         for i in range(num):
             if envs[i].done:
-                if seqs[i][-1] != v.EOS:
-                    seqs[i].append(v.EOS)
-                out_token = (seqs[i], envs[i].get_prior(beta).item(), envs[i].idxs.clone())
+                if seqs[i][-1] != END_TOKEN:
+                    seqs[i].append(END_TOKEN)
+                out[i] = (seqs[i], envs[i].get_prior(beta).item(), envs[i].idxs.clone())
             else:
-                out_token = None
-            if 'out' not in locals():
-                out = [None] * num
-            out[i] = out_token
+                out[i] = None
 
         return out
+
 
     # ========================================================
     # Predict
