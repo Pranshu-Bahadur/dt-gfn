@@ -80,7 +80,7 @@ class Config:
     eval_batch_size: int = 16384
 
     # --- NEW knobs ---
-    rollout_temperature: float = 1.0               # sampling temp for rollouts (policy gen)
+    rollout_temperature: float = 0.0               # sampling temp for rollouts (policy gen)
     min_child_size: int = 20                       # split guard for predictors
     min_gain: float = 0.0                          # optional split gain guard
 
@@ -97,7 +97,7 @@ class Config:
     # policy-based prediction variant (only wired here; utils support in next step)
     # "dirichlet" -> sample Dirichlet probs for leaves (classification)
     # "mean"      -> use posterior mean probs
-    policy_predictor_mode: str = "dirichlet"
+    policy_predictor_mode: str = "mean"
 
 
 # ============================================================

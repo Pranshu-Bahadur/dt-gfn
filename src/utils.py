@@ -2,7 +2,7 @@ from __future__ import annotations
 import math
 import random
 from collections import deque
-from typing import Callable, List, Optional, Tuple, Deque
+from typing import Callable, List, Optional, Tuple, Deque, Iterator
 
 import numpy as np
 import pandas as pd
@@ -326,74 +326,7 @@ def deltaE_split_gain_classification(tokens: torch.Tensor, tok: "Tokenizer", env
     return dR.unsqueeze(0)
 
 # ============================================================
-# Ensemble reward (regression MSE) — for RF/Boost
-# ============================================================
-
-@torch.no_grad()
-def ensemble_reward_mse(
-    seqs: List[List[int]],
-    X_binned: torch.Tensor,
-    y_true: torch.Tensor,
-    tok: "Tokenizer",
-    *,
-    min_child_size: int = 20,
-    min_gain: float = 0.0,
-    base_pred: Optional[torch.Tensor] = None,   # if provided, use directly (Boosting)
-    beta: float = 1.0,
-    sample_size: Optional[int] = None,          # optional subsample for speed
-) -> torch.Tensor:
-    """
-    Compute a single scalar reward for the whole batch of trees:
-      logR = beta * (MSE_baseline - MSE_ens) / (MSE_baseline + 1e-6)
-      R    = exp(clamp(logR))
-
-    If base_pred is provided (Boosting), we score that vector.
-    Otherwise (RF), we form an unweighted mean of tree predictors.
-
-    Returns a 0-dim tensor on X_binned.device.
-    """
-    device = X_binned.device
-    if y_true.numel() == 0:
-        return torch.tensor(1.0, device=device)
-
-    # optional subsample
-    if sample_size is not None and sample_size > 0 and y_true.numel() > sample_size:
-        idx = torch.randperm(y_true.numel(), device=device)[:sample_size]
-        Xb = X_binned[idx]
-        yb = y_true[idx].float()
-    else:
-        Xb = X_binned
-        yb = y_true.float()
-
-    if base_pred is None:
-        if not seqs:
-            return torch.tensor(1.0, device=device)
-        preds = []
-        for seq in seqs:
-            pred_fn = get_tree_predictor(
-                seq, Xb, yb, tok, min_child_size=min_child_size, min_gain=min_gain
-            )
-            preds.append(pred_fn(Xb))
-        ens_pred = torch.stack(preds, dim=0).mean(dim=0)
-    else:
-        ens_pred = base_pred.to(device)
-        if ens_pred.shape != y_true.shape:
-            # If caller gives full-length base_pred but we subsampled above, match shapes
-            if sample_size is not None and sample_size > 0 and y_true.numel() > sample_size:
-                idx = torch.randperm(y_true.numel(), device=device)[:sample_size]
-                ens_pred = ens_pred[idx]
-        ens_pred = ens_pred.float()
-
-    baseline = yb.mean()
-    mse_base = torch.mean((baseline - yb) ** 2)
-    mse_ens = torch.mean((ens_pred - yb) ** 2)
-    clip = (mse_base + 1e-6).detach()
-    logR = beta * ((mse_base - mse_ens) / clip)
-    logR = torch.clamp(logR, min=-50.0, max=50.0)
-    return torch.exp(logR).clamp_min(1e-9)
-
-# ============================================================
-# Predictor (Dirichlet sampling OR posterior mean for probs)
+# Predictor (Dirichlet sampling / posterior mean for probs)
 # ============================================================
 
 def get_tree_predictor(
@@ -402,19 +335,20 @@ def get_tree_predictor(
     y_target: torch.Tensor,
     tok: "Tokenizer",
     *,
-    min_child_size: int = 20,
-    min_gain: float = 0.0,
-    predictor_mode: str = "dirichlet",   # "dirichlet" (sample) | "mean" (posterior mean)
+    min_child_size: int = 20,      # minimum rows per child
+    min_gain: float = 0.0,         # optional impurity reduction threshold
+    predictor_mode: str = "dirichlet",  # "dirichlet" | "mean" (classification only)
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """
     Rebuild the tree by replaying tokens on TRAIN data with stronger split checks:
       • accept split only if both children have >= min_child_size
       • and (optionally) gain >= min_gain
+
     Leaf values:
-      • classification with probs (0..1, rows sum≈1):
-          - predictor_mode="dirichlet": sample from Dirichlet posterior
-          - predictor_mode="mean":     use posterior mean conc/sum(conc)
-      • otherwise (regression / residuals): per-leaf mean (vector OK)
+      • classification (y_target one-hot probs):
+          - predictor_mode == "dirichlet": sample from Dirichlet posterior
+          - predictor_mode == "mean":      use Dirichlet posterior mean
+      • regression / residuals: per-leaf mean
 
     Returns: predictor(X_binned_test) -> Tensor
     """
@@ -515,7 +449,7 @@ def get_tree_predictor(
             L_idx = idxs[m]
             R_idx = idxs[~m]
 
-            # --- enforce min child size and optional min gain ------------
+            # --- enforce guards ------------------------------------------
             if (L_idx.numel() < min_child_size) or (R_idx.numel() < min_child_size):
                 pending = None
                 continue
@@ -525,7 +459,7 @@ def get_tree_predictor(
                     pending = None
                     continue
 
-            # accept split: mutate node into split, push children (R then L for LIFO)
+            # accept split
             node.clear()
             node.update(type='split', f=f, t=t)
             L = Node(type='leaf', idxs=L_idx)
@@ -554,10 +488,10 @@ def get_tree_predictor(
                 continue
             counts = y_target[idxs].sum(0)  # [K]
             conc = counts + alpha
-            if predictor_mode == "mean":
-                node['val'] = conc / conc.sum().clamp_min(1e-12)
-            else:
+            if predictor_mode == "dirichlet":
                 node['val'] = torch.distributions.Dirichlet(conc).sample()
+            else:  # posterior mean
+                node['val'] = conc / conc.sum()
     else:
         for node, idxs in leaves:
             if idxs.numel() == 0:
