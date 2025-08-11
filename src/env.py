@@ -1,4 +1,3 @@
-# src/env.py
 from __future__ import annotations
 from typing import List, Tuple, Optional
 import numpy as np
@@ -10,8 +9,8 @@ class TabularEnv:
     """
     A tabular decision-tree environment for GFN rollouts.
 
-    Notes on grammar accounting:
-      - 'feat'   : choose a feature for the CURRENT open leaf (no change to open_leaves)
+    Grammar accounting:
+      - 'feat'   : choose a feature for the CURRENT open leaf (no change)
       - 'th'     : choose a threshold; split 1 open leaf into 2  -> open_leaves += 1
       - 'leaf'   : close the CURRENT open leaf                   -> open_leaves -= 1
       - done     : when open_leaves == 0 (or a hard safety cap)
@@ -25,8 +24,8 @@ class TabularEnv:
         n_bins: int,
         task: str = "regression",
         device: str = "cpu",
-        shuffle_on_reset: bool = False,
-        binning_strategy: str = "global_uniform"  # "quantile" or "global_uniform"
+        shuffle_on_reset: bool = True,
+        binning_strategy: str = "global_uniform"  # "quantile" | "global_uniform"
     ):
         self.device = device
         self.feature_cols = feature_cols
@@ -52,21 +51,39 @@ class TabularEnv:
             self.y_full = torch.tensor(df_train[target_col].values, dtype=torch.float32, device=device)
             self.n_classes = 1
 
-        # working target (overridable by trainer)
+        # working target (overridable by trainer: residuals, etc.)
         self.y = self.y_full.clone()
 
-        # master index pool (shuffled by reset if requested)
+        # master index pool (shuffled by draw_indices if requested)
         self._master_indices = torch.arange(len(self.y_full), device=device)
+        self._ptr: int = 0
 
         # rollout state
         self.paths: List[Tuple[str, int]] = []
         self.open_leaves: int = 1
         self.done: bool = False
         self.idxs: torch.Tensor = self._master_indices
-        self._ptr: int = 0
 
         # safety cap on emitted tokens to avoid runaway sequences
         self._max_tokens: int = 8192
+
+    # -----------------------------
+    # Shared index sampler (FIX)
+    # -----------------------------
+    def draw_indices(self, batch_size: int) -> torch.Tensor:
+        """
+        Draw a slice of row indices from a shared pointer,
+        shuffling when we wrap around. This replaces calling reset()
+        on shallow copies (which each had their own pointer at 0).
+        """
+        if self._ptr + batch_size > len(self._master_indices):
+            self._ptr = 0
+            if self.shuffle_on_reset:
+                perm = torch.randperm(len(self._master_indices), device=self.device)
+                self._master_indices = self._master_indices[perm]
+        idxs = self._master_indices[self._ptr : self._ptr + batch_size]
+        self._ptr += batch_size
+        return idxs
 
     def _featurise(
         self,
@@ -107,6 +124,9 @@ class TabularEnv:
 
                 quantiles = np.linspace(0, 1, bins + 1)
                 edges = np.unique(np.quantile(s_source, quantiles))
+                if edges.size == 1:
+                    # constant feature guard
+                    edges = np.array([edges[0] - 1, edges[0] + 1], dtype=float)
                 edges[0] -= 1e-9
                 edges[-1] += 1e-9
 
@@ -128,19 +148,12 @@ class TabularEnv:
         Xb = np.stack(X_binned, 1).astype(np.int32)
         return torch.tensor(Xb, device=self.device)
 
+    # legacy reset (still used by training env itself, not by shallow copies)
     def reset(self, batch_size: int):
         """
-        Resets the environment for a new rollout batch.
+        Resets this environment (NOT copies) for a new rollout batch.
         """
-        if self._ptr + batch_size > len(self._master_indices):
-            self._ptr = 0
-            if self.shuffle_on_reset:
-                perm = torch.randperm(len(self._master_indices), device=self.device)
-                self._master_indices = self._master_indices[perm]
-
-        self.idxs = self._master_indices[self._ptr: self._ptr + batch_size]
-        self._ptr += batch_size
-
+        self.idxs = self.draw_indices(batch_size)
         self.paths = []
         self.open_leaves = 1
         self.done = False
@@ -148,29 +161,17 @@ class TabularEnv:
     def step(self, action: Tuple[str, int]):
         """
         Advance the environment by one token action.
-
-        Correct leaf accounting for (feat → th) split grammar:
-          - 'feat' : choose feature for current leaf         (no change)
-          - 'th'   : perform split → 1 leaf becomes 2        (open_leaves += 1)
-          - 'leaf' : close one leaf                          (open_leaves -= 1)
         """
         self.paths.append(action)
         kind, _ = action
 
         if kind == "feat":
-            # selecting a feature doesn't change leaf count
             pass
         elif kind == "th":
-            # splitting increases the number of open leaves by 1
             self.open_leaves += 1
         elif kind == "leaf":
-            # closing a leaf decreases open count
             self.open_leaves -= 1
-        else:
-            # unknown token kind: ignore for counting
-            pass
 
-        # safety: clamp within [0, very large]
         if self.open_leaves < 0:
             self.open_leaves = 0
 
@@ -179,8 +180,8 @@ class TabularEnv:
 
     def get_prior(self, current_beta: float) -> torch.Tensor:
         """
-        Computes the structure prior for a completed trajectory.
-        Penalize by number of 'feat' tokens (i.e., number of splits).
+        Structure prior for a completed trajectory:
+        penalize by number of 'feat' tokens (splits).
         """
         n_feats = sum(1 for k, _ in self.paths if k == "feat")
         prior = -current_beta * float(n_feats)

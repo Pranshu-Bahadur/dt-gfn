@@ -1,152 +1,168 @@
 from __future__ import annotations
-from typing import Any, Dict, Optional, List
-
-import pandas as pd
+from dataclasses import replace
+from typing import Optional, Union, Iterable
 import numpy as np
+import pandas as pd
 import torch
-from sklearn.base import BaseEstimator, RegressorMixin, ClassifierMixin
 
 from src.trainer import Trainer, Config
 
-
-class DTGFN(BaseEstimator):
+class DTGFNClassifier:
     """
-    Scikit-learn compatible wrapper for the DT-GFN Trainer.
-    Works for both regression and classification.
+    Thin sklearn-ish wrapper around the Trainer for classification tasks.
     """
 
-    def __init__(self, feature_cols: Optional[List[str]] = None, **config_kwargs):
-        self.feature_cols = feature_cols
-        self._cfg_kwargs: Dict[str, Any] = config_kwargs
+    def __init__(
+        self,
+        *,
+        n_bins: int = 255,
+        binning_strategy: str = "quantile",
+        updates: int = 50,
+        rollouts: int = 60,
+        max_depth: int = 7,
+        top_k_trees: int = 10,
+        num_parallel: int = 32,
+        boosting_lr: float = 0.1,
+        redundancy_aware: bool = False,
+        device: Optional[str] = None,
+        batch_size: int = 8192,
+        random_forest: bool = True,
+        reward_function: str = "bayesian",
+        min_child_size: int = 20,
+        min_gain: float = 0.0,
+        policy_inference_trees: int = 500,
+        policy_predictor_mode: str = "mean",   # default to mean at inference for stability
+        lr: float = 1e-4,
+        lstm_hidden: int = 256,
+        mlp_layers: int = 3,
+        mlp_width: int = 256,
+    ):
+        self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self._random_forest = bool(random_forest)
+        self._cfg_kwargs = dict(
+            n_bins=n_bins,
+            binning_strategy=binning_strategy,
+            updates=updates,
+            rollouts=rollouts,
+            max_depth=max_depth,
+            top_k_trees=top_k_trees,
+            num_parallel=num_parallel,
+            boosting_lr=boosting_lr,
+            redundancy_aware=redundancy_aware,
+            device=self._device,
+            batch_size=batch_size,
+            random_forest=self._random_forest,
+            reward_function=reward_function,
+            min_child_size=min_child_size,
+            min_gain=min_gain,
+            policy_inference_trees=policy_inference_trees,
+            policy_predictor_mode=policy_predictor_mode,
+            lr=lr,
+            lstm_hidden=lstm_hidden,
+            mlp_layers=mlp_layers,
+            mlp_width=mlp_width,
+        )
+
         self._trainer: Optional[Trainer] = None
-        self.df_train_: Optional[pd.DataFrame] = None
-        self.task = self._cfg_kwargs.get("task", "classification")
+        self._df_train: Optional[pd.DataFrame] = None
+        self._feature_cols: Optional[list] = None
+        self.classes_: Optional[np.ndarray] = None
 
-    def fit(self, X: pd.DataFrame, y=None):
-        """
-        Fit the model. `X` must be a pandas DataFrame; `y` may be a Series/array,
-        or you may include the target column in `X` and omit `y`.
-        """
-        target_col = self._cfg_kwargs.get("target_col", "target")
+    # -----------------------------
+    # Fit
+    # -----------------------------
+    def fit(self, X: Union[pd.DataFrame, np.ndarray], y: Union[pd.Series, np.ndarray]) -> "DTGFNClassifier":
+        if isinstance(X, np.ndarray):
+            X = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
+        if isinstance(y, np.ndarray):
+            y = pd.Series(y, name="Cover_Type")
+        elif isinstance(y, pd.Series):
+            y = y.rename("Cover_Type")
 
-        if y is not None:
-            df_train = X.copy()
-            df_train[target_col] = y
-        else:
-            if target_col not in X.columns:
-                raise ValueError(
-                    f"If `y` is not provided, X must contain the target column '{target_col}'."
-                )
-            df_train = X.copy()
+        df_train = X.copy()
+        df_train["Cover_Type"] = y.values
 
-        self.df_train_ = df_train.copy()
-
-        feature_cols = self.feature_cols or [c for c in X.columns if c != target_col]
+        feature_cols = [c for c in df_train.columns if c != "target"]
 
         cfg = Config(
             feature_cols=feature_cols,
-            target_col=target_col,
-            **self._cfg_kwargs,
+            target_col="Cover_Type",
+            task="classification",
+            #device=self._device,
+            **{k: v for k, v in self._cfg_kwargs.items() if k in Config.__dataclass_fields__}
         )
-        self.task = cfg.task
+        # also push non-config extras
+        cfg.batch_size = self._cfg_kwargs["batch_size"]
+        cfg.policy_predictor_mode = self._cfg_kwargs["policy_predictor_mode"]
 
-        self._trainer = Trainer(cfg).fit(df_train)
+        trainer = Trainer(cfg)
+        trainer.fit(df_train)
+
+        self._trainer = trainer
+        self._df_train = df_train
+        self._feature_cols = feature_cols
+        self.classes_ = trainer.classes_
         return self
 
-    # ---------------------------
-    # Inference API
-    # ---------------------------
-    def predict(
-        self,
-        X: pd.DataFrame,
-        predict_mode: str = "ensemble",                  # "ensemble" | "policy"
-        n_trees: Optional[int] = None,
-        *,
-        infer_reward: Optional[str] = None,              # None | "none" | "bayesian" | "gini" | "variance" | "mse_ensemble"
-        algorithm: Optional[str] = None,                 # None | "rf" | "boost" (None -> use training mode)
-        policy_predictor_mode: Optional[str] = None,     # None | "dirichlet" | "mean"
-    ) -> np.ndarray:
-        """
-        For regression: returns predicted values.
-        For classification: returns class labels.
-        """
-        if self._trainer is None:
-            raise RuntimeError("DTGFN has not been fitted yet. Call fit() first.")
-
-        # Call trainer's predict once with all inference-time knobs
-        raw = self._trainer.predict(
-            df_test=X,
-            df_train=self.df_train_,
-            use_policy=(predict_mode == "policy"),
-            policy_inference_trees=n_trees,
-            policy_predictor_mode=policy_predictor_mode,
-            infer_reward=infer_reward,
-            algorithm=algorithm,
-        )
-
-        if self.task == "regression":
-            return raw  # already numpy
-        else:
-            # raw is probs (RF/Boost code returns softmax)
-            return raw.argmax(axis=1)
-
+    # -----------------------------
+    # Predict / Predict_proba
+    # -----------------------------
     def predict_proba(
         self,
-        X: pd.DataFrame,
-        predict_mode: str = "ensemble",
-        n_trees: Optional[int] = None,
+        X: Union[pd.DataFrame, np.ndarray],
         *,
+        predict_mode: str = "policy",          # "policy" | "ensemble"
+        n_trees: Optional[int] = None,
         infer_reward: Optional[str] = None,
-        algorithm: Optional[str] = None,
+        algorithm: str = "boosting",           # "rf" | "boosting"
         policy_predictor_mode: Optional[str] = None,
     ) -> np.ndarray:
-        """
-        Predict class probabilities (classification only).
-        """
-        if self._trainer is None:
-            raise RuntimeError("DTGFN has not been fitted yet. Call fit() first.")
-        if self.task != "classification":
-            raise AttributeError("predict_proba is only available for classification tasks.")
+        assert self._trainer is not None and self._df_train is not None, "Call fit() first."
+        if isinstance(X, np.ndarray):
+            X = pd.DataFrame(X, columns=self._feature_cols)
 
-        probs = self._trainer.predict(
+        use_policy = (predict_mode == "policy")
+        preds = self._trainer.predict(
             df_test=X,
-            df_train=self.df_train_,
-            use_policy=(predict_mode == "policy"),
+            df_train=self._df_train,
+            use_policy=use_policy,
             policy_inference_trees=n_trees,
-            policy_predictor_mode=policy_predictor_mode,
+            policy_predictor_mode=(policy_predictor_mode or self._cfg_kwargs["policy_predictor_mode"]),
             infer_reward=infer_reward,
             algorithm=algorithm,
         )
-        return probs
+        return preds
 
-    # ---------------------------
+    def predict(
+        self,
+        X: Union[pd.DataFrame, np.ndarray],
+        *,
+        predict_mode: str = "policy",
+        n_trees: Optional[int] = None,
+        infer_reward: Optional[str] = None,
+        algorithm: str = "rf",                 # default to RF hard preds unless specified
+        policy_predictor_mode: Optional[str] = None,
+    ) -> np.ndarray:
+        P = self.predict_proba(
+            X,
+            predict_mode=predict_mode,
+            n_trees=n_trees,
+            infer_reward=infer_reward,
+            algorithm=algorithm,
+            policy_predictor_mode=policy_predictor_mode,
+        )
+        if P.ndim == 2:
+            # classification probs
+            yhat_ids = np.argmax(P, axis=1)
+            if self.classes_ is not None:
+                return self.classes_[yhat_ids]
+            return yhat_ids.astype(int)
+        return P
+
     # sklearn compat
-    # ---------------------------
-    def get_params(self, deep: bool = True) -> Dict[str, Any]:
-        params = self._cfg_kwargs.copy()
-        params['feature_cols'] = self.feature_cols
-        return params
+    def get_params(self, deep=True):
+        return dict(**self._cfg_kwargs)
 
     def set_params(self, **params):
-        if 'feature_cols' in params:
-            self.feature_cols = params.pop('feature_cols')
-
         self._cfg_kwargs.update(params)
-
-        if self._trainer:
-            for k, v in params.items():
-                setattr(self._trainer.cfg, k, v)
-
         return self
-
-
-class DTGFNRegressor(DTGFN, RegressorMixin):
-    def __init__(self, feature_cols: Optional[List[str]] = None, **config_kwargs):
-        config_kwargs["task"] = "regression"
-        super().__init__(feature_cols, **config_kwargs)
-
-
-class DTGFNClassifier(DTGFN, ClassifierMixin):
-    def __init__(self, feature_cols: Optional[List[str]] = None, **config_kwargs):
-        config_kwargs["task"] = "classification"
-        super().__init__(feature_cols, **config_kwargs)
