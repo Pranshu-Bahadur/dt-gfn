@@ -12,7 +12,6 @@ import torch
 from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, SequentialLR
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
-from sklearn.preprocessing import LabelEncoder
 
 from src.tokenizer import Tokenizer, Vocab
 from src.env import TabularEnv
@@ -30,18 +29,19 @@ from src.utils import (
     calculate_bayesian_reward_regression,
 )
 
+
 # ============================================================
 # Config
 # ============================================================
 @dataclass
 class Config:
     feature_cols: List[str]
-    target_col: str = "target"
+    target_col: str = "__target__"
     task: str = "classification"                   # "classification" | "regression"
     reward_function: str = "bayesian"              # "bayesian" | "gini" | "variance" | "sse"
     n_classes: Optional[int] = None
     n_bins: int = 255
-    binning_strategy: str = "global_uniform"
+    binning_strategy: str = "quantile"
     device: str = "cuda"
 
     # training mode
@@ -75,7 +75,7 @@ class Config:
     # Memory/throughput
     amp: bool = True
     eval_on_cpu: bool = False
-    metric_sample_size: int = 20000                # (unused; we eval on full data)
+    metric_sample_size: int = 20000
     eval_batch_size: int = 16384
 
     # NEW knobs
@@ -87,12 +87,14 @@ class Config:
     training_reward_scope: str = "per_tree"        # "per_tree" | "ensemble"
     ensemble_reward_metric: str = "mse"            # (regression-only for now)
 
-    # inference-time weighting reward (for RF & Boost)
-    # None -> use training reward_function, "none" -> equal weights
-    infer_reward_function: Optional[str] = None
+    # inference-time weighting reward
+    infer_reward_function: Optional[str] = None    # None → same as training
 
     # policy-based predictor mode hint
     policy_predictor_mode: str = "dirichlet"       # "dirichlet" | "mean"
+
+    # (internal) set by env when classification
+    # n_classes is filled in fit()
 
 
 # ============================================================
@@ -110,13 +112,10 @@ class Trainer:
         self.pb = None
         self.log_z: Optional[torch.Tensor] = None
         self.replay_buffer: Optional[ReplayBuffer] = None
-        self.le: Optional[LabelEncoder] = None
         self.classes_: Optional[np.ndarray] = None
         self.scaler = GradScaler(enabled=cfg.amp)
 
-    # -------------------------
-    # Fit
-    # -------------------------
+    # ---------------- Fit ----------------
     def fit(self, df_train: pd.DataFrame) -> "Trainer":
         c = self.cfg
 
@@ -133,8 +132,8 @@ class Trainer:
             device=c.device,
         )
         if c.task == "classification":
-            self.le, c.n_classes = env_template.le, env_template.n_classes
-            self.classes_ = np.asarray(self.le.classes_)
+            c.n_classes = env_template.n_classes
+            self.classes_ = env_template.le_categories
         else:
             self.classes_ = None
 
@@ -171,30 +170,24 @@ class Trainer:
 
         return self
 
-    # ========================================================
-    # Reward helpers
-    # ========================================================
+    # ---------------- Reward helpers ----------------
     def _per_tree_reward(self, tok: torch.Tensor, reward_env: TabularEnv) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         c = self.cfg
-
-        # Detect residual-matrix training (multi-class boosting): rows don't sum to 1
-        is_residual_matrix = (
-            hasattr(reward_env, "y") and isinstance(reward_env.y, torch.Tensor) and reward_env.y.dim() == 2
-            and not torch.allclose(reward_env.y.sum(1), torch.ones_like(reward_env.y.sum(1)), atol=1e-3, rtol=0.0)
-        )
+        is_residual_matrix = (hasattr(reward_env, "y")
+                              and isinstance(reward_env.y, torch.Tensor)
+                              and reward_env.y.dim() == 2
+                              and not torch.allclose(reward_env.y.sum(1), torch.ones_like(reward_env.y.sum(1)), atol=1e-3))
 
         if c.reward_function == 'bayesian' and not is_residual_matrix:
             fn = calculate_bayesian_reward if c.task == 'classification' else calculate_bayesian_reward_regression
             R_t = fn(tok, self.tokenizer, reward_env, c.beta)
             return R_t, None
 
-        # Otherwise shape by SSE gains (regression OR residual-matrix classification)
         if is_residual_matrix or c.reward_function in ("variance", "sse"):
             dR = deltaE_split_gain_sse(tok, self.tokenizer, reward_env)
             R_t = torch.clamp(dR.sum(), min=1e-9)
             return R_t, dR
 
-        # Fallback to Gini or variance by task
         if c.task == 'classification':
             dR = deltaE_split_gain_classification(tok, self.tokenizer, reward_env)
         else:
@@ -204,10 +197,6 @@ class Trainer:
 
     @torch.no_grad()
     def _weight_for_tree(self, seq: List[int], reward_env: TabularEnv, mode: str) -> float:
-        """
-        Compute a scalar weight for a single tree according to `mode`.
-        mode: 'none' | 'bayesian' | 'gini' | 'variance' | 'sse' | (fallback to cfg.reward_function)
-        """
         device = reward_env.device
         tok = torch.tensor([seq], device=device, dtype=torch.long)
         task = self.cfg.task
@@ -224,7 +213,6 @@ class Trainer:
             dR = deltaE_split_gain_classification(tok, self.tokenizer, reward_env)
             return float(torch.clamp(dR.sum(), min=1e-9).item())
 
-        # default to training reward function
         return self._weight_for_tree(seq, reward_env, self.cfg.reward_function)
 
     @torch.no_grad()
@@ -235,7 +223,6 @@ class Trainer:
         y_true: torch.Tensor,
         base_pred: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Regression-only scalar reward; unchanged logic
         c = self.cfg
         device = X_binned.device
         if c.task != "regression":
@@ -265,11 +252,9 @@ class Trainer:
         logR = c.beta * ((mse_base - mse_ens) / clip)
         logR = torch.clamp(logR, min=-50.0, max=50.0)
         R = torch.exp(logR).clamp_min(1e-9)
-        return R  # scalar
+        return R
 
-    # ========================================================
-    # Batched policy update (one step)
-    # ========================================================
+    # ---------------- Policy update ----------------
     def _update_policy(
         self,
         all_tuples_with_targets: List,
@@ -307,7 +292,7 @@ class Trainer:
                     tok_i = padded[i:i+1, :t.numel()]
                     target = targets[i]
                     reward_env.y = target
-                    reward_env.reset(len(target))  # uses shared sampler internally
+                    reward_env.reset(len(target))
                     R_t, dR = self._per_tree_reward(tok_i, reward_env)
                     R_list.append(R_t.squeeze())
                     if dR is not None:
@@ -353,9 +338,7 @@ class Trainer:
         fl_loss_acc = float(fl_val.item()) if fl_val is not None else 0.0
         return tb_loss_acc, fl_loss_acc
 
-    # ========================================================
-    # RF training (policy + gen)
-    # ========================================================
+    # ---------------- RF training ----------------
     def _fit_dt_gfn_random_forest(self, env_template, y_true, X_binned, optimizers, schedulers):
         c = self.cfg
         tqdm.write("--- Starting DT-GFN (Random Forest) Training ---")
@@ -383,7 +366,6 @@ class Trainer:
                 for sch in schedulers: sch.step()
                 continue
 
-            # optional ensemble reward (regression-only)
             ensemble_R_override = None
             if c.training_reward_scope == "ensemble" and c.task == "regression" and len(all_tuples) > 0:
                 seqs = [seq for seq, _ in all_tuples]
@@ -397,7 +379,7 @@ class Trainer:
             for sch in schedulers:
                 sch.step()
 
-            # ---- FULL DATA metrics (now reward-weighted) ----
+            # ---- FULL DATA metrics (reward-weighted) ----
             trees = [seq for seq, _ in all_tuples if seq]
             if trees:
                 reward_env = copy.copy(env_template)
@@ -440,9 +422,7 @@ class Trainer:
         self.ensemble = [seq for seq, _ in all_tuples if seq] if 'all_tuples' in locals() else []
         tqdm.write(f"--- RF finished. Final forest size: {len(self.ensemble)} ---")
 
-    # ========================================================
-    # Boosting training (unchanged core logic)
-    # ========================================================
+    # ---------------- Boosting training ----------------
     def _fit_boost_gfn(self, env_template, y_true, X_binned, optimizers, schedulers):
         c = self.cfg
         tqdm.write("--- Starting Boost-GFN Training ---")
@@ -511,9 +491,7 @@ class Trainer:
                 else:
                     tqdm.write(f"Update {upd}/{c.updates} | TB: {avg_tb_loss:.4f} | FL: {avg_fl_loss:.4f} | Corr: nan")
 
-    # ========================================================
-    # Rollouts (policy can *close* a branch early via LEAF)
-    # ========================================================
+    # ---------------- Rollouts ----------------
     def _collect_rollouts(self, env_template, temp, residuals, beta):
         forward_tuples, done = [], 0
         ras_counts = {} if self.cfg.redundancy_aware else None
@@ -524,7 +502,6 @@ class Trainer:
                     ras_counts.clear()
                 batch = min(self.cfg.num_parallel, self.cfg.rollouts - done)
 
-                # --- FIX: draw disjoint/shuffled indices from the shared template ---
                 envs = [copy.copy(env_template) for _ in range(batch)]
                 idx_batches = [env_template.draw_indices(self.cfg.batch_size) for _ in range(batch)]
                 for env, idxs in zip(envs, idx_batches):
@@ -536,7 +513,6 @@ class Trainer:
 
                 results = self.batched_rollout(envs, temp, residuals, beta, ras_counts)
 
-                # compute reward per-seq now and store it in replay (improves sampling)
                 for res in results:
                     if not res:
                         continue
@@ -579,7 +555,6 @@ class Trainer:
         if not valid:
             return []
 
-        # combined importance weight = reward * backward-prob weight
         weights = np.array(
             [max(entries[i][0], 1e-9) * float(entries[i][4]) for i in valid],
             dtype=np.float32
@@ -605,19 +580,14 @@ class Trainer:
 
         return [(entries[i][1], entries[i][2]) for i in idxs]
 
-
     def batched_rollout(self, envs, temp, residuals, beta, ras_counts: Optional[dict] = None):
         """
         Rollouts with *feasible* actions only:
           • A feature is valid iff it has >=2 distinct bins on the leaf AND at least one threshold
             yields both children ≥ min_child_size (if configured).
           • Thresholds = unique bins observed on the leaf, excluding the max bin (i.e., u[:-1]).
-            Optionally filter thresholds by min_child_size.
+            Optionally filter thresholds by min_child_size. Always respect grammar [lo_f, hi_f].
         """
-        import copy
-        from collections import deque
-        import torch
-
         c, v, device = self.cfg, self.tokenizer.v, self.cfg.device
         num = len(envs)
         END_TOKEN  = v.EOS
@@ -631,7 +601,6 @@ class Trainer:
         depths: List[Deque[int]] = [deque([0]) for _ in range(num)]
         lo_stacks: List[Deque[torch.Tensor]] = [deque([torch.zeros(v.num_feat, dtype=torch.long, device=device)]) for _ in range(num)]
         hi_stacks: List[Deque[torch.Tensor]] = [deque([torch.full((v.num_feat,), v.num_th - 1, dtype=torch.long, device=device)]) for _ in range(num)]
-        # track which training rows belong to each open leaf (indices *relative to env.idxs*)
         row_stacks: List[Deque[torch.Tensor]] = [deque([torch.arange(envs[i].idxs.numel(), device=device)]) for i in range(num)]
 
         def _mark_done_if_finished(ti: int):
@@ -656,7 +625,7 @@ class Trainer:
                         if path in ras_counts:
                             last[bi, :] -= ras_counts[path] * 1e9
 
-                # ---------------- first decision: FEAT or LEAF ----------------
+                # ---- FEAT/LEAF decision ----
                 mask1 = torch.zeros((len(active), v.size()), dtype=torch.bool, device=device)
                 for bi, oidx in enumerate(active):
                     if not depths[oidx]:
@@ -665,13 +634,11 @@ class Trainer:
                     can_split = (d < c.max_depth)
 
                     rows_rel = row_stacks[oidx][-1]
-                    Xb = envs[oidx].X_full[envs[oidx].idxs]  # [B, F]
-                    Xleaf = Xb.index_select(0, rows_rel)     # [n_leaf, F]
+                    Xb = envs[oidx].X_full[envs[oidx].idxs]
+                    Xleaf = Xb.index_select(0, rows_rel)
 
                     valid_feats = []
                     if can_split and Xleaf.size(0) > 1:
-                        # feature is valid if it has at least two distinct bins in this leaf
-                        # AND (optional) some threshold respects min_child_size on both sides
                         n_leaf = Xleaf.size(0)
                         for f in range(Xleaf.size(1)):
                             bf = Xleaf[:, f]
@@ -679,20 +646,17 @@ class Trainer:
                             if uniq.numel() < 2:
                                 continue
                             if c.min_child_size and c.min_child_size > 1:
-                                # thresholds = uniq[:-1]; check if any makes both sides large enough
                                 csum = counts.cumsum(0)[:-1]
-                                left_ok  = csum >= c.min_child_size
-                                right_ok = (n_leaf - csum) >= c.min_child_size
-                                if not bool((left_ok & right_ok).any()):
+                                if not bool(((csum >= c.min_child_size) & ((n_leaf - csum) >= c.min_child_size)).any()):
                                     continue
                             valid_feats.append(f)
 
-                    # always allow LEAF
+                    # allow LEAF always
                     mask1[bi, LEAF_TOKEN] = True
                     if len(valid_feats) > 0:
                         feat_ids = v.split_start + torch.as_tensor(valid_feats, device=device, dtype=torch.long)
                         mask1[bi, feat_ids] = True
-                    mask1[bi, v.EOS] = False  # never end here; use LEAF to close a branch
+                    mask1[bi, v.EOS] = False  # never EOS here
 
                 toks1 = _safe_sample(last, mask1, temp)
 
@@ -724,7 +688,7 @@ class Trainer:
                     rows_rel = row_stacks[oidx].pop()
                     need_threshold.append((oidx, f_idx, d0, lo_top.clone(), hi_top.clone(), rows_rel.clone()))
 
-                # ---------------- second decision: THRESHOLD ----------------
+                # ---- THRESHOLD decision ----
                 if need_threshold:
                     sub_idx = [oidx for (oidx, *_) in need_threshold]
                     sub_pad = torch.nn.utils.rnn.pad_sequence(
@@ -748,15 +712,12 @@ class Trainer:
                         if uniq.numel() < 2:
                             continue
 
-                        # candidate thresholds are exactly the observed bins except the max one
-                        cand_t = uniq[:-1]  # e.g., for {0,99} -> {0}
+                        cand_t = uniq[:-1]
                         if c.min_child_size and c.min_child_size > 1:
-                            # keep only those that satisfy min_child_size on both sides
                             csum = counts.cumsum(0)[:-1]
                             keep = (csum >= c.min_child_size) & ((bf.numel() - csum) >= c.min_child_size)
                             cand_t = cand_t[keep]
 
-                        # also respect the current feasible [lo_f, hi_f] window enforced by grammar
                         lo_f = int(lo_top[f_idx].item())
                         hi_f = int(hi_top[f_idx].item())
                         if cand_t.numel() > 0:
@@ -779,20 +740,17 @@ class Trainer:
 
                         _, t_idx = self.tokenizer.decode_one(t_tok)
 
-                        # split rows by chosen t
                         Xb = envs[oidx].X_full[envs[oidx].idxs]
                         fv = Xb.index_select(0, rows_rel)[:, f_idx]
                         m = fv <= t_idx
                         rows_L = rows_rel[m]
                         rows_R = rows_rel[~m]
 
-                        # update feasible bin windows for children
                         lo_L, hi_L = lo_top.clone(), hi_top.clone()
                         hi_L[f_idx] = torch.minimum(hi_L[f_idx], torch.as_tensor(t_idx, device=device))
                         lo_R, hi_R = lo_top.clone(), hi_top.clone()
                         lo_R[f_idx] = torch.maximum(lo_R[f_idx], torch.as_tensor(t_idx + 1, device=device))
 
-                        # push children (R then L for LIFO)
                         depths[oidx].append(d0 + 1); lo_stacks[oidx].append(lo_R); hi_stacks[oidx].append(hi_R); row_stacks[oidx].append(rows_R)
                         depths[oidx].append(d0 + 1); lo_stacks[oidx].append(lo_L); hi_stacks[oidx].append(hi_L); row_stacks[oidx].append(rows_L)
 
@@ -814,11 +772,7 @@ class Trainer:
 
         return out
 
-
-
-    # ========================================================
-    # Predict
-    # ========================================================
+    # ---------------- Predict ----------------
     def predict(
         self,
         df_test: pd.DataFrame,
@@ -860,7 +814,7 @@ class Trainer:
             out.append(pred_fn(xb).to("cpu"))
         return torch.cat(out, dim=0)
 
-    # ---------------- RF inference ----------------
+    # ---- RF inference ----
     def _predict_random_forest(
         self,
         X_te, X_tr, y_tr, env_template, use_policy, policy_inference_trees,
@@ -883,7 +837,6 @@ class Trainer:
                 trees_in_batch = min(c.num_parallel, total_trees - len(trees_to_use))
                 if trees_in_batch <= 0:
                     break
-                # draw indices via shared sampler
                 envs = [copy.copy(env_template) for _ in range(trees_in_batch)]
                 idx_batches = [env_template.draw_indices(c.batch_size) for _ in range(trees_in_batch)]
                 for env, idxs in zip(envs, idx_batches):
@@ -937,7 +890,7 @@ class Trainer:
         preds = sum_preds / total_weight
         return torch.softmax(preds, dim=1) if c.task == "classification" else preds
 
-    # ---------------- Boost inference (sequential) ----------------
+    # ---- Boost inference (v12-style sequential) ----
     def _predict_boosting(
         self,
         X_te, X_tr, y_tr, env_template, use_policy, policy_inference_trees,
@@ -953,82 +906,60 @@ class Trainer:
             test_preds  = torch.full((len(X_te),), self.y_mean, device=device, dtype=torch.float32)
             train_preds = torch.full_like(y_tr, self.y_mean, dtype=torch.float32, device=device)
 
-        if not use_policy:
-            # fallback: use stored ensemble as-is
-            for fn in tqdm(self.boosting_ensemble, desc="Ensemble Prediction", leave=False):
-                test_preds += c.boosting_lr * fn(X_te)
-            return torch.softmax(test_preds, dim=1) if c.task == "classification" else test_preds
+        if use_policy:
+            tqdm.write("--- Generating Boosting Ensemble with Policy (Sequential Inference) ---")
+            total_trees = policy_inference_trees if policy_inference_trees is not None else c.updates
+            num_batches = math.ceil(total_trees / c.num_parallel)
 
-        tqdm.write("--- Generating Boosting Ensemble with Policy (Sequential Inference / v12 style) ---")
-        total_trees = policy_inference_trees if policy_inference_trees is not None else c.updates
-        num_batches = math.ceil(total_trees / c.num_parallel)
-
-        # 1) residuals for candidate generation (computed once)
-        if c.task == "classification":
-            residuals = (
-                torch.nn.functional.one_hot(y_tr, num_classes=c.n_classes).to(torch.float)
-                - torch.softmax(train_preds, dim=1)
-            )
-        else:
-            residuals = y_tr - train_preds
-
-        env_template.y = residuals.clone().to(device)
-
-        # 2) generate all candidates from current residuals
-        candidate_trees: List[List[int]] = []
-        for _ in tqdm(range(num_batches), desc="Policy-based Tree Generation", leave=False):
-            envs = [copy.copy(env_template) for _ in range(c.num_parallel)]
-            # rely on env.reset() sampling inside batched_rollout (v12 behavior)
-            res = self.batched_rollout(
-                envs,
-                temp=c.rollout_temperature,
-                residuals=residuals,
-                beta=c.beta,
-                ras_counts=({} if c.redundancy_aware else None),
-            )
-            candidate_trees.extend([r[0] for r in res if r])
-
-        # 3) walk candidates sequentially, recomputing residuals before each add
-        infer_reward = (c.infer_reward_function if infer_reward is None else infer_reward)
-        for seq in tqdm(candidate_trees, desc="Sequential Boosting Prediction", leave=False):
-            # refresh residuals wrt *current* train_preds
+            # residuals at current base
             if c.task == "classification":
-                residuals = (
-                    torch.nn.functional.one_hot(y_tr, num_classes=c.n_classes).to(torch.float)
-                    - torch.softmax(train_preds, dim=1)
-                )
+                residuals = torch.nn.functional.one_hot(y_tr, num_classes=c.n_classes).to(torch.float) - torch.softmax(train_preds, dim=1)
             else:
                 residuals = y_tr - train_preds
 
-            # build tree predictor on the CURRENT residuals
-            pred = get_tree_predictor(
-                seq, X_tr, residuals, self.tokenizer,
-                min_child_size=c.min_child_size, min_gain=c.min_gain,
-                predictor_mode=(policy_predictor_mode or c.policy_predictor_mode)
-            )
-            contrib_tr = pred(X_tr)
-            contrib_te = pred(X_te)
+            env_template.y = residuals.clone().to(device)
 
-            # optional inference-time weighting (keep to v12: only variance for regression)
-            if infer_reward in (None, "none"):
-                w = 1.0
-            elif infer_reward == "variance" and c.task == "regression":
-                tok = torch.tensor([seq], device=device, dtype=torch.long)
-                # score with *current* residuals
-                reward_env = copy.copy(env_template)
-                reward_env.y = residuals.clone().to(device)
-                w = float(torch.clamp(deltaE_split_gain_regression(tok, self.tokenizer, reward_env).sum(), min=1e-9).item())
-            else:
-                w = 1.0
+            candidate_trees: List[List[int]] = []
+            for _ in tqdm(range(num_batches), desc="Policy-based Tree Generation", leave=False):
+                envs = [copy.copy(env_template) for _ in range(c.num_parallel)]
+                idx_batches = [env_template.draw_indices(c.batch_size) for _ in range(c.num_parallel)]
+                for env, idxs in zip(envs, idx_batches):
+                    env.paths = []; env.open_leaves = 1; env.done = False; env.idxs = idxs
+                res = self.batched_rollout(
+                    envs, temp=c.rollout_temperature, residuals=residuals, beta=c.beta, ras_counts=({} if c.redundancy_aware else None)
+                )
+                candidate_trees.extend([r[0] for r in res if r])
 
-            train_preds += c.boosting_lr * (w * contrib_tr)
-            test_preds  += c.boosting_lr * (w * contrib_te)
+            infer_reward = (c.infer_reward_function if infer_reward is None else infer_reward)
+
+            for seq in tqdm(candidate_trees, desc="Sequential Boosting Prediction", leave=False):
+                if c.task == "classification":
+                    residuals = torch.nn.functional.one_hot(y_tr, num_classes=c.n_classes).to(torch.float) - torch.softmax(train_preds, dim=1)
+                else:
+                    residuals = y_tr - train_preds
+
+                pred = get_tree_predictor(
+                    seq, X_tr, residuals, self.tokenizer,
+                    min_child_size=c.min_child_size, min_gain=c.min_gain,
+                    predictor_mode=(policy_predictor_mode or c.policy_predictor_mode)
+                )
+                contrib_tr = pred(X_tr)
+                contrib_te = pred(X_te)
+
+                if infer_reward in (None, "none"):
+                    w = 1.0
+                elif infer_reward == 'variance' and c.task == "regression":
+                    tok = torch.tensor([seq], device=device, dtype=torch.long)
+                    dR = deltaE_split_gain_regression(tok, self.tokenizer, env_template)
+                    w = float(torch.clamp(dR.sum(), min=1e-9).item())
+                else:
+                    w = 1.0
+
+                train_preds += c.boosting_lr * (w * contrib_tr)
+                test_preds  += c.boosting_lr * (w * contrib_te)
+
+        else:
+            for fn in tqdm(self.boosting_ensemble, desc="Ensemble Prediction", leave=False):
+                test_preds += c.boosting_lr * fn(X_te)
 
         return torch.softmax(test_preds, dim=1) if c.task == "classification" else test_preds
-
-
-    # sklearn compat
-    def get_params(self, deep=True): return asdict(self.cfg)
-    def set_params(self, **params):
-        for k, v in params.items(): setattr(self.cfg, k, v)
-        return self
