@@ -608,17 +608,31 @@ class Trainer:
 
     def batched_rollout(self, envs, temp, residuals, beta, ras_counts: Optional[dict] = None):
         """
-        Grammar-correct tree generation with *policy-chosen* early leaf closure.
+        Rollouts with *feasible* actions only:
+          • A feature is valid iff it has >=2 distinct bins on the leaf AND at least one threshold
+            yields both children ≥ min_child_size (if configured).
+          • Thresholds = unique bins observed on the leaf, excluding the max bin (i.e., u[:-1]).
+            Optionally filter thresholds by min_child_size.
         """
+        import copy
+        from collections import deque
+        import torch
+
         c, v, device = self.cfg, self.tokenizer.v, self.cfg.device
         num = len(envs)
         END_TOKEN  = v.EOS
         LEAF_TOKEN = self.tokenizer._leaf(0)
 
+        for env in envs:
+            env.y = residuals
+            env.reset(c.batch_size)
+
         seqs = [[v.BOS] for _ in range(num)]
         depths: List[Deque[int]] = [deque([0]) for _ in range(num)]
         lo_stacks: List[Deque[torch.Tensor]] = [deque([torch.zeros(v.num_feat, dtype=torch.long, device=device)]) for _ in range(num)]
         hi_stacks: List[Deque[torch.Tensor]] = [deque([torch.full((v.num_feat,), v.num_th - 1, dtype=torch.long, device=device)]) for _ in range(num)]
+        # track which training rows belong to each open leaf (indices *relative to env.idxs*)
+        row_stacks: List[Deque[torch.Tensor]] = [deque([torch.arange(envs[i].idxs.numel(), device=device)]) for i in range(num)]
 
         def _mark_done_if_finished(ti: int):
             if not depths[ti]:
@@ -642,23 +656,47 @@ class Trainer:
                         if path in ras_counts:
                             last[bi, :] -= ras_counts[path] * 1e9
 
+                # ---------------- first decision: FEAT or LEAF ----------------
                 mask1 = torch.zeros((len(active), v.size()), dtype=torch.bool, device=device)
                 for bi, oidx in enumerate(active):
                     if not depths[oidx]:
                         continue
                     d = depths[oidx][-1]
-                    lo_top, hi_top = lo_stacks[oidx][-1], hi_stacks[oidx][-1]
                     can_split = (d < c.max_depth)
-                    valid_feats = (lo_top <= hi_top).nonzero(as_tuple=False).flatten() if can_split else torch.empty(0, dtype=torch.long, device=device)
-                    mask1[bi, LEAF_TOKEN] = True  # allow closing
-                    if valid_feats.numel() > 0:
-                        feat_ids = v.split_start + valid_feats
+
+                    rows_rel = row_stacks[oidx][-1]
+                    Xb = envs[oidx].X_full[envs[oidx].idxs]  # [B, F]
+                    Xleaf = Xb.index_select(0, rows_rel)     # [n_leaf, F]
+
+                    valid_feats = []
+                    if can_split and Xleaf.size(0) > 1:
+                        # feature is valid if it has at least two distinct bins in this leaf
+                        # AND (optional) some threshold respects min_child_size on both sides
+                        n_leaf = Xleaf.size(0)
+                        for f in range(Xleaf.size(1)):
+                            bf = Xleaf[:, f]
+                            uniq, counts = torch.unique(bf, return_counts=True)
+                            if uniq.numel() < 2:
+                                continue
+                            if c.min_child_size and c.min_child_size > 1:
+                                # thresholds = uniq[:-1]; check if any makes both sides large enough
+                                csum = counts.cumsum(0)[:-1]
+                                left_ok  = csum >= c.min_child_size
+                                right_ok = (n_leaf - csum) >= c.min_child_size
+                                if not bool((left_ok & right_ok).any()):
+                                    continue
+                            valid_feats.append(f)
+
+                    # always allow LEAF
+                    mask1[bi, LEAF_TOKEN] = True
+                    if len(valid_feats) > 0:
+                        feat_ids = v.split_start + torch.as_tensor(valid_feats, device=device, dtype=torch.long)
                         mask1[bi, feat_ids] = True
-                    mask1[bi, v.EOS] = False
+                    mask1[bi, v.EOS] = False  # never end here; use LEAF to close a branch
 
-                toks1 = _safe_sample(last, mask1, temp, eos_id=v.EOS)
+                toks1 = _safe_sample(last, mask1, temp)
 
-                need_threshold: List[Tuple[int,int,int,torch.Tensor,torch.Tensor]] = []
+                need_threshold: List[Tuple[int,int,int,torch.Tensor,torch.Tensor,torch.Tensor]] = []
                 still_for_round: List[int] = []
                 for bi, oidx in enumerate(active):
                     tok = toks1[bi].item()
@@ -673,7 +711,7 @@ class Trainer:
 
                     if tok == LEAF_TOKEN:
                         envs[oidx].step(('leaf', 0))
-                        depths[oidx].pop(); lo_stacks[oidx].pop(); hi_stacks[oidx].pop()
+                        depths[oidx].pop(); lo_stacks[oidx].pop(); hi_stacks[oidx].pop(); row_stacks[oidx].pop()
                         _mark_done_if_finished(oidx)
                         if not envs[oidx].done:
                             still_for_round.append(oidx)
@@ -681,13 +719,14 @@ class Trainer:
 
                     kind, f_idx = self.tokenizer.decode_one(tok)  # 'feat'
                     envs[oidx].step((kind, f_idx))
-
                     d0 = depths[oidx].pop()
                     lo_top, hi_top = lo_stacks[oidx].pop(), hi_stacks[oidx].pop()
-                    need_threshold.append((oidx, f_idx, d0, lo_top.clone(), hi_top.clone()))
+                    rows_rel = row_stacks[oidx].pop()
+                    need_threshold.append((oidx, f_idx, d0, lo_top.clone(), hi_top.clone(), rows_rel.clone()))
 
+                # ---------------- second decision: THRESHOLD ----------------
                 if need_threshold:
-                    sub_idx = [oidx for (oidx, _, _, _, _) in need_threshold]
+                    sub_idx = [oidx for (oidx, *_) in need_threshold]
                     sub_pad = torch.nn.utils.rnn.pad_sequence(
                         [torch.tensor(seqs[i], device=device) for i in sub_idx],
                         batch_first=True, padding_value=v.PAD
@@ -697,18 +736,42 @@ class Trainer:
 
                     mask2 = torch.zeros((len(sub_idx), v.size()), dtype=torch.bool, device=device)
                     th_base = v.split_start + v.num_feat
-                    for si, (oidx, f_idx, d0, lo_top, hi_top) in enumerate(need_threshold):
+
+                    for si, (oidx, f_idx, d0, lo_top, hi_top, rows_rel) in enumerate(need_threshold):
+                        Xb = envs[oidx].X_full[envs[oidx].idxs]
+                        bf = Xb.index_select(0, rows_rel)[:, f_idx]
+
+                        if bf.numel() == 0:
+                            continue
+
+                        uniq, counts = torch.unique(bf, sorted=True, return_counts=True)
+                        if uniq.numel() < 2:
+                            continue
+
+                        # candidate thresholds are exactly the observed bins except the max one
+                        cand_t = uniq[:-1]  # e.g., for {0,99} -> {0}
+                        if c.min_child_size and c.min_child_size > 1:
+                            # keep only those that satisfy min_child_size on both sides
+                            csum = counts.cumsum(0)[:-1]
+                            keep = (csum >= c.min_child_size) & ((bf.numel() - csum) >= c.min_child_size)
+                            cand_t = cand_t[keep]
+
+                        # also respect the current feasible [lo_f, hi_f] window enforced by grammar
                         lo_f = int(lo_top[f_idx].item())
                         hi_f = int(hi_top[f_idx].item())
-                        if lo_f <= hi_f:
-                            th_ids = th_base + torch.arange(lo_f, hi_f + 1, device=device)
+                        if cand_t.numel() > 0:
+                            cand_t = cand_t[(cand_t >= lo_f) & (cand_t <= hi_f)]
+
+                        if cand_t.numel() > 0:
+                            th_ids = th_base + cand_t.to(device=device, dtype=torch.long)
                             mask2[si, th_ids] = True
+
                         mask2[si, v.EOS] = False
                         mask2[si, self.tokenizer._leaf(0)] = False
 
-                    toks2 = _safe_sample(last_th, mask2, temp, eos_id=v.EOS)
+                    toks2 = _safe_sample(last_th, mask2, temp)
 
-                    for si, (oidx, f_idx, d0, lo_top, hi_top) in enumerate(need_threshold):
+                    for si, (oidx, f_idx, d0, lo_top, hi_top, rows_rel) in enumerate(need_threshold):
                         t_tok = toks2[si].item()
                         seqs[oidx].append(t_tok)
                         if ras_counts is not None:
@@ -716,13 +779,22 @@ class Trainer:
 
                         _, t_idx = self.tokenizer.decode_one(t_tok)
 
+                        # split rows by chosen t
+                        Xb = envs[oidx].X_full[envs[oidx].idxs]
+                        fv = Xb.index_select(0, rows_rel)[:, f_idx]
+                        m = fv <= t_idx
+                        rows_L = rows_rel[m]
+                        rows_R = rows_rel[~m]
+
+                        # update feasible bin windows for children
                         lo_L, hi_L = lo_top.clone(), hi_top.clone()
                         hi_L[f_idx] = torch.minimum(hi_L[f_idx], torch.as_tensor(t_idx, device=device))
                         lo_R, hi_R = lo_top.clone(), hi_top.clone()
                         lo_R[f_idx] = torch.maximum(lo_R[f_idx], torch.as_tensor(t_idx + 1, device=device))
 
-                        depths[oidx].append(d0 + 1); lo_stacks[oidx].append(lo_R); hi_stacks[oidx].append(hi_R)
-                        depths[oidx].append(d0 + 1); lo_stacks[oidx].append(lo_L); hi_stacks[oidx].append(hi_L)
+                        # push children (R then L for LIFO)
+                        depths[oidx].append(d0 + 1); lo_stacks[oidx].append(lo_R); hi_stacks[oidx].append(hi_R); row_stacks[oidx].append(rows_R)
+                        depths[oidx].append(d0 + 1); lo_stacks[oidx].append(lo_L); hi_stacks[oidx].append(hi_L); row_stacks[oidx].append(rows_L)
 
                         envs[oidx].step(('th', int(t_idx)))
                         if depths[oidx]:
@@ -741,6 +813,8 @@ class Trainer:
                 out[i] = None
 
         return out
+
+
 
     # ========================================================
     # Predict
