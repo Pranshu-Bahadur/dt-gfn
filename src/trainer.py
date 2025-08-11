@@ -953,54 +953,79 @@ class Trainer:
             test_preds  = torch.full((len(X_te),), self.y_mean, device=device, dtype=torch.float32)
             train_preds = torch.full_like(y_tr, self.y_mean, dtype=torch.float32, device=device)
 
-        if use_policy:
-            tqdm.write("--- Generating Boosting Ensemble with Policy (Sequential Inference) ---")
-            total_trees = policy_inference_trees if policy_inference_trees is not None else c.updates
-
-            for _ in tqdm(range(total_trees), desc="Sequential Boosting Prediction", leave=False):
-                # recompute residuals using current train_preds
-                if c.task == "classification":
-                    residuals = torch.nn.functional.one_hot(y_tr, num_classes=c.n_classes).to(torch.float) - torch.softmax(train_preds, dim=1)
-                else:
-                    residuals = y_tr - train_preds
-
-                env_template.y = residuals.clone().to(device)
-
-                # generate small candidate set on *current* residuals
-                envs = [copy.copy(env_template) for _ in range(c.num_parallel)]
-                idx_batches = [env_template.draw_indices(c.batch_size) for _ in range(c.num_parallel)]
-                for env, idxs in zip(envs, idx_batches):
-                    env.paths = []; env.open_leaves = 1; env.done = False; env.idxs = idxs
-
-                res = self.batched_rollout(
-                    envs, temp=c.rollout_temperature, residuals=residuals, beta=c.beta,
-                    ras_counts=({} if c.redundancy_aware else None)
-                )
-                candidate_trees = [r[0] for r in res if r]
-                if not candidate_trees:
-                    continue
-
-                # pick first (or add scoring here to pick best)
-                seq = candidate_trees[0]
-
-                pred = get_tree_predictor(
-                    seq, X_tr, residuals, self.tokenizer,
-                    min_child_size=c.min_child_size, min_gain=c.min_gain,
-                    predictor_mode=(policy_predictor_mode or c.policy_predictor_mode)
-                )
-                contrib_tr = pred(X_tr)
-                contrib_te = pred(X_te)
-
-                # simple weighting
-                w = 1.0
-                train_preds += c.boosting_lr * (w * contrib_tr)
-                test_preds  += c.boosting_lr * (w * contrib_te)
-
-        else:
+        if not use_policy:
+            # fallback: use stored ensemble as-is
             for fn in tqdm(self.boosting_ensemble, desc="Ensemble Prediction", leave=False):
                 test_preds += c.boosting_lr * fn(X_te)
+            return torch.softmax(test_preds, dim=1) if c.task == "classification" else test_preds
+
+        tqdm.write("--- Generating Boosting Ensemble with Policy (Sequential Inference / v12 style) ---")
+        total_trees = policy_inference_trees if policy_inference_trees is not None else c.updates
+        num_batches = math.ceil(total_trees / c.num_parallel)
+
+        # 1) residuals for candidate generation (computed once)
+        if c.task == "classification":
+            residuals = (
+                torch.nn.functional.one_hot(y_tr, num_classes=c.n_classes).to(torch.float)
+                - torch.softmax(train_preds, dim=1)
+            )
+        else:
+            residuals = y_tr - train_preds
+
+        env_template.y = residuals.clone().to(device)
+
+        # 2) generate all candidates from current residuals
+        candidate_trees: List[List[int]] = []
+        for _ in tqdm(range(num_batches), desc="Policy-based Tree Generation", leave=False):
+            envs = [copy.copy(env_template) for _ in range(c.num_parallel)]
+            # rely on env.reset() sampling inside batched_rollout (v12 behavior)
+            res = self.batched_rollout(
+                envs,
+                temp=c.rollout_temperature,
+                residuals=residuals,
+                beta=c.beta,
+                ras_counts=({} if c.redundancy_aware else None),
+            )
+            candidate_trees.extend([r[0] for r in res if r])
+
+        # 3) walk candidates sequentially, recomputing residuals before each add
+        infer_reward = (c.infer_reward_function if infer_reward is None else infer_reward)
+        for seq in tqdm(candidate_trees, desc="Sequential Boosting Prediction", leave=False):
+            # refresh residuals wrt *current* train_preds
+            if c.task == "classification":
+                residuals = (
+                    torch.nn.functional.one_hot(y_tr, num_classes=c.n_classes).to(torch.float)
+                    - torch.softmax(train_preds, dim=1)
+                )
+            else:
+                residuals = y_tr - train_preds
+
+            # build tree predictor on the CURRENT residuals
+            pred = get_tree_predictor(
+                seq, X_tr, residuals, self.tokenizer,
+                min_child_size=c.min_child_size, min_gain=c.min_gain,
+                predictor_mode=(policy_predictor_mode or c.policy_predictor_mode)
+            )
+            contrib_tr = pred(X_tr)
+            contrib_te = pred(X_te)
+
+            # optional inference-time weighting (keep to v12: only variance for regression)
+            if infer_reward in (None, "none"):
+                w = 1.0
+            elif infer_reward == "variance" and c.task == "regression":
+                tok = torch.tensor([seq], device=device, dtype=torch.long)
+                # score with *current* residuals
+                reward_env = copy.copy(env_template)
+                reward_env.y = residuals.clone().to(device)
+                w = float(torch.clamp(deltaE_split_gain_regression(tok, self.tokenizer, reward_env).sum(), min=1e-9).item())
+            else:
+                w = 1.0
+
+            train_preds += c.boosting_lr * (w * contrib_tr)
+            test_preds  += c.boosting_lr * (w * contrib_te)
 
         return torch.softmax(test_preds, dim=1) if c.task == "classification" else test_preds
+
 
     # sklearn compat
     def get_params(self, deep=True): return asdict(self.cfg)
