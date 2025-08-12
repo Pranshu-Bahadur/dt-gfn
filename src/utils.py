@@ -575,12 +575,9 @@ def get_tree_predictor(
                     out[idxs] = n['val']
             return out
     return predict
-
-
 # ============================================================
 # Replay Buffer
 # ============================================================
-
 class ReplayBuffer:
     def __init__(self, capacity: int = 10000):
         self.capacity = capacity
@@ -612,20 +609,105 @@ def _safe_sample(logits: torch.Tensor,
                  mask: torch.Tensor,
                  temperature: float = 1.0,
                  eos_id: int = 2) -> torch.Tensor:
-    """
-    Apply mask and temperature, then sample multinomially.
-    If all tokens are masked on a row, force EOS to be selectable.
-    """
     logits = logits.masked_fill(~mask, -float("inf"))
     all_masked = (~mask).all(dim=-1)
     if all_masked.any():
         logits[all_masked, eos_id] = 0.0
-
     if temperature is not None and temperature > EPS:
         logits = logits / temperature
-
     probs = F.softmax(logits, dim=-1)
     return torch.multinomial(probs, 1).squeeze(1)
+
+# ============================================================
+# Optional: uniform backward log-prob surrogate
+# ============================================================
+
+@torch.no_grad()
+def uniform_backward_log_prob(padded_seq: torch.Tensor, tok, max_depth: int) -> torch.Tensor:
+    """
+    Approximate teacher-forced backward log-probabilities assuming a
+    UNIFORM policy over the *forward* grammar’s valid actions.
+
+    This ignores data-dependent feasibility and only enforces:
+      • max depth,
+      • feature window feasibility via (lo, hi) thresholds,
+      • LEAF is forbidden at root unless no split is possible.
+
+    Returns: (B, T-1) float32 with zeros at EOS and PAD.
+    """
+    seq = padded_seq  # (B, T) long
+    B, T = seq.shape
+    device = seq.device
+    v = tok.v
+    PAD, EOS, LEAF = int(v.PAD), int(v.EOS), int(tok._leaf(0))
+
+    out = torch.zeros((B, T - 1), device=device, dtype=torch.float32)
+
+    for b in range(B):
+        s = seq[b]
+
+        depth_stack = [0]
+        lo_stack = [torch.zeros(v.num_feat, dtype=torch.long, device=device)]
+        hi_stack = [torch.full((v.num_feat,), v.num_th - 1, dtype=torch.long, device=device)]
+        pending = None  # (depth, lo_top, hi_top, f_idx)
+
+        for t in range(T - 1):
+            nxt = int(s[t + 1].item())
+
+            if nxt == PAD:
+                break
+            if nxt == EOS:
+                break
+            if len(depth_stack) == 0:
+                out[b, t] = 0.0
+                continue
+
+            if pending is None:
+                # Feature/Leaf decision
+                d = depth_stack[-1]
+                root = (d == 0)
+                lo_top = lo_stack[-1]
+                hi_top = hi_stack[-1]
+                can_split = (d < max_depth)
+                valid_feats = (lo_top <= hi_top).nonzero(as_tuple=False).flatten()
+                can_close = (not root) or (not can_split) or (valid_feats.numel() == 0)
+                count = int(valid_feats.numel()) + (1 if can_close else 0)
+                if count <= 0:
+                    count = 1
+                out[b, t] = -math.log(count)
+
+                if nxt == LEAF:
+                    depth_stack.pop(); lo_stack.pop(); hi_stack.pop()
+                else:
+                    _, f_idx = tok.decode_one(nxt)
+                    depth = depth_stack.pop()
+                    lo_t = lo_stack.pop()
+                    hi_t = hi_stack.pop()
+                    pending = (depth, lo_t.clone(), hi_t.clone(), int(f_idx))
+            else:
+                # Threshold decision
+                depth, lo_top, hi_top, f_idx = pending
+                lo_f = int(lo_top[f_idx].item())
+                hi_f = int(hi_top[f_idx].item())
+                count = max(0, hi_f - lo_f + 1)
+                if count <= 0:
+                    count = 1
+                out[b, t] = -math.log(count)
+
+                _, t_idx = tok.decode_one(nxt)
+                t_idx = int(t_idx)
+
+                lo_L, hi_L = lo_top.clone(), hi_top.clone()
+                hi_L[f_idx] = min(hi_L[f_idx].item(), t_idx)
+                lo_R, hi_R = lo_top.clone(), hi_top.clone()
+                lo_R[f_idx] = max(lo_R[f_idx].item(), t_idx + 1)
+
+                depth_stack.append(depth + 1); lo_stack.append(lo_R); hi_stack.append(hi_R)
+                depth_stack.append(depth + 1); lo_stack.append(lo_L); hi_stack.append(hi_L)
+
+                pending = None
+
+    return out
 
 # ============================================================
 # Optional token prior (gain bias)
@@ -637,9 +719,7 @@ def create_gain_bias(df_train: pd.DataFrame,
                      tok: "Tokenizer",
                      bins: int,
                      prior_scale: float = 0.5) -> torch.Tensor:
-    """
-    LightGBM mining to produce a token prior over feature/threshold tokens.
-    """
+    # (unchanged; keep your original implementation)
     df_sample = df_train.sample(n=min(len(df_train), 200_000), random_state=42)
     X_binned_list = []
     for f in feats:

@@ -1,19 +1,22 @@
+# src/env.py
 from __future__ import annotations
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
+
+import math
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+from sklearn.preprocessing import LabelEncoder
+
 
 class TabularEnv:
     """
-    A tabular decision-tree environment for GFN rollouts.
-
-    Grammar accounting:
-      - 'feat'   : choose a feature for the CURRENT open leaf (no change)
-      - 'th'     : choose a threshold; split 1 open leaf into 2  -> open_leaves += 1
-      - 'leaf'   : close the CURRENT open leaf                   -> open_leaves -= 1
-      - done     : when open_leaves == 0 (or a hard safety cap)
+    Environment wrapper that:
+      • fits per-feature binning on train,
+      • treats 0/1 (or ≤2-unique) columns as binary,
+      • exposes per-feature effective bins (for threshold constraints),
+      • provides X_full (binned) and y_full tensors,
+      • supplies small helpers used by rollouts/rewards (draw_indices/reset/step/prior).
     """
 
     def __init__(
@@ -22,167 +25,187 @@ class TabularEnv:
         feature_cols: List[str],
         target_col: str,
         n_bins: int,
-        task: str = "regression",
+        task: str,
+        binning_strategy: str = "quantile",   # "quantile" | "global_uniform"
         device: str = "cpu",
-        shuffle_on_reset: bool = True,
-        binning_strategy: str = "global_uniform"  # "quantile" | "global_uniform"
     ):
-        self.device = device
-        self.feature_cols = feature_cols
-        self.target_col = target_col
-        self.n_bins = n_bins
+        assert task in ("classification", "regression")
+        self.device = torch.device(device)
         self.task = task
-        self.shuffle_on_reset = shuffle_on_reset
+        self.feature_cols = list(feature_cols)
+        self.target_col = target_col
+        self.n_bins = int(n_bins)
         self.binning_strategy = binning_strategy
-        self.le: Optional[LabelEncoder] = None
-        self.n_classes: Optional[int] = None
 
-        self.feature_scaler: Optional[MinMaxScaler] = None
-
-        # Featurize on init
-        self.X_full = self._featurise(df_train, df_train, feature_cols, n_bins)
-
-        if self.task == "classification":
+        # label-encode y if classification
+        if task == "classification":
             self.le = LabelEncoder()
-            y_encoded = self.le.fit_transform(df_train[target_col].values)
-            self.y_full = torch.tensor(y_encoded, dtype=torch.long, device=device)
-            self.n_classes = int(self.y_full.max().item()) + 1
+            y_np = self.le.fit_transform(df_train[target_col].to_numpy())
+            self.n_classes = int(np.max(y_np)) + 1
+            self.y_full = torch.as_tensor(y_np, device=self.device, dtype=torch.long)
         else:
-            self.y_full = torch.tensor(df_train[target_col].values, dtype=torch.float32, device=device)
-            self.n_classes = 1
+            self.le = None
+            self.n_classes = None
+            y_np = df_train[target_col].to_numpy(dtype=np.float32)
+            self.y_full = torch.as_tensor(y_np, device=self.device, dtype=torch.float32)
 
-        # working target (overridable by trainer: residuals, etc.)
-        self.y = self.y_full.clone()
+        # fit bin edges on train (per feature)
+        self.bin_edges, self.per_feat_bins, self.binary_mask = self._fit_bin_edges(df_train[self.feature_cols])
 
-        # master index pool (shuffled by draw_indices if requested)
-        self._master_indices = torch.arange(len(self.y_full), device=device)
-        self._ptr: int = 0
+        # bin X_train
+        Xb = self._bin_dataframe(df_train[self.feature_cols])
+        self.X_full = torch.as_tensor(Xb, device=self.device, dtype=torch.long)
 
-        # rollout state
-        self.paths: List[Tuple[str, int]] = []
+        # rolling state for rollout/prior
+        self.paths: List = []
         self.open_leaves: int = 1
         self.done: bool = False
-        self.idxs: torch.Tensor = self._master_indices
+        self.idxs: torch.Tensor = torch.arange(self.X_full.size(0), device=self.device)
+        self._n_splits: int = 0
 
-        # safety cap on emitted tokens to avoid runaway sequences
-        self._max_tokens: int = 8192
+    # ------------------------------------------------------------------
+    # Binning
+    # ------------------------------------------------------------------
+    def _fit_bin_edges(self, Xdf: pd.DataFrame) -> Tuple[List[torch.Tensor], torch.LongTensor, torch.BoolTensor]:
+        """
+        Build per-feature bin edges. For binary/2-unique columns, fix to 2 bins with edge 0.5.
+        For continuous, use quantiles or global uniform. Return:
+          - bin_edges: list of 1D tensors of cutpoints (length = bins-1 for that feature)
+          - per_feat_bins: LongTensor of effective bins per feature
+          - binary_mask: BoolTensor marking features treated as binary
+        """
+        edges: List[torch.Tensor] = []
+        eff_bins: List[int] = []
+        binary_mask: List[bool] = []
 
-    # -----------------------------
-    # Shared index sampler (FIX)
-    # -----------------------------
+        Xnp = Xdf.to_numpy(copy=False)
+        N, D = Xnp.shape
+
+        for j, col in enumerate(Xdf.columns):
+            x = Xnp[:, j]
+            x = x[~np.isnan(x)]
+            uniq = np.unique(x)
+
+            # binary / two-unique detection
+            is_binary = False
+            if uniq.size <= 2:
+                # common 0/1, but also handles any two distinct values cleanly
+                is_binary = True
+            # also treat strict 0/1 as binary even if typed oddly
+            if set(np.unique(Xdf[col].dropna().astype(float))) <= {0.0, 1.0}:
+                is_binary = True
+
+            if is_binary:
+                # two bins, single cut at 0.5 (works for {0,1} or {a,b} after normalization)
+                cut = torch.tensor([0.5], dtype=torch.float32)
+                edges.append(cut)
+                eff_bins.append(2)
+                binary_mask.append(True)
+                continue
+
+            # non-binary continuous
+            if self.binning_strategy == "global_uniform":
+                lo = float(np.nanmin(x)) if x.size > 0 else 0.0
+                hi = float(np.nanmax(x)) if x.size > 0 else lo + 1.0
+                if not np.isfinite(lo) or not np.isfinite(hi):
+                    lo, hi = 0.0, 1.0
+                if hi <= lo:
+                    # nearly constant
+                    edges.append(torch.tensor([lo], dtype=torch.float32))
+                    eff_bins.append(1)
+                    binary_mask.append(False)
+                else:
+                    # build n_bins uniform bins
+                    cuts = np.linspace(lo, hi, num=self.n_bins + 1, endpoint=True)[1:-1]
+                    cuts = np.unique(cuts)
+                    if cuts.size == 0:
+                        cuts = np.array([lo + 1e-6], dtype=np.float32)
+                    edges.append(torch.from_numpy(cuts.astype(np.float32)))
+                    eff_bins.append(int(cuts.size + 1))
+                    binary_mask.append(False)
+            else:
+                # quantile binning
+                qs = np.linspace(0.0, 1.0, num=self.n_bins + 1, endpoint=True)
+                qv = np.quantile(x, qs, method="linear") if x.size > 0 else np.linspace(0.0, 1.0, self.n_bins + 1)
+                cuts = np.unique(qv[1:-1])  # remove endpoints
+                if cuts.size == 0:
+                    # fallback: treat as constant with one bin
+                    cuts = np.array([qv[0]], dtype=np.float32)
+                edges.append(torch.from_numpy(cuts.astype(np.float32)))
+                eff_bins.append(int(cuts.size + 1))
+                binary_mask.append(False)
+
+        per_feat_bins = torch.as_tensor(eff_bins, dtype=torch.long)
+        binary_mask_t = torch.as_tensor(binary_mask, dtype=torch.bool)
+        return edges, per_feat_bins, binary_mask_t
+
+    def _bucketize_col(self, x: np.ndarray, cutpoints: torch.Tensor, is_binary: bool) -> np.ndarray:
+        """
+        x: 1D numpy array
+        cutpoints: 1D torch tensor of cut thresholds (length B-1)
+        return: int64 bin ids in [0..B-1]
+        """
+        if is_binary:
+            # Fast path: anything > 0.5 goes to bin 1
+            out = (x > 0.5).astype(np.int64)
+            return out
+
+        cp = cutpoints.cpu().numpy()
+        # np.digitize assigns 0..len(cp) by comparing against cp (strict > when right=False)
+        # We want bins 0..B-1
+        out = np.digitize(x, cp, right=False).astype(np.int64)
+        return out
+
+    def _bin_dataframe(self, df: pd.DataFrame) -> np.ndarray:
+        Xnp = df.to_numpy(copy=False)
+        D = Xnp.shape[1]
+        out = np.empty_like(Xnp, dtype=np.int64)
+        for j in range(D):
+            out[:, j] = self._bucketize_col(Xnp[:, j], self.bin_edges[j], bool(self.binary_mask[j]))
+        return out
+
+    # ------------------------------------------------------------------
+    # Public helpers used by Trainer
+    # ------------------------------------------------------------------
+    def _featurise(self, df_new: pd.DataFrame, df_fit: pd.DataFrame, feature_cols: List[str], n_bins: int) -> torch.Tensor:
+        """
+        Featurise a new dataframe with the *fitted* bin edges.
+        """
+        X_new = df_new[self.feature_cols]
+        Xb = self._bin_dataframe(X_new)
+        return torch.as_tensor(Xb, device=self.device, dtype=torch.long)
+
+    # rollout sampling helper
     def draw_indices(self, batch_size: int) -> torch.Tensor:
+        N = self.X_full.size(0)
+        if batch_size >= N:
+            return torch.randperm(N, device=self.device)
+        # sample without replacement
+        idx = torch.randperm(N, device=self.device)[:batch_size]
+        return idx
+
+    def reset(self, length: int):
         """
-        Draw a slice of row indices from a shared pointer,
-        shuffling when we wrap around. This replaces calling reset()
-        on shallow copies (which each had their own pointer at 0).
+        For reward computation on a provided y (same order as training rows).
         """
-        if self._ptr + batch_size > len(self._master_indices):
-            self._ptr = 0
-            if self.shuffle_on_reset:
-                perm = torch.randperm(len(self._master_indices), device=self.device)
-                self._master_indices = self._master_indices[perm]
-        idxs = self._master_indices[self._ptr : self._ptr + batch_size]
-        self._ptr += batch_size
-        return idxs
-
-    def _featurise(
-        self,
-        df_target: pd.DataFrame,
-        df_source: pd.DataFrame,
-        feats: List[str],
-        bins: int
-    ) -> torch.Tensor:
-        """
-        Bin features. For classification with 'global_uniform',
-        apply MinMax scaling first to keep bins consistent.
-        """
-        # If regression with already integer-binned features, pass through
-        if self.task == "regression" and all(pd.api.types.is_integer_dtype(df_source[f]) for f in feats):
-            return torch.tensor(df_target[feats].values.astype(np.int32), device=self.device)
-
-        df_target_processed = df_target[feats].copy()
-        df_source_processed = df_source[feats].copy()
-
-        if self.task == "classification" and self.binning_strategy != "quantile":
-            if self.feature_scaler is None:
-                self.feature_scaler = MinMaxScaler()
-                self.feature_scaler.fit(df_source_processed)
-            df_target_processed[:] = self.feature_scaler.transform(df_target_processed)
-            if not df_source.equals(df_target):
-                df_source_processed[:] = self.feature_scaler.transform(df_source_processed)
-
-        X_binned = []
-
-        if self.binning_strategy == "quantile":
-            for f in feats:
-                source_series = df_source_processed[f].replace([np.inf, -np.inf], np.nan)
-                source_median = source_series.median()
-
-                s_source = source_series.fillna(source_median).values
-                target_series = df_target_processed[f].replace([np.inf, -np.inf], np.nan)
-                s_eval = target_series.fillna(source_median).values
-
-                quantiles = np.linspace(0, 1, bins + 1)
-                edges = np.unique(np.quantile(s_source, quantiles))
-                if edges.size == 1:
-                    # constant feature guard
-                    edges = np.array([edges[0] - 1, edges[0] + 1], dtype=float)
-                edges[0] -= 1e-9
-                edges[-1] += 1e-9
-
-                binned_eval = np.searchsorted(edges, s_eval, side="right") - 1
-                X_binned.append(binned_eval)
-
-        elif self.binning_strategy == "global_uniform":
-            edges = np.linspace(0, 1, bins + 1)
-            edges[0] -= 1e-9
-            edges[-1] += 1e-9
-
-            for f in feats:
-                vals = df_target_processed[f].values.ravel()
-                binned_eval = np.searchsorted(edges, vals, side="right") - 1
-                X_binned.append(binned_eval)
-        else:
-            raise ValueError(f"Unknown binning_strategy: {self.binning_strategy}")
-
-        Xb = np.stack(X_binned, 1).astype(np.int32)
-        return torch.tensor(Xb, device=self.device)
-
-    # legacy reset (still used by training env itself, not by shallow copies)
-    def reset(self, batch_size: int):
-        """
-        Resets this environment (NOT copies) for a new rollout batch.
-        """
-        self.idxs = self.draw_indices(batch_size)
+        self.idxs = torch.arange(length, device=self.device)
         self.paths = []
         self.open_leaves = 1
         self.done = False
+        self._n_splits = 0
 
     def step(self, action: Tuple[str, int]):
         """
-        Advance the environment by one token action.
+        No-op for routing (rollout maintains its own stacks),
+        but we count thresholds to form a simple structure prior if desired.
         """
-        self.paths.append(action)
         kind, _ = action
+        if kind in ("th", "thr", "threshold"):
+            self._n_splits += 1
 
-        if kind == "feat":
-            pass
-        elif kind == "th":
-            self.open_leaves += 1
-        elif kind == "leaf":
-            self.open_leaves -= 1
-
-        if self.open_leaves < 0:
-            self.open_leaves = 0
-
-        # done when no open leaves or token budget exceeded
-        self.done = (self.open_leaves == 0) or (len(self.paths) > self._max_tokens)
-
-    def get_prior(self, current_beta: float) -> torch.Tensor:
+    def get_prior(self, beta: float) -> torch.Tensor:
         """
-        Structure prior for a completed trajectory:
-        penalize by number of 'feat' tokens (splits).
+        Simple structure prior: -beta * (#decision nodes).
+        (Kept for compatibility; many TB variants ignore this term.)
         """
-        n_feats = sum(1 for k, _ in self.paths if k == "feat")
-        prior = -current_beta * float(n_feats)
-        return torch.tensor([prior], device=self.device)
+        return torch.tensor(-beta * float(self._n_splits), device=self.device, dtype=torch.float32)

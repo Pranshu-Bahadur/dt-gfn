@@ -28,6 +28,8 @@ from src.utils import (
     deltaE_split_gain_sse,
     calculate_bayesian_reward,
     calculate_bayesian_reward_regression,
+    # optional: uniform backward surrogate (not strictly required below)
+    uniform_backward_log_prob,
 )
 
 # ============================================================
@@ -62,6 +64,9 @@ class Config:
     mlp_width: int = 256
     lr: float = 1e-4
 
+    # Backward policy choice
+    backward_policy: str = "uniform"               # "uniform" | "network"
+
     # Priors & annealing
     beta: Optional[float] = None
     prior_scale: float = 0.5
@@ -94,6 +99,9 @@ class Config:
     # policy-based predictor mode hint
     policy_predictor_mode: str = "dirichlet"       # "dirichlet" | "mean"
 
+    # Track best single-tree train accuracy while training (classification)
+    show_best_tree_acc: bool = False
+
 
 # ============================================================
 # Trainer
@@ -113,6 +121,10 @@ class Trainer:
         self.le: Optional[LabelEncoder] = None
         self.classes_: Optional[np.ndarray] = None
         self.scaler = GradScaler(enabled=cfg.amp)
+
+        # best-single-tree tracker
+        self._best_tree_seq: Optional[List[int]] = None
+        self._best_tree_acc: float = 0.0
 
     # -------------------------
     # Fit
@@ -142,21 +154,53 @@ class Trainer:
         X_binned = env_template.X_full.clone()
 
         # policy nets
-        self.pf = torch.jit.script(PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device))
-        self.pb = torch.jit.script(PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device))
+        self.pf = torch.jit.script(
+            PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device)
+        )
+        if c.backward_policy == "network":
+            self.pb = torch.jit.script(
+                PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device)
+            )
+        else:
+            self.pb = None
+
         self.log_z = torch.nn.Parameter(torch.tensor(1.0, device=c.device))
 
+        # optimizers / schedulers
         optim_pfs = torch.optim.AdamW(self.pf.parameters(), lr=c.lr)
-        optim_pbs = torch.optim.AdamW(self.pb.parameters(), lr=c.lr)
-        optim_z   = torch.optim.Adam([self.log_z], lr=c.lr / 10)
+        sched_pfs = SequentialLR(
+            optim_pfs,
+            [LambdaLR(optim_pfs, lambda u: min(1.0, u / max(1, 10))),
+             CosineAnnealingLR(optim_pfs, T_max=max(1, c.updates - 10))],
+            milestones=[10],
+        )
 
-        warmup, tmax = 10, max(1, c.updates - 10)
-        schedulers = [
-            SequentialLR(optim_pfs, [LambdaLR(optim_pfs, lambda u: min(1.0, u / warmup)), CosineAnnealingLR(optim_pfs, T_max=tmax)], milestones=[warmup]),
-            SequentialLR(optim_pbs, [LambdaLR(optim_pbs, lambda u: min(1.0, u / warmup)), CosineAnnealingLR(optim_pbs, T_max=tmax)], milestones=[warmup]),
-            SequentialLR(optim_z,   [LambdaLR(optim_z,   lambda u: min(1.0, u / warmup)), CosineAnnealingLR(optim_z,   T_max=tmax)], milestones=[warmup]),
-        ]
-        optimizers = [optim_pfs, optim_pbs, optim_z]
+        opt_list = [optim_pfs]
+        sch_list = [sched_pfs]
+
+        if self.pb is not None:
+            optim_pbs = torch.optim.AdamW(self.pb.parameters(), lr=c.lr)
+            sched_pbs = SequentialLR(
+                optim_pbs,
+                [LambdaLR(optim_pbs, lambda u: min(1.0, u / max(1, 10))),
+                 CosineAnnealingLR(optim_pbs, T_max=max(1, c.updates - 10))],
+                milestones=[10],
+            )
+            opt_list.append(optim_pbs)
+            sch_list.append(sched_pbs)
+
+        optim_z = torch.optim.Adam([self.log_z], lr=c.lr / 10)
+        sched_z = SequentialLR(
+            optim_z,
+            [LambdaLR(optim_z, lambda u: min(1.0, u / max(1, 10))),
+             CosineAnnealingLR(optim_z, T_max=max(1, c.updates - 10))],
+            milestones=[10],
+        )
+        opt_list.append(optim_z)
+        sch_list.append(sched_z)
+
+        optimizers = opt_list
+        schedulers = sch_list
 
         self.replay_buffer = ReplayBuffer(capacity=200)
 
@@ -177,7 +221,7 @@ class Trainer:
     def _per_tree_reward(self, tok: torch.Tensor, reward_env: TabularEnv) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         c = self.cfg
 
-        # Detect residual-matrix training (multi-class boosting): rows don't sum to 1
+        # Detect residual-matrix training (multi-class boosting)
         is_residual_matrix = (
             hasattr(reward_env, "y") and isinstance(reward_env.y, torch.Tensor) and reward_env.y.dim() == 2
             and not torch.allclose(reward_env.y.sum(1), torch.ones_like(reward_env.y.sum(1)), atol=1e-3, rtol=0.0)
@@ -204,10 +248,6 @@ class Trainer:
 
     @torch.no_grad()
     def _weight_for_tree(self, seq: List[int], reward_env: TabularEnv, mode: str) -> float:
-        """
-        Compute a scalar weight for a single tree according to `mode`.
-        mode: 'none' | 'bayesian' | 'gini' | 'variance' | 'sse' | (fallback to cfg.reward_function)
-        """
         device = reward_env.device
         tok = torch.tensor([seq], device=device, dtype=torch.long)
         task = self.cfg.task
@@ -223,7 +263,6 @@ class Trainer:
         if mode == "gini":
             dR = deltaE_split_gain_classification(tok, self.tokenizer, reward_env)
             return float(torch.clamp(dR.sum(), min=1e-9).item())
-
         # default to training reward function
         return self._weight_for_tree(seq, reward_env, self.cfg.reward_function)
 
@@ -235,7 +274,6 @@ class Trainer:
         y_true: torch.Tensor,
         base_pred: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Regression-only scalar reward; unchanged logic
         c = self.cfg
         device = X_binned.device
         if c.task != "regression":
@@ -284,7 +322,6 @@ class Trainer:
         seqs, priors, targets = zip(*all_tuples_with_targets)
         toks = [torch.tensor(s, device=device, dtype=torch.long) for s in seqs]
         padded = torch.nn.utils.rnn.pad_sequence(toks, batch_first=True, padding_value=v.PAD)
-        flipped = torch.nn.utils.rnn.pad_sequence([t.flip(0) for t in toks], batch_first=True, padding_value=v.PAD)
         priors_tensor = torch.as_tensor(priors, device=device, dtype=torch.float32)
 
         for opt in optimizers:
@@ -292,8 +329,21 @@ class Trainer:
 
         with autocast(enabled=c.amp):
             log_pf = self.pf.log_prob(padded)
-            log_pb = self.pb.log_prob(flipped)
-            logF   = self.pf.log_F(padded)
+
+            # backward policy: network on reversed tokens OR uniform surrogate
+            if self.pb is not None and c.backward_policy == "network":
+                flipped = torch.nn.utils.rnn.pad_sequence(
+                    [t.flip(0) for t in toks], batch_first=True, padding_value=v.PAD
+                )
+                log_pb = self.pb.log_prob(flipped)
+            elif c.backward_policy == "uniform":
+                # simple surrogate: cancels in TB up to a constant → use zeros
+                # (you can swap to uniform_backward_log_prob(padded, self.tokenizer, c.max_depth) if desired)
+                log_pb = torch.zeros_like(log_pf)
+            else:
+                log_pb = torch.zeros_like(log_pf)
+
+            logF = self.pf.log_F(padded)
 
             if ensemble_reward_override is not None:
                 R = ensemble_reward_override.expand(len(seqs)).to(device)
@@ -375,6 +425,8 @@ class Trainer:
         Ytarget_full = Ytarget_full.cpu() if c.eval_on_cpu else Ytarget_full
         X_build_for_pred = X_binned.cpu() if c.eval_on_cpu else X_binned
 
+        all_tuples_last = []
+
         for upd in tqdm(range(1, c.updates + 1), desc="Policy Training & Tree Generation"):
             forward_tuples = self._collect_rollouts(env_template, temp=c.rollout_temperature, residuals=y_true, beta=c.beta)
             replay_tuples  = self.sample_replay(c.top_k_trees)
@@ -397,13 +449,8 @@ class Trainer:
             for sch in schedulers:
                 sch.step()
 
-            # ---- FULL DATA metrics (now reward-weighted) ----
+            # ---- FULL DATA metrics (reward-weighted mean for speed) ----
             trees = [seq for seq, _ in all_tuples if seq]
-            if trees:
-                reward_env = copy.copy(env_template)
-                reward_env.y = y_true.clone().to(X_build_for_pred.device)
-                reward_env.y_full = y_true.clone().to(X_build_for_pred.device)
-                reward_env.reset(len(y_true))
 
             sum_pred, total_w = None, 0.0
             with torch.no_grad():
@@ -413,7 +460,7 @@ class Trainer:
                         min_child_size=c.min_child_size, min_gain=c.min_gain,
                         predictor_mode=c.policy_predictor_mode
                     )
-                    w = self._weight_for_tree(seq, reward_env, mode=self.cfg.reward_function)
+                    w = self._weight_for_tree(seq, env_template, mode=self.cfg.reward_function)
                     running = self._predict_in_batches(
                         pred_fn, X_metric, c.eval_batch_size,
                         device=("cpu" if c.eval_on_cpu else c.device),
@@ -435,9 +482,29 @@ class Trainer:
                         corr = torch.corrcoef(torch.stack([avg_pred.squeeze().cpu(), y_metric.squeeze().cpu()]))[0, 1].item()
                         log_str += f" | Train Corr (w): {corr:.4f}"
 
-            tqdm.write(log_str)
+            # ---- Optional: best single-tree (unweighted) train accuracy tracker ----
+            if c.show_best_tree_acc and c.task == "classification" and trees:
+                with torch.no_grad():
+                    for seq in trees:
+                        pred_fn = get_tree_predictor(
+                            seq, X_build_for_pred, Ytarget_full, self.tokenizer,
+                            min_child_size=c.min_child_size, min_gain=c.min_gain,
+                            predictor_mode=c.policy_predictor_mode
+                        )
+                        preds = self._predict_in_batches(
+                            pred_fn, X_metric, c.eval_batch_size,
+                            device=("cpu" if c.eval_on_cpu else c.device),
+                        )
+                        acc_i = (preds.argmax(1).cpu() == y_metric.cpu()).float().mean().item()
+                        if acc_i > self._best_tree_acc:
+                            self._best_tree_acc = acc_i
+                            self._best_tree_seq = seq
+                    log_str += f" | BestTreeAcc: {self._best_tree_acc:.4f}"
 
-        self.ensemble = [seq for seq, _ in all_tuples if seq] if 'all_tuples' in locals() else []
+            tqdm.write(log_str)
+            all_tuples_last = all_tuples
+
+        self.ensemble = [seq for seq, _ in all_tuples_last if seq] if all_tuples_last else []
         tqdm.write(f"--- RF finished. Final forest size: {len(self.ensemble)} ---")
 
     # ========================================================
@@ -524,7 +591,6 @@ class Trainer:
                     ras_counts.clear()
                 batch = min(self.cfg.num_parallel, self.cfg.rollouts - done)
 
-                # --- FIX: draw disjoint/shuffled indices from the shared template ---
                 envs = [copy.copy(env_template) for _ in range(batch)]
                 idx_batches = [env_template.draw_indices(self.cfg.batch_size) for _ in range(batch)]
                 for env, idxs in zip(envs, idx_batches):
@@ -536,7 +602,6 @@ class Trainer:
 
                 results = self.batched_rollout(envs, temp, residuals, beta, ras_counts)
 
-                # compute reward per-seq now and store it in replay (improves sampling)
                 for res in results:
                     if not res:
                         continue
@@ -559,14 +624,20 @@ class Trainer:
         if not buf or not buf.data:
             return []
 
-        # refresh backward weights if stale
+        # If using uniform backward, just return top-k by reward (no pb weighting refresh).
+        if self.cfg.backward_policy != "network":
+            entries = list(buf.data)
+            k = min(k, len(entries))
+            return [(entries[i][1], entries[i][2]) for i in range(k)]
+
+        # Otherwise: refresh backward weights via learned pb on reversed sequences.
         stale = [i for i, e in enumerate(buf.data) if e[4] is None or buf.step - e[5] >= REFRESH_INTERVAL]
         if stale:
             stale_seqs = [buf.data[i][1] for i in stale]
             with torch.no_grad():
                 flipped = [torch.tensor(s, device=self.cfg.device).flip(0) for s in stale_seqs]
                 padded = torch.nn.utils.rnn.pad_sequence(flipped, batch_first=True, padding_value=self.tokenizer.v.PAD)
-                logp = self.pb.log_prob(padded)
+                logp = self.pb.log_prob(padded)  # type: ignore[union-attr]
                 mask = (padded != self.tokenizer.v.PAD).float()
                 T = min(mask.size(1), logp.size(1))
                 w = (logp[:, :T] * mask[:, :T]).sum(1).exp()
@@ -579,7 +650,6 @@ class Trainer:
         if not valid:
             return []
 
-        # combined importance weight = reward * backward-prob weight
         weights = np.array(
             [max(entries[i][0], 1e-9) * float(entries[i][4]) for i in valid],
             dtype=np.float32
