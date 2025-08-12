@@ -33,39 +33,31 @@ class PolicyBase(nn.Module):
 
 class PolicyPaperMLP(PolicyBase):
     """
-    LSTM + shared MLP heads policy network (DT-GFN style).
+    Paper-style MLP policy with NO embeddings:
+      one-hot(token) -> shared MLP (LeakyReLU) -> {token logits, flow}.
+    Applied time-step-wise to seq[:, :-1] during teacher forcing.
     """
     def __init__(
         self,
         vocab_size: int,
-        lstm_hidden: int,
+        lstm_hidden: int,   # kept for API compat; unused here
         mlp_layers: int,
         mlp_width: int,
         pad_id: int = 0,
     ):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.lstm_hidden = lstm_hidden
+        self.vocab_size = int(vocab_size)
         self.pad_id = int(pad_id)
 
-        # Token embedding → LSTM
-        self.embedding = nn.Embedding(vocab_size, lstm_hidden)
-        self.rnn = nn.LSTM(
-            input_size=lstm_hidden,
-            hidden_size=lstm_hidden,
-            num_layers=1,
-            batch_first=True,
-        )
-
-        # Shared MLP applied time-step-wise on LSTM outputs
-        layers = [nn.Linear(lstm_hidden, mlp_width), nn.ReLU()]
+        # Shared MLP applied on the last dimension (broadcasts over B,T)
+        layers = [nn.Linear(self.vocab_size, mlp_width), nn.LeakyReLU()]
         for _ in range(max(0, mlp_layers - 1)):
-            layers += [nn.Linear(mlp_width, mlp_width), nn.ReLU()]
+            layers += [nn.Linear(mlp_width, mlp_width), nn.LeakyReLU()]
         self.shared_mlp = nn.Sequential(*layers)
 
         # Heads
-        self.head_tok = nn.Linear(mlp_width, vocab_size)  # logits for next token
-        self.head_flow = nn.Linear(mlp_width, 1)          # scalar flow per position
+        self.head_tok  = nn.Linear(mlp_width, self.vocab_size)  # logits for next token
+        self.head_flow = nn.Linear(mlp_width, 1)                # scalar flow per position
 
     def forward(self, seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -74,11 +66,11 @@ class PolicyPaperMLP(PolicyBase):
           logits: (B, T, V)
           flow  : (B, T)
         """
-        emb = self.embedding(seq)            # (B, T, H)
-        #h, _ = self.rnn(emb)                 # (B, T, H)
-        h = self.shared_mlp(emb)               # (B, T, W)
-        logits = self.head_tok(h)            # (B, T, V)
-        flow   = self.head_flow(h).squeeze(-1)  # (B, T)
+        # One-hot encode tokens (B, T, V) — no embedding table
+        x = torch.nn.functional.one_hot(seq, num_classes=self.vocab_size).to(torch.float32)
+        h = self.shared_mlp(x)                 # (B, T, W)
+        logits = self.head_tok(h)              # (B, T, V)
+        flow   = self.head_flow(h).squeeze(-1) # (B, T)
         return logits, flow
 
     @torch.jit.export
@@ -93,23 +85,19 @@ class PolicyPaperMLP(PolicyBase):
         if T < 2:
             return torch.empty(B, 0, device=seq.device, dtype=torch.float32)
 
-        # We want p(seq[:,1:] | seq[:,:-1])
-        logits, _ = self.forward(seq[:, :-1])        # (B, T-1, V)
-        logp = torch.log_softmax(logits, dim=-1)     # (B, T-1, V)
-        next_ids = seq[:, 1:]                        # (B, T-1)
+        logits, _ = self.forward(seq[:, :-1])                # (B, T-1, V)
+        logp = torch.log_softmax(logits, dim=-1)             # (B, T-1, V)
+        next_ids = seq[:, 1:]                                 # (B, T-1)
         gathered = logp.gather(-1, next_ids.unsqueeze(-1)).squeeze(-1)  # (B, T-1)
 
-        # mask out PAD transitions so TB/FL sums ignore padding
-        mask = (next_ids != self.pad_id).to(gathered.dtype)
+        mask = (next_ids != self.pad_id).to(gathered.dtype)  # zero-out PAD steps
         return gathered * mask
 
     @torch.jit.export
     def log_F(self, seq: torch.Tensor) -> torch.Tensor:
-        """
-        Flow per position. Mask inside your loss if desired.
-        """
         _, flow = self.forward(seq)  # (B, T)
         return flow
+
 
 
 class PolicyTransformer(PolicyBase):
@@ -132,18 +120,18 @@ class PolicyTransformer(PolicyBase):
         pad_id: int = 0,
     ):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.d_model = d_model
-        self.max_len = max_len
+        self.vocab_size = int(vocab_size)
+        self.d_model = int(d_model)
+        self.max_len = int(max_len)
         self.pad_id = int(pad_id)
 
         # Embeddings
-        self.token_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb   = nn.Embedding(max_len,   d_model)
+        self.token_emb = nn.Embedding(self.vocab_size, self.d_model)
+        self.pos_emb   = nn.Embedding(self.max_len,   self.d_model)
 
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
+            d_model=self.d_model,
             nhead=n_heads,
             dim_feedforward=d_ff,
             dropout=dropout,
@@ -153,11 +141,11 @@ class PolicyTransformer(PolicyBase):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
         # Heads
-        self.head_tok  = nn.Linear(d_model, vocab_size)
-        self.head_flow = nn.Linear(d_model, 1)
+        self.head_tok  = nn.Linear(self.d_model, self.vocab_size)
+        self.head_flow = nn.Linear(self.d_model, 1)
 
     def _positional(self, T: int, device: torch.device) -> torch.Tensor:
-        T = T if T < self.max_len else self.max_len
+        T = min(T, self.max_len)
         pos_ids = torch.arange(T, device=device)
         return self.pos_emb(pos_ids).unsqueeze(0)  # (1, T, D)
 
