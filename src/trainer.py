@@ -31,6 +31,9 @@ from src.utils import (
     uniform_backward_log_prob,  # optional
 )
 
+from src.utils import decode_tree_from_seq  # add at top
+
+
 
 # ============================================================
 # Config
@@ -540,150 +543,61 @@ class Trainer:
     # ========================================================
     # RF training (policy + gen)
     # ========================================================
-    def _visualize_best_tree_live(
-        self,
-        env_template,
-        *,
-        save_dir: str = "runs/trees",
-        step: int | None = None,
-        format: str = "png",
-        seq: Optional[List[int]] = None,
-    ):
-        """
-        Robust tree renderer that tolerates early STOP (EOS) and truncated trajectories.
-        If the sequence ends before all branches are explicitly closed with LEAF tokens,
-        remaining open branches are rendered as implicit leaves (summaries of the rows
-        currently routed to that branch).
-        """
-        import os
-        import torch
-        try:
-            import graphviz
-        except Exception:
-            return None
+    # trainer.py
 
-        # Pick which trajectory to render
-        if seq is None:
-            seq = self._best_tree_seq or (self.ensemble[0] if self.ensemble else None)
-        if not seq:
-            return None
+    def _visualize_best_tree_live(self, env_template, *, save_dir="runs/trees", step=None, format="png"):
+        import os, graphviz, torch
+        seq = self._best_tree_seq or (self.ensemble[0] if self.ensemble else None)
+        if seq is None: return None
 
-        # Decode tokens but ignore BOS/EOS; we’ll handle missing closures ourselves.
-        actions = list(self.tokenizer.decode(seq[1:-1]))
-
-        Xb = env_template.X_full
-        y  = env_template.y_full
+        tree = decode_tree_from_seq(seq, self.tokenizer)
+        Xb, y = env_template.X_full, env_template.y_full
         is_cls = (self.cfg.task == "classification")
-        n_classes = int(self.cfg.n_classes) if is_cls and self.cfg.n_classes is not None else None
-
-        # Class names
-        if is_cls:
-            if self.classes_ is not None:
-                class_names = [str(c) for c in self.classes_.tolist()]
-            else:
-                class_names = [f"C{i}" for i in range(n_classes or 0)]
-        else:
-            class_names = None
+        n_classes = int(self.cfg.n_classes) if is_cls else None
+        class_names = [str(c) for c in (self.classes_.tolist() if self.classes_ is not None else range(n_classes or 0))]
 
         dot = graphviz.Digraph(comment="Best Decision Tree")
         dot.attr("node", shape="box", style="rounded")
-        node_counter = 0
-
-        def add_leaf(parent_id, edge_label, idxs):
-            nonlocal node_counter
-            node_id = str(node_counter); node_counter += 1
-            n_leaf = int(idxs.numel()) if isinstance(idxs, torch.Tensor) else int(len(idxs))
-            if is_cls:
-                if n_leaf > 0:
-                    counts = torch.bincount(y.index_select(0, idxs), minlength=n_classes).to(torch.int64)
-                    total = int(counts.sum().item())
-                    if total > 0:
+        nid = 0
+        def draw(node, idxs, parent=None, edge=""):
+            nonlocal nid
+            my = str(nid); nid += 1
+            if node.kind == "leaf" or node.left is None or node.right is None:
+                if is_cls:
+                    if idxs.numel() > 0:
+                        counts = torch.bincount(y.index_select(0, idxs), minlength=n_classes).float()
+                        total = counts.sum().clamp_min(1.0)
                         maj = int(torch.argmax(counts).item())
-                        probs = (counts.float() / total).cpu().numpy()
+                        probs = (counts / total).cpu().numpy()
                         prob_str = ", ".join([f"{class_names[i]}:{probs[i]:.2f}" for i in range(len(probs))])
-                        label = f"Leaf • n={n_leaf}\nmajority={class_names[maj]}\n{prob_str}"
+                        label = f"Leaf • n={int(idxs.numel())}\nmajority={class_names[maj]}\n{prob_str}"
                     else:
-                        label = f"Leaf • n={n_leaf}\n(no samples)"
+                        label = f"Leaf • n=0"
                 else:
-                    label = "Leaf • n=0"
-            else:
-                if n_leaf > 0:
                     vals = y.index_select(0, idxs).float()
-                    mu = float(vals.mean().item())
-                    sd = float(vals.std(unbiased=False).item())
-                    label = f"Leaf • n={n_leaf}\nmean={mu:.4f} ± {sd:.4f}"
-                else:
-                    label = "Leaf • n=0\nmean=0.0"
-            dot.node(node_id, label, style="rounded,filled", fillcolor="lightblue")
-            if parent_id is not None:
-                dot.edge(parent_id, node_id, label=edge_label)
-            return node_id
+                    label = f"Leaf • n={int(idxs.numel())}\nmean={float(vals.mean()):.4f} ± {float(vals.std(unbiased=False)):.4f}" if idxs.numel() > 0 else "Leaf • n=0"
+                dot.node(my, label, style="rounded,filled", fillcolor="lightblue")
+            else:
+                fname = self.cfg.feature_cols[int(node.feat)]
+                label = f"{fname} ≤ bin {int(node.thr)}"
+                dot.node(my, label)
+            if parent is not None:
+                dot.edge(parent, my, label=edge)
 
-        def add_subtree(parent_id, edge_label, idxs, pos):
-            """
-            Parse a pre-order stream:
-              [ feat f, th t, <left subtree>, <right subtree> ] or [ leaf ]
-            If we run out of tokens (EOS truncation), we emit an implicit leaf.
-            Returns new stream position.
-            """
-            nonlocal node_counter
+            # route rows and recurse (Right then Left push → draw Left first for readability)
+            if node.kind != "leaf" and node.left is not None and node.right is not None:
+                col = Xb.index_select(0, idxs)[:, int(node.feat)]
+                m = col <= int(node.thr)
+                left_idx, right_idx = idxs[m], idxs[~m]
+                draw(node.left,  left_idx, parent=my, edge="True")
+                draw(node.right, right_idx, parent=my, edge="False")
 
-            # Implicit leaf when tokens are exhausted
-            if pos >= len(actions):
-                add_leaf(parent_id, edge_label, idxs)
-                return pos
-
-            kind, val = actions[pos]
-
-            # Explicit leaf
-            if kind == "leaf":
-                add_leaf(parent_id, edge_label, idxs)
-                return pos + 1
-
-            # Expected: feat followed by th
-            if kind == "feat":
-                # If no threshold follows, treat this position as an implicit leaf
-                if pos + 1 >= len(actions) or actions[pos + 1][0] != "th":
-                    add_leaf(parent_id, edge_label, idxs)
-                    return pos + 1
-
-                f_idx = int(val)
-                _, t_val = actions[pos + 1]
-                t = int(t_val)
-
-                # Split current rows
-                if isinstance(idxs, torch.Tensor) and idxs.numel() > 0:
-                    col = Xb.index_select(0, idxs)[:, f_idx]
-                    left = idxs[col <= t]
-                    right = idxs[col >  t]
-                else:
-                    left = idxs
-                    right = idxs
-
-                # Feature node
-                node_id = str(node_counter); node_counter += 1
-                fname = self.cfg.feature_cols[f_idx] if 0 <= f_idx < len(self.cfg.feature_cols) else f"X[{f_idx}]"
-                label = f"{fname} ≤ bin {t}"
-                dot.node(node_id, label)
-                if parent_id is not None:
-                    dot.edge(parent_id, node_id, label=edge_label)
-
-                # Recurse: left then right; if stream ends anywhere, children become leaves
-                pos = add_subtree(node_id, "True",  left,  pos + 2)
-                pos = add_subtree(node_id, "False", right, pos)
-                return pos
-
-            # Any stray token → close as leaf
-            add_leaf(parent_id, edge_label, idxs)
-            return pos + 1
-
-        root_rows = torch.arange(Xb.size(0), device=Xb.device)
-        add_subtree(None, "", root_rows, 0)
-
+        draw(tree, torch.arange(Xb.size(0), device=Xb.device))
         os.makedirs(save_dir, exist_ok=True)
-        fname = f"best_tree_step_{step}" if step is not None else "best_tree"
-        dot.render(os.path.join(save_dir, fname), format=format, cleanup=True)
+        name = f"best_tree_step_{step}" if step is not None else "best_tree"
+        dot.render(os.path.join(save_dir, name), format=format, cleanup=True)
         return dot
+
 
 
     def _fit_dt_gfn_random_forest(self, env_template, y_true, X_binned, optimizers, schedulers):

@@ -1,3 +1,4 @@
+# src/utils.py
 from __future__ import annotations
 import math
 import random
@@ -24,14 +25,13 @@ def tb_loss(
 ) -> torch.Tensor:
     """
     Trajectory Balance loss using log-reward directly.
-    We minimize: mean( [ sum_t log_pf - (log_r + prior + sum_t log_pb) - log_z ]^2 )
+    We minimize: mean( [ sum_t log_pf - (log_r + sum_t log_pb) - log_z ]^2 )
     """
     sum_log_pf = log_pf.sum(1)           # (B,)
     sum_log_pb = log_pb.sum(1)           # (B,)
-    target = (log_r + sum_log_pb)  # (B,)
+    target = (log_r + sum_log_pb)        # (B,)
     resid = sum_log_pf - target - log_z.squeeze()
     return torch.mean(resid * resid)
-
 
 
 @torch.jit.script
@@ -141,9 +141,6 @@ def _build_tree_by_data(tokens: torch.Tensor,
     return root, n_dec
 
 
-# OLD signature:
-# def _collect_leaf_indices(root: _Node) -> List[torch.Tensor]:
-
 def _collect_leaf_indices(root: _Node, device: torch.device) -> List[torch.Tensor]:
     """Return list of train row-index tensors from a built tree."""
     leaves: List[torch.Tensor] = []
@@ -159,6 +156,61 @@ def _collect_leaf_indices(root: _Node, device: torch.device) -> List[torch.Tenso
             leaves.append(idxs)
     return leaves
 
+# ============================================================
+# Structure decoder (matches rollout push order)
+# ============================================================
+
+class _TNode(dict):
+    """Lightweight explicit tree node used for decoding token streams."""
+    pass
+
+def decode_tree_from_seq(seq: List[int], tok: "Tokenizer") -> _TNode:
+    """
+    Decode BOS...EOS token sequence into a binary tree.
+    Matches rollout order: after (feat, th) push Right then Left.
+    """
+    v = tok.v
+    start = 1 if len(seq) and seq[0] == v.BOS else 0
+    end = len(seq) - 1 if len(seq) and seq[-1] == v.EOS else len(seq)
+    actions = [tok.decode_one(t) for t in seq[start:end]]
+
+    root = _TNode(kind="split")  # will be set by first action
+    stack: List[_TNode] = [root]
+    i = 0
+    while i < len(actions) and stack:
+        node = stack.pop()
+        kind, val = actions[i]
+        if kind == "leaf":
+            node.clear()
+            node.update(kind="leaf")
+            i += 1
+            continue
+        if kind == "feat":
+            assert i + 1 < len(actions), "Malformed sequence: FEAT not followed by TH."
+            k2, tval = actions[i + 1]
+            assert k2 in ("th", "thr", "threshold"), "Malformed sequence: FEAT must be followed by TH."
+            node.clear()
+            node.update(kind="split", feat=int(val), thr=int(tval))
+            node["left"]  = _TNode(kind="leaf")
+            node["right"] = _TNode(kind="leaf")
+            # push Right then Left (LIFO means Left processed next)
+            stack.append(node["right"])
+            stack.append(node["left"])
+            i += 2
+            continue
+        raise RuntimeError(f"Unexpected token kind: {kind}")
+
+    # any unfilled nodes → leaves
+    def _finalize(n: _TNode):
+        if n is None:
+            return
+        if n.get("kind", "leaf") == "split":
+            if "left" not in n or "right" not in n:
+                n.clear(); n.update(kind="leaf")
+            else:
+                _finalize(n["left"]); _finalize(n["right"])
+    _finalize(root)
+    return root
 
 # ============================================================
 # Bayesian Rewards (DT-GFN style) — numerically stable
@@ -374,194 +426,157 @@ def get_tree_predictor(
     *,
     min_child_size: int = 20,
     min_gain: float = 0.0,
-    predictor_mode: str = "dirichlet",  # "dirichlet" | "mean" (classification only)
+    predictor_mode: str = "dirichlet",  # "dirichlet"|"dirichlet_sample" for sample; "mean"|"dirichlet_mean" for mean
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """
-    Rebuild the tree by replaying tokens on TRAIN data with stronger split checks:
-      • accept split only if both children have >= min_child_size
-      • and (optionally) gain >= min_gain
-
-    Leaf values:
-      • classification (y_target one-hot probs):
-          - predictor_mode == "dirichlet": sample from Dirichlet posterior
-          - predictor_mode == "mean":      use Dirichlet posterior mean
-      • regression / residuals: per-leaf mean
-
-    Returns: predictor(X_binned_test) -> Tensor
+    Build explicit tree from tokens (stack decoder that mirrors rollout),
+    then compute leaf statistics on TRAIN data. During that pass, if a split
+    produces children that violate min_child_size or min_gain, the node is
+    collapsed to a leaf.
     """
     device = X_binned.device
     y_target = y_target.detach().to(dtype=torch.float32, device=device)
-    v = tok.v
 
-    # decode tokens (strip BOS/EOS if present)
-    start = 1 if len(traj) and traj[0] == v.BOS else 0
-    end = len(traj) - 1 if len(traj) and traj[-1] == v.EOS else len(traj)
-    decoded = tok.decode(traj[start:end])
+    # decode structure (no data gating)
+    tree = decode_tree_from_seq(traj, tok)
 
-    N = X_binned.size(0)
-    all_idx = torch.arange(N, device=device, dtype=torch.long)
+    # determine task from y_target
+    is_clf = (y_target.dim() == 2)
+    K = int(y_target.size(1)) if is_clf else None
 
-    # detect mode
-    is_matrix = (y_target.dim() == 2)
-    if is_matrix:
-        min_ok = float(y_target.min()) >= -1e-6
-        max_ok = float(y_target.max()) <= 1.0 + 1e-6
-        row_sums = y_target.sum(dim=1)
-        sums_ok = torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-3, rtol=0.0)
-        is_clf_probs = (min_ok and max_ok and bool(sums_ok))
-        K = y_target.size(1)
-    else:
-        is_clf_probs = False
-        K = None
-
-    # impurity helpers
-    def node_sse(idxs: torch.Tensor) -> torch.Tensor:
-        if idxs.numel() <= 1:
+    # impurity helpers for optional gain threshold
+    def _sse(rows: torch.Tensor) -> torch.Tensor:
+        if rows.numel() <= 1:
             return torch.tensor(0.0, device=device)
-        Y = y_target[idxs]
-        if Y.ndim == 1:
-            mu = Y.mean()
-            return ((Y - mu) ** 2).sum()
-        else:
-            mu = Y.mean(dim=0, keepdim=True)
-            return ((Y - mu) ** 2).sum()
+        Z = y_target.index_select(0, rows)
+        if Z.ndim == 1:
+            mu = Z.mean()
+            return ((Z - mu) ** 2).sum()
+        mu = Z.mean(dim=0, keepdim=True)
+        return ((Z - mu) ** 2).sum()
 
-    def node_gini(idxs: torch.Tensor) -> torch.Tensor:
-        if not is_clf_probs or idxs.numel() == 0:
+    def _gini(rows: torch.Tensor) -> torch.Tensor:
+        if rows.numel() == 0 or not is_clf:
             return torch.tensor(0.0, device=device)
-        counts = y_target[idxs].sum(0)  # [K]
-        n = counts.sum().clamp_min(1.0)
+        counts = y_target.index_select(0, rows).sum(0)  # [K]
+        n = counts.sum().clamp_min(1)
         p = counts / n
         return 1.0 - (p * p).sum()
 
-    def split_gain(parent_idx: torch.Tensor, L_idx: torch.Tensor, R_idx: torch.Tensor) -> float:
-        nP = float(parent_idx.numel())
-        if nP <= 1:
-            return 0.0
-        if is_clf_probs:
-            gP = node_gini(parent_idx)
-            gL = node_gini(L_idx)
-            gR = node_gini(R_idx)
-            nL = float(L_idx.numel()); nR = float(R_idx.numel())
-            gain = gP * nP - (gL * nL + gR * nR)
+    def _gain(parent: torch.Tensor, L: torch.Tensor, R: torch.Tensor) -> float:
+        if is_clf:
+            gP = _gini(parent); gL = _gini(L); gR = _gini(R)
+            nP = float(parent.numel()); nL = float(L.numel()); nR = float(R.numel())
+            return float((gP * nP - (gL * nL + gR * nR)))
         else:
-            sP = node_sse(parent_idx)
-            sL = node_sse(L_idx)
-            sR = node_sse(R_idx)
-            gain = float((sP - (sL + sR)).item())
-        return float(gain)
+            sP = _sse(parent); sL = _sse(L); sR = _sse(R)
+            return float((sP - (sL + sR)).item())
 
-    # build by data with LIFO expansion
-    class Node(dict): pass
-    root = Node(type='leaf', idxs=all_idx)
-    stack: List[Node] = [root]
-    pending: Optional[Tuple[Node, int]] = None  # (node_to_split, feature_id)
+    # pass 1: compute per-leaf values on train data (and collapse weak splits)
+    leaves_values: List = []
+    leaves_nodes: List = []
 
-    for kind, val in decoded:
-        if not stack and pending is None:
-            break
-
-        if pending is None:
-            if kind == 'feat':
-                node = stack.pop() if stack else None
-                if node is None or node.get('type') != 'leaf':
-                    continue
-                pending = (node, int(val))
-            elif kind == 'leaf':
-                if stack:
-                    stack.pop()
+    stack: List[Tuple[_TNode, torch.Tensor]] = [(tree, torch.arange(X_binned.size(0), device=device))]
+    while stack:
+        node, idxs = stack.pop()
+        if idxs.numel() == 0:
+            # empty → leaf with neutral stats
+            if is_clf:
+                leaves_values.append({"type": "dirichlet", "alpha": 0.1, "counts": torch.zeros(K, device=device)})
             else:
-                continue
-        else:
-            if kind != 'th':
-                pending = None
-                continue
+                leaves_values.append(torch.tensor(0.0, device=device))
+            node.clear(); node.update(kind="leaf", leaf_idx=len(leaves_values) - 1)
+            leaves_nodes.append(node)
+            continue
 
-            node, f = pending
-            t = int(val)
-            idxs = node.get('idxs', all_idx)
-
-            fv = X_binned[idxs, f]
-            m = fv <= t
-            L_idx = idxs[m]
-            R_idx = idxs[~m]
-
-            # guards
-            if (L_idx.numel() < min_child_size) or (R_idx.numel() < min_child_size):
-                pending = None
-                continue
-            if min_gain > 0.0:
-                g = split_gain(idxs, L_idx, R_idx)
-                if g < min_gain:
-                    pending = None
-                    continue
-
-            node.clear()
-            node.update(type='split', f=f, t=t)
-            L = Node(type='leaf', idxs=L_idx)
-            R = Node(type='leaf', idxs=R_idx)
-            node['L'] = L; node['R'] = R
-            stack.append(R); stack.append(L)
-            pending = None
-
-    # collect leaves
-    leaves: List[Tuple[Node, torch.Tensor]] = []
-    q: Deque[Node] = deque([root])
-    while q:
-        n = q.popleft()
-        if n.get('type') == 'split':
-            q.append(n['L']); q.append(n['R'])
-        else:
-            leaves.append((n, n.get('idxs', torch.empty(0, dtype=torch.long, device=device))))
-
-    # compute leaf values
-    if is_clf_probs:
-        alpha = torch.full((K,), 0.1 / max(1, K), device=device)
-        for node, idxs in leaves:
-            if idxs.numel() == 0:
-                node['val'] = torch.full((K,), 1.0 / K, device=device)
-                continue
-            counts = y_target[idxs].sum(0)  # [K]
-            conc = counts + alpha
-            if predictor_mode == "dirichlet":
-                node['val'] = torch.distributions.Dirichlet(conc).sample()
+        if node.get("kind") != "split" or "left" not in node or "right" not in node:
+            # treat as leaf
+            if is_clf:
+                counts = y_target.index_select(0, idxs).sum(0)
+                leaves_values.append({"type": "dirichlet", "alpha": 0.1, "counts": counts})
             else:
-                node['val'] = conc / conc.sum()
-    else:
-        for node, idxs in leaves:
-            if idxs.numel() == 0:
-                node['val'] = (torch.zeros_like(y_target[0])
-                               if y_target.dim() > 1
-                               else torch.tensor(0.0, device=device))
+                vals = y_target.index_select(0, idxs)
+                leaves_values.append(vals.mean())
+            node.clear(); node.update(kind="leaf", leaf_idx=len(leaves_values) - 1)
+            leaves_nodes.append(node)
+            continue
+
+        f, t = int(node["feat"]), int(node["thr"])
+        col = X_binned.index_select(0, idxs)[:, f]
+        m = col <= t
+        L_idx = idxs[m]
+        R_idx = idxs[~m]
+
+        # guards
+        if (L_idx.numel() < min_child_size) or (R_idx.numel() < min_child_size):
+            if is_clf:
+                counts = y_target.index_select(0, idxs).sum(0)
+                leaves_values.append({"type": "dirichlet", "alpha": 0.1, "counts": counts})
             else:
-                node['val'] = y_target[idxs].mean(dim=0, keepdim=False)
+                vals = y_target.index_select(0, idxs)
+                leaves_values.append(vals.mean())
+            node.clear(); node.update(kind="leaf", leaf_idx=len(leaves_values) - 1)
+            leaves_nodes.append(node)
+            continue
 
-    # strip training indices from nodes
-    for node, _ in leaves:
-        node.pop('idxs', None)
-
-    # prediction fn
-    def predict(X: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            if is_matrix:
-                out = torch.zeros(X.size(0), y_target.size(1), device=X.device, dtype=y_target.dtype)
-            else:
-                out = torch.zeros(X.size(0), device=X.device, dtype=y_target.dtype)
-
-            q: Deque[Tuple[Node, torch.Tensor]] = deque([(root, torch.arange(X.size(0), device=X.device))])
-            while q:
-                n, idxs = q.popleft()
-                if idxs.numel() == 0:
-                    continue
-                if n.get('type') == 'split':
-                    f = int(n['f']); t = int(n['t'])
-                    m = X[idxs, f] <= t
-                    q.append((n['L'], idxs[m]))
-                    q.append((n['R'], idxs[~m]))
+        if min_gain > 0.0:
+            g = _gain(idxs, L_idx, R_idx)
+            if g < float(min_gain):
+                if is_clf:
+                    counts = y_target.index_select(0, idxs).sum(0)
+                    leaves_values.append({"type": "dirichlet", "alpha": 0.1, "counts": counts})
                 else:
-                    out[idxs] = n['val']
-            return out
-    return predict
+                    vals = y_target.index_select(0, idxs)
+                    leaves_values.append(vals.mean())
+                node.clear(); node.update(kind="leaf", leaf_idx=len(leaves_values) - 1)
+                leaves_nodes.append(node)
+                continue
+
+        # keep split → push Right then Left (LIFO → Left next)
+        stack.append((node["right"], R_idx))
+        stack.append((node["left"],  L_idx))
+
+    # prediction mode mapping
+    mode = predictor_mode.lower()
+    do_sample = mode in ("dirichlet", "dirichlet_sample")
+    # (dirichlet_mean, mean) → posterior mean
+
+    # pass 2: predictor over new data
+    def _predict(X_new_binned: torch.Tensor) -> torch.Tensor:
+        Xn = X_new_binned
+        if is_clf:
+            out = torch.zeros((Xn.size(0), K), device=Xn.device)
+        else:
+            out = torch.zeros((Xn.size(0),), device=Xn.device)
+
+        stack2: List[Tuple[_TNode, torch.Tensor]] = [(tree, torch.arange(Xn.size(0), device=Xn.device))]
+        while stack2:
+            node, idxs = stack2.pop()
+            if idxs.numel() == 0:
+                continue
+            if node.get("kind") != "split" or "left" not in node or "right" not in node:
+                lv = leaves_values[node["leaf_idx"]]
+                if is_clf:
+                    alpha = lv["alpha"]; counts = lv["counts"]
+                    params = torch.clamp(alpha + counts, min=1e-9)
+                    if do_sample:
+                        probs = torch.distributions.Dirichlet(params).sample()
+                    else:
+                        probs = params / params.sum().clamp_min(1e-9)
+                    out.index_copy_(0, idxs, probs.unsqueeze(0).expand(idxs.numel(), -1))
+                else:
+                    out.index_copy_(0, idxs, lv.repeat(idxs.numel()))
+                continue
+
+            f, t = int(node["feat"]), int(node["thr"])
+            col = Xn.index_select(0, idxs)[:, f]
+            m = col <= t
+            stack2.append((node["right"], idxs[~m]))
+            stack2.append((node["left"],  idxs[m]))
+        return out
+
+    return _predict
+
 # ============================================================
 # Replay Buffer
 # ============================================================

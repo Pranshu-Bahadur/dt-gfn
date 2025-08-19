@@ -71,7 +71,7 @@ class DTGFNClassifier:
         lstm_hidden: int = 256,
         mlp_layers: int = 3,
         mlp_width: int = 256,
-        backward_policy: str = "network",  # "uniform" | "network"
+        backward_policy: str = "uniform",  # "uniform" | "network"
         beta: Optional[float] = None,
         device: Optional[str] = None,
 
