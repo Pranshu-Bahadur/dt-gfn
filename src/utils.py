@@ -15,36 +15,23 @@ import lightgbm as lgb
 # ============================================================
 
 @torch.jit.script
-def tb_loss(log_pf: torch.Tensor,
-            log_pb: torch.Tensor,
-            log_z: torch.Tensor,
-            R: torch.Tensor,
-            prior: torch.Tensor) -> torch.Tensor:
+def tb_loss(
+    log_pf: torch.Tensor,    # (B, T-1)
+    log_pb: torch.Tensor,    # (B, T-1)
+    log_z: torch.Tensor,     # scalar parameter (learned)
+    log_r: torch.Tensor,     # (B,)  <-- CHANGED: pass log reward, not raw R
+    prior: torch.Tensor,     # (B,)
+) -> torch.Tensor:
     """
-    Trajectory Balance (batched).
-      logZ + Σ log p_f  ≈  logR + Σ log p_b
-    NOTE: 'prior' is accepted for API compatibility but not used here;
-          include structure priors inside R to avoid double-counting.
-    Shapes:
-      log_pf, log_pb : [B, T-1] or [T-1]
-      log_z, R       : [B] or scalar
+    Trajectory Balance loss using log-reward directly.
+    We minimize: mean( [ sum_t log_pf - (log_r + prior + sum_t log_pb) - log_z ]^2 )
     """
-    if log_pf.dim() == 1:
-        log_pf = log_pf.unsqueeze(0)
-    if log_pb.dim() == 1:
-        log_pb = log_pb.unsqueeze(0)
+    sum_log_pf = log_pf.sum(1)           # (B,)
+    sum_log_pb = log_pb.sum(1)           # (B,)
+    target = (log_r + sum_log_pb)  # (B,)
+    resid = sum_log_pf - target - log_z.squeeze()
+    return torch.mean(resid * resid)
 
-    lp = log_pf.sum(dim=-1)                          # [B]
-    lb = log_pb.sum(dim=-1)                          # [B]
-    logR = torch.log(R.clamp_min(1e-9))              # [B] or scalar
-
-    if log_z.dim() == 0:
-        log_z = log_z.expand_as(lp)
-    if logR.dim() == 0:
-        logR = logR.expand_as(lp)
-
-    diff = log_z + lp - (logR + lb)
-    return (diff * diff).mean()
 
 
 @torch.jit.script

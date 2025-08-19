@@ -30,10 +30,20 @@ class PolicyBase(nn.Module):
         """
         raise NotImplementedError
 
+    @torch.jit.export
+    def next_logits(self, seq: torch.Tensor) -> torch.Tensor:
+        """
+        Convenience: returns only the last-step logits (B×V) for a batch of sequences.
+        Useful when applying custom logit biases (e.g., redundancy penalties, STOP bias).
+        """
+        logits, _ = self.forward(seq)
+        return logits[:, -1, :]
+
 
 class PolicyPaperMLP(PolicyBase):
     """
     LSTM + shared MLP heads policy network (DT-GFN style).
+    Minimal functional changes; adds `next_logits` via PolicyBase.
     """
     def __init__(
         self,
@@ -48,7 +58,7 @@ class PolicyPaperMLP(PolicyBase):
         self.lstm_hidden = lstm_hidden
         self.pad_id = int(pad_id)
 
-        # Token embedding → LSTM
+        # Token embedding → LSTM (kept as in your version; LSTM can be re-enabled if desired)
         self.embedding = nn.Embedding(vocab_size, lstm_hidden)
         self.rnn = nn.LSTM(
             input_size=lstm_hidden,
@@ -75,10 +85,12 @@ class PolicyPaperMLP(PolicyBase):
           flow  : (B, T)
         """
         emb = self.embedding(seq)            # (B, T, H)
-        #h, _ = self.rnn(emb)                 # (B, T, H)
-        h = self.shared_mlp(emb)               # (B, T, W)
-        logits = self.head_tok(h)            # (B, T, V)
-        flow   = self.head_flow(h).squeeze(-1)  # (B, T)
+        # If you'd like to use the LSTM, uncomment next two lines and replace `emb` with `h` below.
+        # h, _ = self.rnn(emb)                # (B, T, H)
+        # x = h
+        x = self.shared_mlp(emb)             # (B, T, W)
+        logits = self.head_tok(x)            # (B, T, V)
+        flow   = self.head_flow(x).squeeze(-1)  # (B, T)
         return logits, flow
 
     @torch.jit.export
@@ -199,3 +211,5 @@ class PolicyTransformer(PolicyBase):
     def log_F(self, seq: torch.Tensor) -> torch.Tensor:
         _, flow = self.forward(seq)
         return flow
+
+
