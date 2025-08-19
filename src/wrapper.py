@@ -1,7 +1,7 @@
 # src/wrapper.py
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Optional, Union
+from typing import Any, Dict, Iterable, Optional, Union, List
 import numpy as np
 import pandas as pd
 
@@ -27,70 +27,138 @@ class DTGFNClassifier:
     """
     Thin sklearn-ish wrapper around the DT-GFN Trainer.
 
-    Fixes:
-      • Never leaks the target into features (uses reserved TARGET_COL).
-      • Freezes feature order at fit-time and reuses it for inference.
-      • Encodes labels to 0..C-1 and maps predictions back to original labels.
-      • Compatible with Trainer.infer_* and legacy Trainer.predict(...) interfaces.
+    • Never leaks the target into features (uses reserved TARGET_COL)
+    • Freezes feature order at fit-time and reuses it at inference
+    • Encodes labels to 0..C-1 and maps predictions back to original labels
+    • Forwards new redundancy / early-stop / viz / TB-stabilization / binning knobs
     """
 
     def __init__(
         self,
         *,
+        # --- Core dataset/binning ---
         n_bins: int = 255,
-        binning_strategy: str = "quantile",
+        binning_strategy: str = "quantile",   # "quantile" | "global_uniform" | "lgbm_quantile"
+        # LightGBM-like binning controls (used by env when strategy == "lgbm_quantile")
+        min_data_in_bin: Optional[int] = None,
+        subsample_for_bin: Optional[int] = None,
+
+        # --- Training budget / structure ---
         updates: int = 50,
         rollouts: int = 60,
         max_depth: int = 7,
         top_k_trees: int = 10,
         num_parallel: int = 32,
-        boosting_lr: float = 0.1,
-        redundancy_aware: bool = False,
-        device: Optional[str] = None,
         batch_size: int = 8192,
+
+        # --- Mode & rewards ---
         random_forest: bool = True,
+        boosting_lr: float = 0.1,
         reward_function: str = "bayesian",
+        infer_reward_function: Optional[str] = None,
+
+        # --- Tree feasibility ---
         min_child_size: int = 20,
         min_gain: float = 0.0,
+
+        # --- Policy inference ---
         policy_inference_trees: int = 500,
-        policy_predictor_mode: str = "mean",
+        policy_predictor_mode: str = "dirichlet_sample",  # "dirichlet_sample" | "dirichlet" | "mean"
+        rollout_temperature: float = 0.0,
+
+        # --- Network / opt ---
         lr: float = 1e-4,
         lstm_hidden: int = 256,
         mlp_layers: int = 3,
         mlp_width: int = 256,
-        rollout_temperature: float = 1.0,
+        backward_policy: str = "network",  # "uniform" | "network"
         beta: Optional[float] = None,
+        device: Optional[str] = None,
+
+        # --- Redundancy & STOP (new) ---
+        redundancy_aware: bool = True,
+        redundancy_lambda_intra: float = 1.0,
+        redundancy_lambda_inter: float = 0.25,
+        redundancy_decay: float = 0.995,
+        redundancy_ngram: int = 4,
+        dedup_sequences: bool = True,
+
+        allow_early_stop: bool = True,
+        min_decisions_before_stop: int = 1,
+        stop_bias: float = 0.0,
+
+        # --- TB stabilization & live viz (new) ---
+        tb_reward_temperature: float = 10.0,
+        tb_reward_standardize: bool = True,
+        show_best_tree_acc: bool = True,
+        viz_every: int = 0,
+        viz_dir: str = "runs/trees",
+        viz_format: str = "png",
     ):
-        self._cfg = dict(
+        # Store everything; we'll filter by Config at fit()
+        self._cfg: Dict[str, Any] = dict(
+            # data/binning
             n_bins=n_bins,
             binning_strategy=binning_strategy,
+            min_data_in_bin=min_data_in_bin,
+            subsample_for_bin=subsample_for_bin,
+
+            # training budget
             updates=updates,
             rollouts=rollouts,
             max_depth=max_depth,
             top_k_trees=top_k_trees,
             num_parallel=num_parallel,
-            boosting_lr=boosting_lr,
-            redundancy_aware=redundancy_aware,
-            device=device,
             batch_size=batch_size,
+
+            # mode/rewards
             random_forest=random_forest,
+            boosting_lr=boosting_lr,
             reward_function=reward_function,
+            infer_reward_function=infer_reward_function,
+
+            # feasibility
             min_child_size=min_child_size,
             min_gain=min_gain,
+
+            # policy inference
             policy_inference_trees=policy_inference_trees,
             policy_predictor_mode=policy_predictor_mode,
+            rollout_temperature=rollout_temperature,
+
+            # network/opt
             lr=lr,
             lstm_hidden=lstm_hidden,
             mlp_layers=mlp_layers,
             mlp_width=mlp_width,
-            rollout_temperature=rollout_temperature,
+            backward_policy=backward_policy,
             beta=beta,
+            device=device,
+
+            # redundancy/STOP
+            redundancy_aware=redundancy_aware,
+            redundancy_lambda_intra=redundancy_lambda_intra,
+            redundancy_lambda_inter=redundancy_lambda_inter,
+            redundancy_decay=redundancy_decay,
+            redundancy_ngram=redundancy_ngram,
+            dedup_sequences=dedup_sequences,
+            allow_early_stop=allow_early_stop,
+            min_decisions_before_stop=min_decisions_before_stop,
+            stop_bias=stop_bias,
+
+            # TB/viz
+            tb_reward_temperature=tb_reward_temperature,
+            tb_reward_standardize=tb_reward_standardize,
+            show_best_tree_acc=show_best_tree_acc,
+            viz_every=viz_every,
+            viz_dir=viz_dir,
+            viz_format=viz_format,
         )
 
         # set by fit()
         self._trainer: Optional[Trainer] = None
         self._df_train: Optional[pd.DataFrame] = None
-        self.feature_cols_: Optional[list[str]] = None
+        self.feature_cols_: Optional[List[str]] = None
         self.n_features_in_: Optional[int] = None
         self.classes_: Optional[np.ndarray] = None  # original label space
 
@@ -107,17 +175,14 @@ class DTGFNClassifier:
 
         # convert y to np array
         y_arr = np.asarray(y)
-        # classification: integers or bools
-        is_classif = np.issubdtype(y_arr.dtype, np.integer) or np.array_equal(
-            np.unique(y_arr), [0, 1]
-        )
 
+        # classification if integer-like or boolean {0,1}
+        is_classif = np.issubdtype(y_arr.dtype, np.integer)
         if not is_classif:
-            # force int if covertype/poker comes in as object/strings of ints
+            # special-case: ints encoded as strings/objects (e.g., covertype)
             try:
-                y_arr_int = y_arr.astype(np.int64)
+                y_arr = y_arr.astype(np.int64)
                 is_classif = True
-                y_arr = y_arr_int
             except Exception:
                 pass
 
@@ -141,27 +206,23 @@ class DTGFNClassifier:
         # freeze feature order
         self.feature_cols_ = [c for c in df_train.columns if c != TARGET_COL]
 
-        # filter cfg to Config dataclass fields and inject required keys
+        # filter _cfg to Config dataclass fields; inject required
         cfg_kwargs = dict(self._cfg)
-        # If Config is a dataclass we can query its fields
         allowed = set(getattr(Config, "__dataclass_fields__", {}).keys())
-        filtered = {k: v for k, v in cfg_kwargs.items() if (allowed and k in allowed) or not allowed}
+        filtered = {k: v for k, v in cfg_kwargs.items() if k in allowed}
 
-        # required fields (override if present)
+        # required fields
         filtered["feature_cols"] = self.feature_cols_
         filtered["target_col"] = TARGET_COL
         filtered["task"] = task
 
-        # choose a device if none provided
-        if "device" in allowed and (filtered.get("device") is None):
+        # choose device if none provided
+        if ("device" in allowed) and (filtered.get("device") is None):
             import torch
-
             filtered["device"] = "cuda" if torch.cuda.is_available() else "cpu"
 
         cfg = Config(**filtered)
-
-        trainer = Trainer(cfg)
-        trainer.fit(df_train)
+        trainer = Trainer(cfg).fit(df_train)
 
         self._trainer = trainer
         self._df_train = df_train
@@ -182,16 +243,16 @@ class DTGFNClassifier:
         return df.loc[:, self.feature_cols_]
 
     # ------------------------------------------------------------------
-    # predict_proba
+    # predict_proba (classification)
     # ------------------------------------------------------------------
     def predict_proba(
         self,
         X: Union[pd.DataFrame, np.ndarray, Iterable],
         *,
-        predict_mode: str = "policy",           # "policy" | "ensemble"
+        predict_mode: str = "policy",   # "policy" | "ensemble"
         n_trees: Optional[int] = None,
         infer_reward: Optional[str] = "bayesian",
-        algorithm: str = "rf",                  # "rf" | "boosting"
+        algorithm: str = "rf",          # "rf" | "boosting"
         policy_predictor_mode: Optional[str] = None,
     ) -> np.ndarray:
         if self._trainer is None or self._df_train is None:
@@ -201,7 +262,7 @@ class DTGFNClassifier:
 
         df = self._align_infer_df(X)
 
-        # prefer new API if available
+        # prefer newer API if present
         if hasattr(self._trainer, "infer_proba"):
             P = self._trainer.infer_proba(
                 df,
@@ -209,7 +270,7 @@ class DTGFNClassifier:
                 mode=predict_mode,
                 infer_reward=(infer_reward or self._cfg.get("reward_function", "bayesian")),
                 algorithm=algorithm,
-                policy_predictor_mode=(policy_predictor_mode or self._cfg.get("policy_predictor_mode", "mean")),
+                policy_predictor_mode=(policy_predictor_mode or self._cfg.get("policy_predictor_mode", "dirichlet_sample")),
             )
         else:
             # legacy API
@@ -218,7 +279,7 @@ class DTGFNClassifier:
                 df_train=self._df_train,
                 use_policy=(predict_mode == "policy"),
                 policy_inference_trees=(n_trees or self._cfg.get("policy_inference_trees", 500)),
-                policy_predictor_mode=(policy_predictor_mode or self._cfg.get("policy_predictor_mode", "mean")),
+                policy_predictor_mode=(policy_predictor_mode or self._cfg.get("policy_predictor_mode", "dirichlet_sample")),
                 infer_reward=(infer_reward or self._cfg.get("reward_function", "bayesian")),
                 algorithm=algorithm,
             )
@@ -261,7 +322,7 @@ class DTGFNClassifier:
                     mode=predict_mode,
                     infer_reward=(infer_reward or self._cfg.get("reward_function", "bayesian")),
                     algorithm=algorithm,
-                    policy_predictor_mode=(policy_predictor_mode or self._cfg.get("policy_predictor_mode", "mean")),
+                    policy_predictor_mode=(policy_predictor_mode or self._cfg.get("policy_predictor_mode", "dirichlet_sample")),
                 )
             else:
                 y = self._trainer.predict(
@@ -269,7 +330,7 @@ class DTGFNClassifier:
                     df_train=self._df_train,
                     use_policy=(predict_mode == "policy"),
                     policy_inference_trees=(n_trees or self._cfg.get("policy_inference_trees", 500)),
-                    policy_predictor_mode=(policy_predictor_mode or self._cfg.get("policy_predictor_mode", "mean")),
+                    policy_predictor_mode=(policy_predictor_mode or self._cfg.get("policy_predictor_mode", "dirichlet_sample")),
                     infer_reward=(infer_reward or self._cfg.get("reward_function", "bayesian")),
                     algorithm=algorithm,
                 )
@@ -282,5 +343,9 @@ class DTGFNClassifier:
         return dict(self._cfg)
 
     def set_params(self, **params: Any) -> "DTGFNClassifier":
+        """
+        Update stored config. Any keys that exist in Trainer.Config
+        will be forwarded at the next fit(); other keys are retained here.
+        """
         self._cfg.update(params)
         return self
