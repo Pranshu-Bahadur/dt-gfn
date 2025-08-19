@@ -77,7 +77,7 @@ class Config:
 
     # Replay sampling: novelty & metric weighting
     replay_novelty_bonus: float = 0.10             # boost if full sequence hasn't appeared this *session*
-    replay_metric_mode: str = "acc_corr"                # "off" | "acc_corr"
+    replay_metric_mode: str = "off"                # "off" | "acc_corr"
     replay_metric_alpha: float = 1.0               # strength of metric weighting
     replay_metric_power: float = 1.0               # nonlinearity: weight *= (1 + alpha * metric**power)
     replay_metric_refresh: int = 1000                # steps between metric recomputes for a seq
@@ -545,58 +545,102 @@ class Trainer:
     # ========================================================
     # trainer.py
 
-    def _visualize_best_tree_live(self, env_template, *, save_dir="runs/trees", step=None, format="png"):
-        import os, graphviz, torch
-        seq = self._best_tree_seq or (self.ensemble[0] if self.ensemble else None)
-        if seq is None: return None
+    def _visualize_best_tree_live(
+        self,
+        env_template,                     # TabularEnv already in training
+        *,
+        save_dir: str = "runs/trees",
+        step: int | None = None,
+        format: str = "png",
+    ):
+        """
+        Render the best-known tree using a structure decoder that mirrors rollout
+        (push Right then Left so Left is expanded next). This fixes "one-sided"
+        drawings that came from linear token walking.
+        """
+        import os
+        try:
+            import graphviz
+        except Exception:
+            return None
 
+        # pick a sequence to render
+        seq = self._best_tree_seq or (self.ensemble[0] if self.ensemble else None)
+        if not seq:
+            return None
+
+        # build explicit tree (no data used for structure)
         tree = decode_tree_from_seq(seq, self.tokenizer)
-        Xb, y = env_template.X_full, env_template.y_full
+
         is_cls = (self.cfg.task == "classification")
-        n_classes = int(self.cfg.n_classes) if is_cls else None
-        class_names = [str(c) for c in (self.classes_.tolist() if self.classes_ is not None else range(n_classes or 0))]
+        n_classes = int(self.cfg.n_classes) if is_cls and self.cfg.n_classes is not None else None
+        class_names = None
+        if is_cls:
+            if self.classes_ is not None:
+                class_names = [str(c) for c in self.classes_.tolist()]
+            else:
+                class_names = [f"C{i}" for i in range(n_classes or 0)]
+
+        # helpers to compute leaf summaries on TRAIN data (for labels)
+        Xb = env_template.X_full
+        y  = env_template.y_full
+
+        def leaf_label(indices: torch.Tensor) -> str:
+            n = int(indices.numel())
+            if is_cls:
+                if n == 0:
+                    return "Leaf • n=0"
+                counts = torch.bincount(y.index_select(0, indices), minlength=n_classes)
+                total = int(counts.sum().item())
+                maj = int(torch.argmax(counts).item()) if total > 0 else 0
+                probs = (counts.float() / max(1, total)).cpu().numpy()
+                prob_str = ", ".join([f"{class_names[i]}:{probs[i]:.2f}" for i in range(len(probs))])
+                return f"Leaf • n={n}\nmajority={class_names[maj]}\n{prob_str}"
+            else:
+                if n == 0:
+                    return "Leaf • n=0\nmean=0.0"
+                vals = y.index_select(0, indices).float()
+                mu = float(vals.mean().item())
+                sd = float(vals.std(unbiased=False).item())
+                return f"Leaf • n={n}\nmean={mu:.4f} ± {sd:.4f}"
 
         dot = graphviz.Digraph(comment="Best Decision Tree")
         dot.attr("node", shape="box", style="rounded")
         nid = 0
-        def draw(node, idxs, parent=None, edge=""):
+
+        # traverse tree while routing TRAIN rows through it to label leaves
+        def walk(node, idxs):
             nonlocal nid
-            my = str(nid); nid += 1
-            if node.kind == "leaf" or node.left is None or node.right is None:
-                if is_cls:
-                    if idxs.numel() > 0:
-                        counts = torch.bincount(y.index_select(0, idxs), minlength=n_classes).float()
-                        total = counts.sum().clamp_min(1.0)
-                        maj = int(torch.argmax(counts).item())
-                        probs = (counts / total).cpu().numpy()
-                        prob_str = ", ".join([f"{class_names[i]}:{probs[i]:.2f}" for i in range(len(probs))])
-                        label = f"Leaf • n={int(idxs.numel())}\nmajority={class_names[maj]}\n{prob_str}"
-                    else:
-                        label = f"Leaf • n=0"
-                else:
-                    vals = y.index_select(0, idxs).float()
-                    label = f"Leaf • n={int(idxs.numel())}\nmean={float(vals.mean()):.4f} ± {float(vals.std(unbiased=False)):.4f}" if idxs.numel() > 0 else "Leaf • n=0"
-                dot.node(my, label, style="rounded,filled", fillcolor="lightblue")
-            else:
-                fname = self.cfg.feature_cols[int(node.feat)]
-                label = f"{fname} ≤ bin {int(node.thr)}"
-                dot.node(my, label)
-            if parent is not None:
-                dot.edge(parent, my, label=edge)
+            if node.get("kind") != "split":
+                lid = str(nid); nid += 1
+                dot.node(lid, leaf_label(idxs), style="rounded,filled", fillcolor="lightblue")
+                return lid
 
-            # route rows and recurse (Right then Left push → draw Left first for readability)
-            if node.kind != "leaf" and node.left is not None and node.right is not None:
-                col = Xb.index_select(0, idxs)[:, int(node.feat)]
-                m = col <= int(node.thr)
-                left_idx, right_idx = idxs[m], idxs[~m]
-                draw(node.left,  left_idx, parent=my, edge="True")
-                draw(node.right, right_idx, parent=my, edge="False")
+            f = int(node["feat"]); t = int(node["thr"])
+            fname = self.cfg.feature_cols[f] if 0 <= f < len(self.cfg.feature_cols) else f"X[{f}]"
+            myid = str(nid); nid += 1
+            dot.node(myid, f"{fname} ≤ bin {t}")
 
-        draw(tree, torch.arange(Xb.size(0), device=Xb.device))
+            # route rows
+            fv = Xb.index_select(0, idxs)[:, f]
+            m = fv <= t
+            left_rows  = idxs[m]
+            right_rows = idxs[~m]
+
+            lid = walk(node["left"],  left_rows)
+            rid = walk(node["right"], right_rows)
+            dot.edge(myid, lid, label="True")
+            dot.edge(myid, rid, label="False")
+            return myid
+
+        all_rows = torch.arange(Xb.size(0), device=Xb.device)
+        walk(tree, all_rows)
+
         os.makedirs(save_dir, exist_ok=True)
-        name = f"best_tree_step_{step}" if step is not None else "best_tree"
-        dot.render(os.path.join(save_dir, name), format=format, cleanup=True)
+        fname = f"best_tree_step_{step}" if step is not None else "best_tree"
+        dot.render(os.path.join(save_dir, fname), format=format, cleanup=True)
         return dot
+
 
 
 
