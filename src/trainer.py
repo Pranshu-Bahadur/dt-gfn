@@ -19,18 +19,11 @@ from src.tokenizer import Tokenizer, Vocab
 from src.env import TabularEnv
 from src.policy import PolicyPaperMLP
 from src.utils import (
-    ReplayBuffer,
-    tb_loss,                                   # <- now expects log_r
-    fl_loss,
-    _safe_sample,
-    get_tree_predictor,
-    deltaE_split_gain_regression,
-    deltaE_split_gain_classification,
-    deltaE_split_gain_sse,
-    calculate_bayesian_reward,
-    calculate_bayesian_reward_regression,
-    # optional: uniform backward surrogate (not strictly required below)
-    uniform_backward_log_prob,
+    ReplayBuffer, tb_loss, fl_loss, _safe_sample, get_tree_predictor,
+    deltaE_split_gain_regression, deltaE_split_gain_classification, deltaE_split_gain_sse,
+    calculate_bayesian_reward, calculate_bayesian_reward_regression,
+    uniform_backward_log_prob,     # optional
+    _build_tree_by_data,           # << add this
 )
 
 from src.utils import decode_tree_from_seq  # NEW
@@ -118,6 +111,10 @@ class Config:
     viz_dir: str = "runs_v14/trees"
     viz_format: str = "png"
     show_best_tree_acc: bool = True      # helps decide which seq to render
+
+    leaf_cooldown_steps: int = 1          # forbid immediate LEAF on fresh child if it can split
+    leaf_bias: float = 0.0                # e.g., -0.2 to mildly discourage LEAF near root
+    threshold_balance_gamma: float = 0.0  # e.g., 0.25 to penalize imbalanced thresholds
 
 
 
@@ -437,14 +434,19 @@ class Trainer:
         format: str = "png",
     ):
         """
-        Render the best-known tree using a structure decoder that mirrors rollout
-        (push Right then Left so Left is expanded next). This fixes one-sided sketches
-        you get from linear token walks.
+        Render the best-known tree using a structure rebuilt *by data*:
+          • Replays tokens on TRAIN rows, accepts a split only if both children are non-empty.
+          • Uses LIFO expansion (push Right then Left so Left expands next), matching rollout.
+          • Labels leaves with train counts and class probs (or mean±sd for regression).
+
+        Returns a graphviz.Digraph (and writes <save_dir>/best_tree_step_<step>.<format>).
         """
         import os
         try:
             import graphviz
         except Exception:
+            from tqdm import tqdm
+            tqdm.write("[viz] graphviz not available; skipping.")
             return None
 
         # pick a sequence to render
@@ -452,21 +454,23 @@ class Trainer:
         if not seq:
             return None
 
-        # build explicit tree (no data used for structure)
-        tree = decode_tree_from_seq(seq, self.tokenizer)
+        device = env_template.device
+        tok = torch.tensor([seq], device=device, dtype=torch.long)
 
+        # Build a data-consistent tree on ALL train rows
+        N = env_template.X_full.size(0)
+        all_rows = torch.arange(N, device=device)
+        root, _ = _build_tree_by_data(tok, self.tokenizer, env_template.X_full, all_rows)
+
+        Xb = env_template.X_full
+        y  = env_template.y_full
         is_cls = (self.cfg.task == "classification")
-        n_classes = int(self.cfg.n_classes) if is_cls and self.cfg.n_classes is not None else None
-        class_names = None
         if is_cls:
+            n_classes = int(self.cfg.n_classes) if self.cfg.n_classes is not None else int(y.max().item()) + 1
             if self.classes_ is not None:
                 class_names = [str(c) for c in self.classes_.tolist()]
             else:
-                class_names = [f"C{i}" for i in range(n_classes or 0)]
-
-        # helpers to compute leaf summaries on TRAIN data (for labels)
-        Xb = env_template.X_full
-        y  = env_template.y_full
+                class_names = [f"C{i}" for i in range(n_classes)]
 
         def leaf_label(indices: torch.Tensor) -> str:
             n = int(indices.numel())
@@ -477,7 +481,7 @@ class Trainer:
                 total = int(counts.sum().item())
                 maj = int(torch.argmax(counts).item()) if total > 0 else 0
                 probs = (counts.float() / max(1, total)).cpu().numpy()
-                prob_str = ", ".join([f"{class_names[i]}:{probs[i]:.2f}" for i in range(len(probs))])
+                prob_str = ", ".join([f"{class_names[i]}:{probs[i]:.2f}" for i in range(n_classes)])
                 return f"Leaf • n={n}\nmajority={class_names[maj]}\n{prob_str}"
             else:
                 if n == 0:
@@ -491,38 +495,34 @@ class Trainer:
         dot.attr("node", shape="box", style="rounded")
         nid = 0
 
-        # traverse tree while routing TRAIN rows through it to label leaves
-        def walk(node, idxs):
+        # Traverse the rebuilt tree, routing TRAIN rows to compute labels
+        def walk(node, idxs: torch.Tensor):
             nonlocal nid
-            if node.get("kind") != "split":
+            if node.get("type") != "split":
                 lid = str(nid); nid += 1
                 dot.node(lid, leaf_label(idxs), style="rounded,filled", fillcolor="lightblue")
                 return lid
 
-            f = int(node["feat"]); t = int(node["thr"])
+            f = int(node["f"]); t = int(node["t"])
             fname = self.cfg.feature_cols[f] if 0 <= f < len(self.cfg.feature_cols) else f"X[{f}]"
             myid = str(nid); nid += 1
             dot.node(myid, f"{fname} ≤ bin {t}")
 
-            # route rows
             fv = Xb.index_select(0, idxs)[:, f]
             m = fv <= t
-            left_rows  = idxs[m]
-            right_rows = idxs[~m]
-
-            lid = walk(node["left"],  left_rows)
-            rid = walk(node["right"], right_rows)
+            lid = walk(node["L"], idxs[m])
+            rid = walk(node["R"], idxs[~m])
             dot.edge(myid, lid, label="True")
             dot.edge(myid, rid, label="False")
             return myid
 
-        all_rows = torch.arange(Xb.size(0), device=Xb.device)
-        walk(tree, all_rows)
+        walk(root, all_rows)
 
         os.makedirs(save_dir, exist_ok=True)
         fname = f"best_tree_step_{step}" if step is not None else "best_tree"
         dot.render(os.path.join(save_dir, fname), format=format, cleanup=True)
         return dot
+
 
     def _fit_dt_gfn_random_forest(self, env_template, y_true, X_binned, optimizers, schedulers):
         c = self.cfg
@@ -810,30 +810,40 @@ class Trainer:
 
     def batched_rollout(self, envs, temp, residuals, beta, ras_counts: Optional[dict] = None):
         """
-        Rollouts with *feasible* actions only:
-          • A feature is valid iff it has >=2 distinct bins on the leaf AND at least one threshold
-            yields both children ≥ min_child_size (if configured).
-          • Thresholds = unique bins observed on the leaf, excluding the max bin (i.e., u[:-1]).
-            Optionally filter thresholds by min_child_size.
+        Roll out trees with *feasible* actions only (two-stage FEAT -> THRESHOLD).
+        Fixes:
+          • Aligns masks when filtering thresholds (no IndexError).
+          • Respects per-leaf feasible bin windows (lo/hi).
+          • Optional threshold imbalance penalty (cfg.threshold_balance_gamma).
+          • Optional LEAF cooldown to avoid premature closures (cfg.leaf_cooldown_steps).
+
+        Returns: list of (seq, prior, idxs) or None per env.
         """
-        import copy
-        from collections import deque
         import torch
+        from collections import deque
 
         c, v, device = self.cfg, self.tokenizer.v, self.cfg.device
         num = len(envs)
         END_TOKEN  = v.EOS
-        LEAF_TOKEN = v.split_start - 1  # self.tokenizer._leaf(0) but constant id is fine
+        LEAF_TOKEN = self.tokenizer._leaf(0)
 
+        # optional knobs
+        leaf_cd_steps = int(getattr(c, "leaf_cooldown_steps", 0) or 0)
+        th_imbal_gamma = float(getattr(c, "threshold_balance_gamma", 0.0) or 0.0)
+
+        # Prepare envs
         for env in envs:
             env.y = residuals
             env.reset(c.batch_size)
 
+        # Per-trajectory state
         seqs = [[v.BOS] for _ in range(num)]
         depths: List[Deque[int]] = [deque([0]) for _ in range(num)]
         lo_stacks: List[Deque[torch.Tensor]] = [deque([torch.zeros(v.num_feat, dtype=torch.long, device=device)]) for _ in range(num)]
         hi_stacks: List[Deque[torch.Tensor]] = [deque([torch.full((v.num_feat,), v.num_th - 1, dtype=torch.long, device=device)]) for _ in range(num)]
         row_stacks: List[Deque[torch.Tensor]] = [deque([torch.arange(envs[i].idxs.numel(), device=device)]) for i in range(num)]
+        # cooldown stacks (one counter per open leaf)
+        cd_stacks: List[Deque[int]] = [deque([0]) for _ in range(num)]
 
         def _mark_done_if_finished(ti: int):
             if not depths[ti]:
@@ -851,77 +861,102 @@ class Trainer:
                 logits, _ = self.pf(pad)
                 last = logits[:, -1, :]
 
+                # Strong "don't repeat this exact prefix" guard if ras_counts provided
                 if ras_counts is not None:
                     for bi, oidx in enumerate(active):
-                        path = tuple(seqs[oidx])
-                        if path in ras_counts:
-                            last[bi, :] -= ras_counts[path] * 1e9
+                        pref = tuple(seqs[oidx])
+                        if pref in ras_counts:
+                            last[bi, :] -= 1e9  # effectively forbids repeating this exact action at this prefix
 
-                # ---------------- first decision: FEAT or LEAF ----------------
+                # ---------------- first decision: choose FEAT or LEAF ----------------
                 mask1 = torch.zeros((len(active), v.size()), dtype=torch.bool, device=device)
+
                 for bi, oidx in enumerate(active):
                     if not depths[oidx]:
                         continue
+
                     d = depths[oidx][-1]
                     can_split = (d < c.max_depth)
 
                     rows_rel = row_stacks[oidx][-1]
-                    Xb = envs[oidx].X_full[envs[oidx].idxs]  # [B, F]
-                    Xleaf = Xb.index_select(0, rows_rel)     # [n_leaf, F]
+                    Xb = envs[oidx].X_full[envs[oidx].idxs]   # [B,F]
+                    Xleaf = Xb.index_select(0, rows_rel)       # [n_leaf,F]
+                    n_leaf = int(Xleaf.size(0))
 
+                    # Valid features: need ≥2 distinct bins; if min_child_size>0, at least one viable threshold
                     valid_feats = []
-                    if can_split and Xleaf.size(0) > 1:
-                        n_leaf = Xleaf.size(0)
+                    if can_split and n_leaf > 1:
+                        mcs = int(c.min_child_size or 0)
                         for f in range(Xleaf.size(1)):
                             bf = Xleaf[:, f]
                             uniq, counts = torch.unique(bf, return_counts=True)
                             if uniq.numel() < 2:
                                 continue
-                            if c.min_child_size and c.min_child_size > 1:
-                                csum = counts.cumsum(0)[:-1]
-                                left_ok  = csum >= c.min_child_size
-                                right_ok = (n_leaf - csum) >= c.min_child_size
-                                if not bool((left_ok & right_ok).any()):
+                            if mcs > 1:
+                                csum = counts.cumsum(0)[:-1]   # positions align with uniq[:-1]
+                                if not bool(((csum >= mcs) & ((n_leaf - csum) >= mcs)).any()):
                                     continue
                             valid_feats.append(f)
 
-                    mask1[bi, LEAF_TOKEN] = True                         # allow LEAF
-                    if len(valid_feats) > 0:
+                    # LEAF allowed unless cooldown blocks and a split is feasible
+                    allow_leaf = True
+                    if leaf_cd_steps > 0 and can_split:
+                        if cd_stacks[oidx][-1] > 0:
+                            allow_leaf = False
+
+                    if allow_leaf:
+                        mask1[bi, LEAF_TOKEN] = True
+
+                    if valid_feats:
                         feat_ids = v.split_start + torch.as_tensor(valid_feats, device=device, dtype=torch.long)
                         mask1[bi, feat_ids] = True
-                    mask1[bi, v.EOS] = False                              # never end here
+
+                    # never allow EOS here; branches close via LEAF
+                    mask1[bi, v.EOS] = False
+
+                    # cooldown ticks down one step while this leaf remains open
+                    if cd_stacks[oidx]:
+                        cd_stacks[oidx][-1] = max(0, cd_stacks[oidx][-1] - 1)
 
                 toks1 = _safe_sample(last, mask1, temp)
 
-                need_threshold: List[Tuple[int,int,int,torch.Tensor,torch.Tensor,torch.Tensor]] = []
+                # Collect leaves that chose a FEAT (need threshold next)
+                need_threshold: List[Tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
                 still_for_round: List[int] = []
+
                 for bi, oidx in enumerate(active):
-                    tok = toks1[bi].item()
+                    tok = int(toks1[bi].item())
                     if not mask1[bi].any():
                         envs[oidx].done = True
                         continue
 
                     seqs[oidx].append(tok)
                     if ras_counts is not None:
-                        path = tuple(seqs[oidx])
-                        ras_counts[path] = ras_counts.get(path, 0) + 1
+                        pref = tuple(seqs[oidx])
+                        ras_counts[pref] = ras_counts.get(pref, 0) + 1
 
                     if tok == LEAF_TOKEN:
-                        envs[oidx].step(('leaf', 0))
-                        depths[oidx].pop(); lo_stacks[oidx].pop(); hi_stacks[oidx].pop(); row_stacks[oidx].pop()
+                        # close this leaf
+                        envs[oidx].step(("leaf", 0))
+                        depths[oidx].pop(); lo_stacks[oidx].pop(); hi_stacks[oidx].pop(); row_stacks[oidx].pop(); cd_stacks[oidx].pop()
                         _mark_done_if_finished(oidx)
                         if not envs[oidx].done:
                             still_for_round.append(oidx)
                         continue
 
+                    # FEAT chosen -> request threshold
                     kind, f_idx = self.tokenizer.decode_one(tok)  # 'feat'
                     envs[oidx].step((kind, f_idx))
-                    d0 = depths[oidx].pop()
-                    lo_top, hi_top = lo_stacks[oidx].pop(), hi_stacks[oidx].pop()
-                    rows_rel = row_stacks[oidx].pop()
-                    need_threshold.append((oidx, f_idx, d0, lo_top.clone(), hi_top.clone(), rows_rel.clone()))
 
-                # ---------------- second decision: THRESHOLD ----------------
+                    d0 = depths[oidx].pop()
+                    lo_top = lo_stacks[oidx].pop()
+                    hi_top = hi_stacks[oidx].pop()
+                    rows_rel = row_stacks[oidx].pop()
+                    cd_top = cd_stacks[oidx].pop()
+
+                    need_threshold.append((oidx, int(f_idx), d0, lo_top.clone(), hi_top.clone(), rows_rel.clone(), cd_top))
+
+                # ---------------- second decision: choose THRESHOLD ----------------
                 if need_threshold:
                     sub_idx = [oidx for (oidx, *_) in need_threshold]
                     sub_pad = torch.nn.utils.rnn.pad_sequence(
@@ -934,7 +969,7 @@ class Trainer:
                     mask2 = torch.zeros((len(sub_idx), v.size()), dtype=torch.bool, device=device)
                     th_base = v.split_start + v.num_feat
 
-                    for si, (oidx, f_idx, d0, lo_top, hi_top, rows_rel) in enumerate(need_threshold):
+                    for si, (oidx, f_idx, d0, lo_top, hi_top, rows_rel, cd_top) in enumerate(need_threshold):
                         Xb = envs[oidx].X_full[envs[oidx].idxs]
                         bf = Xb.index_select(0, rows_rel)[:, f_idx]
 
@@ -945,49 +980,84 @@ class Trainer:
                         if uniq.numel() < 2:
                             continue
 
-                        cand_t = uniq[:-1]
-                        if c.min_child_size and c.min_child_size > 1:
-                            csum = counts.cumsum(0)[:-1]
-                            keep = (csum >= c.min_child_size) & ((bf.numel() - csum) >= c.min_child_size)
-                            cand_t = cand_t[keep]
+                        # Candidate thresholds are the *bin values* uniq[:-1]; positions 0..len-1
+                        th_all_bins = uniq[:-1]
+                        th_pos_all  = torch.arange(th_all_bins.numel(), device=device)
 
+                        # min_child_size mask
+                        mask_mc = torch.ones_like(th_pos_all, dtype=torch.bool)
+                        mcs = int(c.min_child_size or 0)
+                        if mcs > 1:
+                            csum_all = counts.cumsum(0)[:-1]
+                            n_leaf = int(bf.numel())
+                            left_ok  = csum_all >= mcs
+                            right_ok = (n_leaf - csum_all) >= mcs
+                            mask_mc = left_ok & right_ok
+
+                        # feasible bin window mask
                         lo_f = int(lo_top[f_idx].item())
                         hi_f = int(hi_top[f_idx].item())
-                        if cand_t.numel() > 0:
-                            cand_t = cand_t[(cand_t >= lo_f) & (cand_t <= hi_f)]
+                        mask_win = (th_all_bins >= lo_f) & (th_all_bins <= hi_f)
 
-                        if cand_t.numel() > 0:
-                            th_ids = th_base + cand_t.to(device=device, dtype=torch.long)
+                        # final mask for these thresholds
+                        mask_final = mask_mc & mask_win
+                        if mask_final.any():
+                            cand_bins = th_all_bins[mask_final]                 # bin values
+                            cand_pos  = th_pos_all[mask_final]                  # positions into csum_all
+
+                            th_ids = th_base + cand_bins.to(device=device, dtype=torch.long)
                             mask2[si, th_ids] = True
 
+                            # Optional imbalance penalty: push logits down for skewed splits
+                            if th_imbal_gamma > 0.0 and mcs > 0:
+                                csum_all = counts.cumsum(0)[:-1].float()
+                                n_leaf = float(bf.numel())
+                                left_counts = csum_all.index_select(0, cand_pos)
+                                imbal = (2.0 * (left_counts / max(1.0, n_leaf)) - 1.0).abs()  # ∈ [0,1]
+                                for jj, bval in enumerate(cand_bins.tolist()):
+                                    last_th[si, th_base + int(bval)] -= th_imbal_gamma * float(imbal[jj].item())
+
+                        # never allow EOS/LEAF in threshold step
                         mask2[si, v.EOS] = False
                         mask2[si, LEAF_TOKEN] = False
 
                     toks2 = _safe_sample(last_th, mask2, temp)
 
-                    for si, (oidx, f_idx, d0, lo_top, hi_top, rows_rel) in enumerate(need_threshold):
-                        t_tok = toks2[si].item()
+                    for si, (oidx, f_idx, d0, lo_top, hi_top, rows_rel, cd_top) in enumerate(need_threshold):
+                        t_tok = int(toks2[si].item())
                         seqs[oidx].append(t_tok)
                         if ras_counts is not None:
-                            path = tuple(seqs[oidx]); ras_counts[path] = ras_counts.get(path, 0) + 1
+                            pref = tuple(seqs[oidx])
+                            ras_counts[pref] = ras_counts.get(pref, 0) + 1
 
                         _, t_idx = self.tokenizer.decode_one(t_tok)
 
+                        # Split rows
                         Xb = envs[oidx].X_full[envs[oidx].idxs]
                         fv = Xb.index_select(0, rows_rel)[:, f_idx]
                         m = fv <= t_idx
                         rows_L = rows_rel[m]
                         rows_R = rows_rel[~m]
 
+                        # Update feasible bin windows for children
                         lo_L, hi_L = lo_top.clone(), hi_top.clone()
                         hi_L[f_idx] = torch.minimum(hi_L[f_idx], torch.as_tensor(t_idx, device=device))
                         lo_R, hi_R = lo_top.clone(), hi_top.clone()
                         lo_R[f_idx] = torch.maximum(lo_R[f_idx], torch.as_tensor(t_idx + 1, device=device))
 
+                        # Push children (R then L) for LIFO expansion order
                         depths[oidx].append(d0 + 1); lo_stacks[oidx].append(lo_R); hi_stacks[oidx].append(hi_R); row_stacks[oidx].append(rows_R)
                         depths[oidx].append(d0 + 1); lo_stacks[oidx].append(lo_L); hi_stacks[oidx].append(hi_L); row_stacks[oidx].append(rows_L)
 
-                        envs[oidx].step(('th', int(t_idx)))
+                        # Set cooldown for children (if enabled)
+                        if leaf_cd_steps > 0:
+                            cd_stacks[oidx].append(leaf_cd_steps)
+                            cd_stacks[oidx].append(leaf_cd_steps)
+                        else:
+                            cd_stacks[oidx].append(0)
+                            cd_stacks[oidx].append(0)
+
+                        envs[oidx].step(("th", int(t_idx)))
                         if depths[oidx]:
                             still_for_round.append(oidx)
                         else:
@@ -995,6 +1065,7 @@ class Trainer:
 
                 active = still_for_round
 
+        # Finalize outputs
         for i in range(num):
             if envs[i].done:
                 if seqs[i][-1] != END_TOKEN:
@@ -1004,6 +1075,8 @@ class Trainer:
                 out[i] = None
 
         return out
+
+
 
 
 
