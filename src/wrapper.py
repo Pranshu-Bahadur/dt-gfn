@@ -408,3 +408,119 @@ class DTGFNClassifier:
         """
         self._cfg.update(params)
         return self
+
+
+class DTGFNRegressor:
+    """
+    Regressor twin of DTGFNClassifier.
+
+    • Uses the same configuration surface
+    • Always treats the task as regression (even if y is integer-typed)
+    • Returns float32 predictions
+    """
+
+    def __init__(self, **kwargs: Any):
+        # Reuse the exact same knob surface as DTGFNClassifier
+        self._clf_stub = DTGFNClassifier(**kwargs)
+        # Internal mirrors for convenience
+        self._trainer: Optional[Trainer] = None
+        self._df_train: Optional[pd.DataFrame] = None
+        self.feature_cols_: Optional[List[str]] = None
+        self.n_features_in_: Optional[int] = None
+
+    # Proxy cfg dict accessors for consistency
+    @property
+    def _cfg(self) -> Dict[str, Any]:
+        return self._clf_stub._cfg
+
+    # ------------------------------------------------------------------
+    def fit(
+        self,
+        X: Union[pd.DataFrame, np.ndarray, Iterable],
+        y: Union[pd.Series, np.ndarray, Iterable],
+    ) -> "DTGFNRegressor":
+        df_X = _to_df(X)
+        self.n_features_in_ = df_X.shape[1]
+
+        # force regression target
+        y_arr = np.asarray(y, dtype=np.float32)
+
+        df_train = df_X.copy()
+        if TARGET_COL in df_train.columns:
+            df_train = df_train.drop(columns=[TARGET_COL])
+        df_train[TARGET_COL] = y_arr
+
+        # freeze feature order
+        self.feature_cols_ = [c for c in df_train.columns if c != TARGET_COL]
+
+        # filter to Config
+        cfg_kwargs = dict(self._cfg)
+        allowed = set(getattr(Config, "__dataclass_fields__", {}).keys())
+        filtered = {k: v for k, v in cfg_kwargs.items() if k in allowed}
+
+        filtered["feature_cols"] = self.feature_cols_
+        filtered["target_col"] = TARGET_COL
+        filtered["task"] = "regression"
+
+        # choose device if none provided
+        if ("device" in allowed) and (filtered.get("device") is None):
+            import torch
+            filtered["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+
+        cfg = Config(**filtered)
+        trainer = Trainer(cfg).fit(df_train)
+
+        self._trainer = trainer
+        self._df_train = df_train
+        return self
+
+    # ------------------------------------------------------------------
+    def _align_infer_df(self, X: Union[pd.DataFrame, np.ndarray, Iterable]) -> pd.DataFrame:
+        # reuse classifier helper semantics
+        return self._clf_stub._align_infer_df(X)
+
+    # ------------------------------------------------------------------
+    def predict(
+        self,
+        X: Union[pd.DataFrame, np.ndarray, Iterable],
+        *,
+        predict_mode: str = "policy",
+        n_trees: Optional[int] = None,
+        infer_reward: Optional[str] = None,
+        algorithm: str = "rf",
+        policy_predictor_mode: Optional[str] = None,
+    ) -> np.ndarray:
+        if self._trainer is None or self._df_train is None:
+            raise RuntimeError("Call fit() before predict().")
+
+        df = self._align_infer_df(X)
+
+        # Prefer trainer.infer_regression if available
+        if hasattr(self._trainer, "infer_regression"):
+            y = self._trainer.infer_regression(
+                df,
+                n_trees=(n_trees or self._cfg.get("policy_inference_trees", 500)),
+                mode=predict_mode,
+                infer_reward=(infer_reward or self._cfg.get("infer_reward_function")),
+                algorithm=algorithm,
+                policy_predictor_mode=(policy_predictor_mode or self._cfg.get("policy_predictor_mode", "dirichlet_sample")),
+            )
+        else:
+            y = self._trainer.predict(
+                df_test=df,
+                df_train=self._df_train,
+                use_policy=(predict_mode == "policy"),
+                policy_inference_trees=(n_trees or self._cfg.get("policy_inference_trees", 500)),
+                policy_predictor_mode=(policy_predictor_mode or self._cfg.get("policy_predictor_mode", "dirichlet_sample")),
+                infer_reward=(infer_reward or self._cfg.get("infer_reward_function")),
+                algorithm=algorithm,
+            )
+        return np.asarray(y, dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    def get_params(self, deep: bool = True) -> Dict[str, Any]:
+        return dict(self._cfg)
+
+    def set_params(self, **params: Any) -> "DTGFNRegressor":
+        self._cfg.update(params)
+        return self

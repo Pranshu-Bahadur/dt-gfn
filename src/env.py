@@ -68,27 +68,39 @@ class TabularEnv:
         # ----- Features (bin and store edges) -----
         X_df = df[self.feature_cols].copy()
 
-        strat = self.binning_strategy.lower()
-        if strat in ("lgbm_like", "per_feature_auto", "quantile_per_feature"):
-            X_binned_np, meta = self._build_bins_lgbm_like(
-                X_df,
-                max_bins=self.n_bins,
-                min_data_in_bin=self.min_data_in_bin,
-                subsample_for_bin=self.subsample_for_bin,
-                overrides=self.per_feature_binning,
-            )
-            self.bin_meta = meta  # edges per feature, bins per feature, totals
-        elif strat in ("quantile",):
-            X_binned_np, meta = self._build_bins_quantile(X_df, n_bins=self.n_bins)
-            self.bin_meta = meta
-        elif strat in ("global_uniform", "uniform"):
-            X_binned_np, meta = self._build_bins_uniform(X_df, n_bins=self.n_bins)
-            self.bin_meta = meta
-        else:
-            raise ValueError(f"Unknown binning_strategy='{self.binning_strategy}'.")
+        # Fast path: regression + already-integer pre-binned features (use int8, no re-binning)
+        used_prebinned = False
+        if self.task == "regression":
+            prebinned_ok, X_prebinned_np, meta_prebin = self._try_prebinned_passthrough(X_df)
+            if prebinned_ok:
+                used_prebinned = True
+                self.bin_meta = meta_prebin
+                # int8 on train
+                self.X_full = torch.from_numpy(X_prebinned_np.astype(np.int8, copy=False)).to(self.device)
 
-        # Tensor-ize
-        self.X_full = torch.from_numpy(X_binned_np.astype(np.int16, copy=False)).to(self.device)
+        if not used_prebinned:
+            strat = self.binning_strategy.lower()
+            if strat in ("lgbm_like", "per_feature_auto", "quantile_per_feature"):
+                X_binned_np, meta = self._build_bins_lgbm_like(
+                    X_df,
+                    max_bins=self.n_bins,
+                    min_data_in_bin=self.min_data_in_bin,
+                    subsample_for_bin=self.subsample_for_bin,
+                    overrides=self.per_feature_binning,
+                )
+                self.bin_meta = meta  # edges per feature, bins per feature, totals
+            elif strat in ("quantile",):
+                X_binned_np, meta = self._build_bins_quantile(X_df, n_bins=self.n_bins)
+                self.bin_meta = meta
+            elif strat in ("global_uniform", "uniform"):
+                X_binned_np, meta = self._build_bins_uniform(X_df, n_bins=self.n_bins)
+                self.bin_meta = meta
+            else:
+                raise ValueError(f"Unknown binning_strategy='{self.binning_strategy}'.")
+
+            # Standard tensor dtype for binned ints
+            self.X_full = torch.from_numpy(X_binned_np.astype(np.int16, copy=False)).to(self.device)
+
         self.idxs = torch.arange(self.X_full.size(0), device=self.device, dtype=torch.long)
 
         # Expose per-feature bin counts as a tensor (for trainer window init, optional)
@@ -103,6 +115,71 @@ class TabularEnv:
         self.done: bool = False
         self._batch_size: int = 0
         self._n_splits: int = 0  # decision (split) count for structure prior
+
+    # ======================================================================
+    # Pre-binned passthrough (regression-only)
+    # ======================================================================
+    def _try_prebinned_passthrough(self, X_df: pd.DataFrame) -> Tuple[bool, Optional[np.ndarray], Optional[Dict]]:
+        """
+        Detect whether ALL features are integer-coded, non-negative, contiguous (0..K-1),
+        and within int8 capacity (max ≤ 127). If yes, treat them as pre-binned and
+        return (True, np.int8 array, meta). Otherwise (False, None, None).
+        """
+        N, F = X_df.shape
+        bins_by_feat: Dict[str, int] = {}
+        edges_by_feat: Dict[str, np.ndarray] = {}
+        X_np = np.zeros((N, F), dtype=np.int8)
+
+        for j, col in enumerate(X_df.columns):
+            s_raw = X_df[col].to_numpy()
+            s = s_raw.astype(np.float64)
+            s = s[np.isfinite(s)]
+            if s.size == 0:
+                return False, None, None
+
+            # integer-valued check
+            if not np.all(np.mod(s, 1.0) == 0.0):
+                return False, None, None
+
+            s_full = X_df[col].to_numpy().astype(np.int64, copy=False)
+            vmin = int(np.nanmin(s_full))
+            vmax = int(np.nanmax(s_full))
+
+            # non-negative, int8 capacity
+            if vmin < 0 or vmax > 127:
+                return False, None, None
+
+            uniq = np.unique(s_full[~pd.isna(s_full)])
+            # contiguous check: {0,1,...,K-1}
+            if uniq.size == 0:
+                return False, None, None
+            if uniq[0] != 0 or uniq[-1] != (uniq.size - 1):
+                return False, None, None
+            if np.any(np.diff(uniq) != 1):
+                return False, None, None
+
+            # pass through; cast to int8 (safe due to vmax ≤ 127)
+            X_np[:, j] = X_df[col].to_numpy().astype(np.int8, copy=False)
+
+            K = int(vmax + 1)
+            bins_by_feat[col] = K
+            # Provide synthetic edges for completeness ([-0.5, 0.5, ..., K-0.5])
+            edges_by_feat[col] = np.arange(-0.5, K + 0.5, 1.0, dtype=np.float64)
+
+        total_bins_used = int(sum(b for b in bins_by_feat.values() if b > 1))
+        n_used_feats = int(sum(1 for b in bins_by_feat.values() if b > 1))
+        print(f"[Binning] (prebinned pass-through) Total Bins {total_bins_used}")
+        print(f"[Binning] Number of data points in the train set: {N}, number of used features: {n_used_feats}")
+
+        meta = dict(
+            strategy="prebinned",
+            edges=edges_by_feat,                 # synthetic, 1-step edges
+            bins_per_feature=bins_by_feat,
+            total_bins_used=total_bins_used,
+            n_used_features=n_used_feats,
+            total_bins_all=int(sum(bins_by_feat.values())),
+        )
+        return True, X_np, meta
 
     # ======================================================================
     # Binning implementations
@@ -361,9 +438,38 @@ class TabularEnv:
         Signature kept for backward-compat with older trainer code.
         """
         cols = self.feature_cols if feature_cols is None else feature_cols
+        strategy = self.bin_meta.get("strategy", "")
+
+        # Pass-through path for pre-binned regression features
+        if strategy == "prebinned":
+            # Strict validation: integers, non-negative, within train bins
+            X_df = df_test.loc[:, cols].copy()
+            X_np = np.zeros((X_df.shape[0], len(cols)), dtype=np.int8)
+            for j, col in enumerate(cols):
+                s_full = X_df[col].to_numpy()
+                if not np.all(np.isfinite(s_full)):
+                    raise ValueError(f"Non-finite values in column '{col}' for prebinned inference.")
+                if not np.all(np.mod(s_full, 1.0) == 0.0):
+                    raise ValueError(f"Non-integer values in column '{col}' for prebinned inference.")
+                s_full = s_full.astype(np.int64, copy=False)
+                if np.min(s_full) < 0:
+                    raise ValueError(f"Negative values in column '{col}' for prebinned inference.")
+                K = int(self.bin_meta["bins_per_feature"][col])
+                vmax = int(np.max(s_full))
+                if vmax >= K:
+                    raise ValueError(
+                        f"Out-of-range bin in column '{col}' (got max {vmax}, expected < {K})."
+                    )
+                if vmax > 127:
+                    raise ValueError(
+                        f"Column '{col}' exceeds int8 capacity in inference (max {vmax})."
+                    )
+                X_np[:, j] = s_full.astype(np.int8, copy=False)
+            return torch.from_numpy(X_np).to(self.device)
+
+        # Normal binning path
         edges_by_feat = self.bin_meta["edges"]
         X_df = df_test.loc[:, cols].copy()
-
         X_binned = np.zeros((X_df.shape[0], len(cols)), dtype=np.int32)
         for j, col in enumerate(cols):
             s = X_df[col].to_numpy()
