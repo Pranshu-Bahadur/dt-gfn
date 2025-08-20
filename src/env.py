@@ -38,7 +38,8 @@ class TabularEnv:
         min_data_in_bin: Optional[int] = None,
         subsample_for_bin: Optional[int] = None,
 
-        # Optional future hook: explicit per-feature overrides (unused if None)
+        # Optional per-feature overrides:
+        #   {"feature": {"type": "binary"/"continuous", "n_bins": K}}
         per_feature_binning: Optional[Dict[str, Dict]] = None,
     ):
         self.device = torch.device(device)
@@ -76,7 +77,7 @@ class TabularEnv:
                 subsample_for_bin=self.subsample_for_bin,
                 overrides=self.per_feature_binning,
             )
-            self.bin_meta = meta  # edges per feature, bins per feature, total bins
+            self.bin_meta = meta  # edges per feature, bins per feature, totals
         elif strat in ("quantile",):
             X_binned_np, meta = self._build_bins_quantile(X_df, n_bins=self.n_bins)
             self.bin_meta = meta
@@ -86,15 +87,22 @@ class TabularEnv:
         else:
             raise ValueError(f"Unknown binning_strategy='{self.binning_strategy}'.")
 
+        # Tensor-ize
         self.X_full = torch.from_numpy(X_binned_np.astype(np.int16, copy=False)).to(self.device)
         self.idxs = torch.arange(self.X_full.size(0), device=self.device, dtype=torch.long)
 
+        # Expose per-feature bin counts as a tensor (for trainer window init, optional)
+        self.feature_num_bins = torch.as_tensor(
+            [self.bin_meta["bins_per_feature"][c] for c in self.feature_cols],
+            device=self.device, dtype=torch.long
+        )
+
         # ----- Rollout bookkeeping (mutable; trainer will copy envs) -----
-        self.paths: List[Tuple] = []   # free to use as you like
+        self.paths: List[Tuple] = []
         self.open_leaves: int = 1
         self.done: bool = False
         self._batch_size: int = 0
-        self._n_splits: int = 0        # decision (split) count for structure prior
+        self._n_splits: int = 0  # decision (split) count for structure prior
 
     # ======================================================================
     # Binning implementations
@@ -114,13 +122,15 @@ class TabularEnv:
           • numeric         → quantile cuts (on subsample), cap at max_bins
           • optional merge of tiny adjacent bins to satisfy min_data_in_bin
           • respects simple 'overrides' like {"type": "binary"|"continuous", "n_bins": K}
-        Prints:
-          [Binning] Total Bins {sum over feats}
-          [Binning] Number of data points in the train set: N, number of used features: F
+
+        Prints (matching LightGBM semantics):
+          [Binning] Total Bins <sum of bins over *used* features (bins > 1)>
+          [Binning] Number of data points in the train set: N, number of used features: <count of bins > 1>
         """
         rng = np.random.default_rng(12345)
         N, F = X_df.shape
 
+        # Subsample for cut computation (faster/robust for large N)
         if subsample_for_bin and N > subsample_for_bin:
             sample_idx = rng.choice(N, size=subsample_for_bin, replace=False)
             Xs = X_df.iloc[sample_idx]
@@ -136,25 +146,25 @@ class TabularEnv:
             ss = Xs[col].to_numpy()
             ov = overrides.get(col, {})
 
-            # If explicitly forced to binary/continuous with custom bins
+            # Optional explicit override
             forced_type = ov.get("type", None)
             forced_bins = int(ov.get("n_bins", max_bins)) if "n_bins" in ov else max_bins
 
-            edges: np.ndarray
-            # ---- Detect binary quickly unless overridden ----
+            # ---- Detect constant/binary on full data (more stable than just sample) ----
+            uniq_full = np.unique(s[~pd.isna(s)])
+            is_constant = uniq_full.size <= 1
+            is_binary01 = (uniq_full.size == 2) and set(uniq_full).issubset({0, 1})
+
             if forced_type == "binary":
                 edges = np.array([-0.5, 0.5, 1.5], dtype=np.float64)
             elif forced_type == "continuous":
                 edges = self._quantile_edges(ss, forced_bins)
                 edges = self._merge_tiny_bins(ss, edges, min_data_in_bin, forced_bins)
             else:
-                uniq_sample = np.unique(ss[~pd.isna(ss)])
-                if uniq_sample.size <= 1:
-                    # constant
-                    edges = np.array([-np.inf, np.inf], dtype=np.float64)  # 1 bin
-                elif uniq_sample.size == 2 and set(uniq_sample).issubset({0, 1}):
-                    # true binary
-                    edges = np.array([-0.5, 0.5, 1.5], dtype=np.float64)   # 2 bins
+                if is_constant:
+                    edges = np.array([-np.inf, np.inf], dtype=np.float64)  # 1 bin (dropped as "unused")
+                elif is_binary01:
+                    edges = np.array([-0.5, 0.5, 1.5], dtype=np.float64)   # true binary (2 bins)
                 else:
                     # numeric-like
                     edges = self._quantile_edges(ss, max_bins)
@@ -168,15 +178,20 @@ class TabularEnv:
             edges_by_feat[col] = edges
             bins_by_feat[col] = int(edges.size - 1)
 
-        total_bins = int(sum(bins_by_feat.values()))
-        print(f"[Binning] Total Bins {total_bins}")
-        print(f"[Binning] Number of data points in the train set: {N}, number of used features: {F}")
+        # LightGBM logs: "Total Bins" and "used features" (exclude constant features)
+        total_bins_used = int(sum(b for b in bins_by_feat.values() if b > 1))
+        n_used_feats = int(sum(1 for b in bins_by_feat.values() if b > 1))
+
+        print(f"[Binning] Total Bins {total_bins_used}")
+        print(f"[Binning] Number of data points in the train set: {N}, number of used features: {n_used_feats}")
 
         meta = dict(
             strategy="lgbm_like",
             edges=edges_by_feat,
             bins_per_feature=bins_by_feat,
-            total_bins=total_bins,
+            total_bins_used=total_bins_used,
+            n_used_features=n_used_feats,
+            total_bins_all=int(sum(bins_by_feat.values())),
         )
         return X_binned, meta
 
@@ -185,19 +200,24 @@ class TabularEnv:
         xs = xs[np.isfinite(xs)]
         if xs.size == 0:
             return np.array([-np.inf, np.inf], dtype=np.float64)
-        # start with max_bins bins → max_bins+1 edges
+
+        # Start with ≤ max_bins bins → ≤ max_bins+1 edges
+        # Use unique quantiles to avoid degenerate duplicates on small data
         q = np.linspace(0.0, 1.0, num=min(max_bins, max(2, xs.size)) + 1)
         raw = np.unique(np.quantile(xs, q))
-        # cap edges to (max_bins + 1)
+
+        # Cap edges to (max_bins + 1)
         if raw.size > (max_bins + 1):
             stride = max(1, raw.size // (max_bins + 1))
             raw = raw[::stride]
             if raw.size > (max_bins + 1):
                 raw = raw[: (max_bins + 1)]
-        # widen outer edges slightly
+
+        # Widen outer edges a touch
+        raw = raw.astype(np.float64, copy=False)
         raw[0] = np.floor(raw[0] - 1e-9)
         raw[-1] = np.ceil(raw[-1] + 1e-9)
-        return raw.astype(np.float64, copy=False)
+        return raw
 
     def _merge_tiny_bins(
         self,
@@ -206,7 +226,8 @@ class TabularEnv:
         min_data_in_bin: int,
         max_bins: int,
     ) -> np.ndarray:
-        """Merge adjacent bins left-to-right until all sample hist counts ≥ min_data_in_bin."""
+        """Merge adjacent bins left→right until all sample hist counts ≥ min_data_in_bin.
+        Also enforces a hard cap of `max_bins` bins by merging the smallest-adjacent pair."""
         if min_data_in_bin <= 1 or edges.size <= 2:
             return edges
 
@@ -237,7 +258,7 @@ class TabularEnv:
                 del E[k]               # remove last edge
                 k -= 1
 
-            # hard cap to max_bins (merge smallest adjacent pair)
+            # hard cap to max_bins → merge the smallest adjacent pair
             if len(C) > max_bins and len(C) >= 2:
                 pairs = [C[i] + C[i + 1] for i in range(len(C) - 1)]
                 idx = int(np.argmin(pairs))
@@ -267,11 +288,18 @@ class TabularEnv:
             edges_by_feat[col] = edges
             bins_by_feat[col] = int(edges.size - 1)
 
+        total_bins_used = int(sum(b for b in bins_by_feat.values() if b > 1))
+        n_used_feats = int(sum(1 for b in bins_by_feat.values() if b > 1))
+        print(f"[Binning] Total Bins {total_bins_used}")
+        print(f"[Binning] Number of data points in the train set: {X_df.shape[0]}, number of used features: {n_used_feats}")
+
         meta = dict(
             strategy="quantile",
             edges=edges_by_feat,
             bins_per_feature=bins_by_feat,
-            total_bins=int(sum(bins_by_feat.values())),
+            total_bins_used=total_bins_used,
+            n_used_features=n_used_feats,
+            total_bins_all=int(sum(bins_by_feat.values())),
         )
         return X_binned, meta
 
@@ -303,11 +331,18 @@ class TabularEnv:
             edges_by_feat[col] = edges
             bins_by_feat[col] = int(edges.size - 1)
 
+        total_bins_used = int(sum(b for b in bins_by_feat.values() if b > 1))
+        n_used_feats = int(sum(1 for b in bins_by_feat.values() if b > 1))
+        print(f"[Binning] Total Bins {total_bins_used}")
+        print(f"[Binning] Number of data points in the train set: {X_df.shape[0]}, number of used features: {n_used_feats}")
+
         meta = dict(
             strategy="global_uniform",
             edges=edges_by_feat,
             bins_per_feature=bins_by_feat,
-            total_bins=int(sum(bins_by_feat.values())),
+            total_bins_used=total_bins_used,
+            n_used_features=n_used_feats,
+            total_bins_all=int(sum(bins_by_feat.values())),
         )
         return X_binned, meta
 
@@ -317,9 +352,9 @@ class TabularEnv:
     def _featurise(
         self,
         df_test: pd.DataFrame,
-        df_train: Optional[pd.DataFrame] = None,
-        feature_cols: Optional[List[str]] = None,
-        n_bins: Optional[int] = None,
+        df_train: Optional[pd.DataFrame] = None,   # kept for backward-compat
+        feature_cols: Optional[List[str]] = None,  # ignored if None
+        n_bins: Optional[int] = None,              # ignored; we use learned edges
     ) -> torch.Tensor:
         """
         Re-bin test data using the train-time edges in self.bin_meta.
@@ -343,19 +378,14 @@ class TabularEnv:
     # Rollout helpers used by Trainer
     # ======================================================================
     def draw_indices(self, batch_size: int) -> torch.Tensor:
-        """
-        Sample a mini-batch of row indices (without replacement if possible).
-        """
+        """Sample a mini-batch of row indices (without replacement if possible)."""
         N = self.X_full.size(0)
         b = int(batch_size)
         if b <= 0:
             b = N
         if b >= N:
-            # use full dataset
             return torch.arange(N, device=self.device, dtype=torch.long)
-        # without replacement when feasible
-        idx = torch.randperm(N, device=self.device)[:b]
-        return idx
+        return torch.randperm(N, device=self.device)[:b]
 
     def reset(self, batch_size: int) -> None:
         """
@@ -381,17 +411,12 @@ class TabularEnv:
             if self.open_leaves == 0:
                 self.done = True
         elif kind == "feat":
-            # no-op for prior counters; threshold will decide split
             pass
         elif kind == "th":
-            # splitting one leaf into two: net +1 open leaf
             self.open_leaves += 1
             self._n_splits += 1
 
     def get_prior(self, beta: float) -> torch.Tensor:
-        """
-        Simple structure prior: exp(-beta * #splits).
-        You can enrich this if you want to encode depth penalties, etc.
-        """
+        """Simple structure prior: exp(-beta * #splits)."""
         val = float(np.exp(-float(beta) * float(self._n_splits)))
         return torch.tensor(val, device=self.device, dtype=torch.float32)
