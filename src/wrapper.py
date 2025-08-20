@@ -30,7 +30,7 @@ class DTGFNClassifier:
     • Never leaks the target into features (uses reserved TARGET_COL)
     • Freezes feature order at fit-time and reuses it at inference
     • Encodes labels to 0..C-1 and maps predictions back to original labels
-    • Forwards redundancy / early-stop / viz / TB-stabilization / binning knobs
+    • Forwards all training/inference/binning/regularization/viz knobs to Trainer.Config
     """
 
     def __init__(
@@ -39,7 +39,7 @@ class DTGFNClassifier:
         # --- Core dataset/binning ---
         n_bins: int = 255,
         binning_strategy: str = "lgbm_like",   # "lgbm_like" | "quantile" | "global_uniform"
-        # LightGBM-like binning controls (used by env when strategy == "lgbm_like")
+        # LightGBM-like binning controls (env may use these when strategy == "lgbm_like")
         min_data_in_bin: Optional[int] = None,
         subsample_for_bin: Optional[int] = None,
         # Optional per-feature overrides: {"feature": {"type": "binary"/"continuous", "n_bins": K}}
@@ -47,7 +47,7 @@ class DTGFNClassifier:
 
         # --- Training budget / structure ---
         updates: int = 50,
-        rollouts: int = 60,
+        rollouts: int = 60,              # target unique rollouts per update (if enforced)
         max_depth: int = 7,
         top_k_trees: int = 10,
         num_parallel: int = 32,
@@ -73,21 +73,31 @@ class DTGFNClassifier:
         lstm_hidden: int = 256,
         mlp_layers: int = 3,
         mlp_width: int = 256,
-        backward_policy: str = "uniform",  # "uniform" | "network"
+        backward_policy: str = "uniform",  # "uniform" | "network" (usually uniform)
         beta: Optional[float] = None,
+        prior_scale: float = 0.5,
         device: Optional[str] = None,
 
-        # --- Redundancy & STOP ---
+        # --- Redundancy / uniqueness / STOP ---
         redundancy_aware: bool = True,
         redundancy_lambda_intra: float = 1.0,
         redundancy_lambda_inter: float = 0.25,
         redundancy_decay: float = 0.995,
-        redundancy_ngram: int = 4,
+        redundancy_ngram: int = 8,
+        enforce_unique_rollouts: bool = True,
+        unique_rollouts_max_rounds_factor: int = 50,
         dedup_sequences: bool = True,
 
-        allow_early_stop: bool = True,
+        allow_early_stop: bool = False,
         min_decisions_before_stop: int = 1,
         stop_bias: float = 0.0,
+
+        # --- Replay extras ---
+        replay_novelty_bonus: float = 0.10,
+        replay_metric_mode: str = "off",   # "off" | "acc_corr"
+        replay_metric_alpha: float = 1.0,
+        replay_metric_power: float = 1.0,
+        replay_metric_refresh: int = 1000,
 
         # --- TB stabilization & live viz ---
         tb_reward_temperature: float = 10.0,
@@ -96,6 +106,24 @@ class DTGFNClassifier:
         viz_every: int = 0,
         viz_dir: str = "runs/trees",
         viz_format: str = "png",
+
+        # --- System / throughput ---
+        amp: bool = True,
+        eval_on_cpu: bool = False,
+        metric_sample_size: int = 20000,
+        eval_batch_size: int = 16384,
+
+        # --- Reward scope ---
+        training_reward_scope: str = "per_tree",  # "per_tree" | "ensemble"
+        ensemble_reward_metric: str = "mse",
+
+        # --- Leaf discouragement & balance knobs ---
+        leaf_penalty_strength: float = 4.0,
+        leaf_penalty_decay: float = 0.85,
+        leaf_penalty_min_depth: int = 2,
+        leaf_bias: float = -0.2,
+        leaf_cooldown_steps: int = 1,
+        threshold_balance_gamma: float = 0.0,
     ):
         # Store everything; we'll filter by Config at fit()
         self._cfg: Dict[str, Any] = dict(
@@ -136,18 +164,28 @@ class DTGFNClassifier:
             mlp_width=mlp_width,
             backward_policy=backward_policy,
             beta=beta,
+            prior_scale=prior_scale,
             device=device,
 
-            # redundancy/STOP
+            # redundancy / uniqueness / stop
             redundancy_aware=redundancy_aware,
             redundancy_lambda_intra=redundancy_lambda_intra,
             redundancy_lambda_inter=redundancy_lambda_inter,
             redundancy_decay=redundancy_decay,
             redundancy_ngram=redundancy_ngram,
+            enforce_unique_rollouts=enforce_unique_rollouts,
+            unique_rollouts_max_rounds_factor=unique_rollouts_max_rounds_factor,
             dedup_sequences=dedup_sequences,
             allow_early_stop=allow_early_stop,
             min_decisions_before_stop=min_decisions_before_stop,
             stop_bias=stop_bias,
+
+            # replay extras
+            replay_novelty_bonus=replay_novelty_bonus,
+            replay_metric_mode=replay_metric_mode,
+            replay_metric_alpha=replay_metric_alpha,
+            replay_metric_power=replay_metric_power,
+            replay_metric_refresh=replay_metric_refresh,
 
             # TB/viz
             tb_reward_temperature=tb_reward_temperature,
@@ -156,6 +194,24 @@ class DTGFNClassifier:
             viz_every=viz_every,
             viz_dir=viz_dir,
             viz_format=viz_format,
+
+            # system / throughput
+            amp=amp,
+            eval_on_cpu=eval_on_cpu,
+            metric_sample_size=metric_sample_size,
+            eval_batch_size=eval_batch_size,
+
+            # reward scope
+            training_reward_scope=training_reward_scope,
+            ensemble_reward_metric=ensemble_reward_metric,
+
+            # leaf discouragement & balance
+            leaf_penalty_strength=leaf_penalty_strength,
+            leaf_penalty_decay=leaf_penalty_decay,
+            leaf_penalty_min_depth=leaf_penalty_min_depth,
+            leaf_bias=leaf_bias,
+            leaf_cooldown_steps=leaf_cooldown_steps,
+            threshold_balance_gamma=threshold_balance_gamma,
         )
 
         # set by fit()
@@ -276,7 +332,7 @@ class DTGFNClassifier:
                 policy_predictor_mode=(policy_predictor_mode or self._cfg.get("policy_predictor_mode", "dirichlet_sample")),
             )
         else:
-            # legacy API
+            # legacy / mainline API
             P = self._trainer.predict(
                 df_test=df,
                 df_train=self._df_train,

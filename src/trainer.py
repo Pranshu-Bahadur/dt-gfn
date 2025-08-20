@@ -1235,6 +1235,48 @@ class Trainer:
     # ========================================================
     # Predict
     # ========================================================
+
+    @torch.no_grad()
+    def _bin_test_like_train(
+        self,
+        env_template: TabularEnv,
+        df_test: pd.DataFrame,
+        df_train: pd.DataFrame,
+    ) -> torch.Tensor:
+        """
+        Convert df_test to binned tensor using the binning fitted on df_train
+        inside env_template. Tries new env.py APIs first, then falls back.
+
+        Expected return: torch.LongTensor [N_test, F] on env_template.device.
+        """
+        # New-style APIs (preferred)
+        if hasattr(env_template, "transform_df"):
+            X_te = env_template.transform_df(df_test)  # -> torch.LongTensor
+            return X_te.to(env_template.device)
+
+        if hasattr(env_template, "transform"):
+            X_te = env_template.transform(df_test)  # name sometimes differs
+            return X_te.to(env_template.device)
+
+        if hasattr(env_template, "featurise"):
+            X_te = env_template.featurise(df_test)  # sometimes spelled without '_'
+            return X_te.to(env_template.device)
+
+        # Legacy fallback (old env.py)
+        if hasattr(env_template, "_featurise"):
+            X_te = env_template._featurise(
+                df_test, df_train, self.cfg.feature_cols, self.cfg.n_bins
+            )
+            return X_te.to(env_template.device)
+
+        raise RuntimeError(
+            "TabularEnv does not expose a known transform/featurise method. "
+            "Please update env.py to provide transform_df/transform/featurise."
+        )
+
+        # ========================================================
+    # Predict
+    # ========================================================
     def predict(
         self,
         df_test: pd.DataFrame,
@@ -1249,11 +1291,35 @@ class Trainer:
         c = self.cfg
         algo_rf = c.random_forest if algorithm is None else (algorithm == "rf")
 
+        # --- New TabularEnv signature: keyword-only args ---
         env_template = TabularEnv(
-            df_train, c.feature_cols, c.target_col, c.n_bins, c.task,
-            binning_strategy=c.binning_strategy, device=c.device
+            df_train,
+            feature_cols=c.feature_cols,
+            target_col=c.target_col,
+            n_bins=c.n_bins,
+            task=c.task,
+            binning_strategy=c.binning_strategy,
+            device=c.device,
+            # pass-through (present in new env.py)
+            min_data_in_bin=getattr(c, "min_data_in_bin", None),
+            subsample_for_bin=getattr(c, "subsample_for_bin", None),
+            per_feature_binning=getattr(c, "per_feature_binning", None),
         )
-        X_te = env_template._featurise(df_test, df_train, c.feature_cols, c.n_bins)
+
+        # --- Transform test set using the training bins (new API first, legacy fallback) ---
+        if hasattr(env_template, "transform"):
+            X_te = env_template.transform(df_test)
+        elif hasattr(env_template, "_featurise"):
+            # prefer new-style _featurise(df, is_train=False) if available
+            try:
+                X_te = env_template._featurise(df_test, is_train=False)  # type: ignore[arg-type]
+            except TypeError:
+                # legacy path: _featurise(df_test, df_train, feature_cols, n_bins)
+                X_te = env_template._featurise(df_test, df_train, c.feature_cols, c.n_bins)  # type: ignore[misc]
+        else:
+            raise RuntimeError("TabularEnv has no transform/_featurise method for test data.")
+
+        # training tensors from env
         X_tr, y_tr = env_template.X_full.clone(), env_template.y_full.clone()
 
         if algo_rf:
@@ -1267,6 +1333,7 @@ class Trainer:
                 policy_predictor_mode=policy_predictor_mode, infer_reward=infer_reward
             )
         return preds.cpu().numpy()
+
 
     def _predict_in_batches(self, pred_fn, X, bs: int, device: str):
         out = []
