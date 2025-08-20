@@ -30,7 +30,7 @@ class DTGFNClassifier:
     • Never leaks the target into features (uses reserved TARGET_COL)
     • Freezes feature order at fit-time and reuses it at inference
     • Encodes labels to 0..C-1 and maps predictions back to original labels
-    • Forwards new redundancy / early-stop / viz / TB-stabilization / binning knobs
+    • Forwards new redundancy / early-stop / viz / TB-stabilization / binning / replay knobs
     """
 
     def __init__(
@@ -38,10 +38,12 @@ class DTGFNClassifier:
         *,
         # --- Core dataset/binning ---
         n_bins: int = 255,
-        binning_strategy: str = "quantile",   # "quantile" | "global_uniform" | "lgbm_quantile"
-        # LightGBM-like binning controls (used by env when strategy == "lgbm_quantile")
+        binning_strategy: str = "quantile",   # "quantile" | "global_uniform" | "per_feature_auto" | etc.
+        # Optional LightGBM-like binning controls (only used if your env supports them)
         min_data_in_bin: Optional[int] = None,
         subsample_for_bin: Optional[int] = None,
+        # Optional: explicit per-feature overrides if your env supports it
+        per_feature_binning: Optional[Dict[str, Any]] = None,
 
         # --- Training budget / structure ---
         updates: int = 50,
@@ -56,6 +58,8 @@ class DTGFNClassifier:
         boosting_lr: float = 0.1,
         reward_function: str = "bayesian",
         infer_reward_function: Optional[str] = None,
+        training_reward_scope: str = "per_tree",     # "per_tree" | "ensemble"
+        ensemble_reward_metric: str = "mse",
 
         # --- Tree feasibility ---
         min_child_size: int = 20,
@@ -73,6 +77,7 @@ class DTGFNClassifier:
         mlp_width: int = 256,
         backward_policy: str = "uniform",  # "uniform" | "network"
         beta: Optional[float] = None,
+        prior_scale: float = 0.5,
         device: Optional[str] = None,
 
         # --- Redundancy & STOP (new) ---
@@ -83,9 +88,21 @@ class DTGFNClassifier:
         redundancy_ngram: int = 4,
         dedup_sequences: bool = True,
 
+        # Uniqueness controls (trainer will try to return exactly `rollouts` unique trees)
+        enforce_unique_rollouts: bool = True,
+        unique_rollouts_max_rounds_factor: int = 50,
+
+        # Early STOP (global EOS) controls
         allow_early_stop: bool = True,
         min_decisions_before_stop: int = 1,
         stop_bias: float = 0.0,
+
+        # --- Replay sampling: novelty & metric weighting (new) ---
+        replay_novelty_bonus: float = 0.10,          # >=0.0
+        replay_metric_mode: str = "off",             # "off" | "acc_corr"
+        replay_metric_alpha: float = 1.0,
+        replay_metric_power: float = 1.0,
+        replay_metric_refresh: int = 1000,
 
         # --- TB stabilization & live viz (new) ---
         tb_reward_temperature: float = 10.0,
@@ -94,6 +111,12 @@ class DTGFNClassifier:
         viz_every: int = 0,
         viz_dir: str = "runs/trees",
         viz_format: str = "png",
+
+        # --- Throughput / evaluation knobs ---
+        amp: bool = True,
+        eval_on_cpu: bool = False,
+        metric_sample_size: int = 20000,
+        eval_batch_size: int = 16384,
     ):
         # Store everything; we'll filter by Config at fit()
         self._cfg: Dict[str, Any] = dict(
@@ -102,6 +125,7 @@ class DTGFNClassifier:
             binning_strategy=binning_strategy,
             min_data_in_bin=min_data_in_bin,
             subsample_for_bin=subsample_for_bin,
+            per_feature_binning=per_feature_binning,
 
             # training budget
             updates=updates,
@@ -116,6 +140,8 @@ class DTGFNClassifier:
             boosting_lr=boosting_lr,
             reward_function=reward_function,
             infer_reward_function=infer_reward_function,
+            training_reward_scope=training_reward_scope,
+            ensemble_reward_metric=ensemble_reward_metric,
 
             # feasibility
             min_child_size=min_child_size,
@@ -133,6 +159,7 @@ class DTGFNClassifier:
             mlp_width=mlp_width,
             backward_policy=backward_policy,
             beta=beta,
+            prior_scale=prior_scale,
             device=device,
 
             # redundancy/STOP
@@ -142,9 +169,20 @@ class DTGFNClassifier:
             redundancy_decay=redundancy_decay,
             redundancy_ngram=redundancy_ngram,
             dedup_sequences=dedup_sequences,
+
+            enforce_unique_rollouts=enforce_unique_rollouts,
+            unique_rollouts_max_rounds_factor=unique_rollouts_max_rounds_factor,
+
             allow_early_stop=allow_early_stop,
             min_decisions_before_stop=min_decisions_before_stop,
             stop_bias=stop_bias,
+
+            # replay sampling
+            replay_novelty_bonus=replay_novelty_bonus,
+            replay_metric_mode=replay_metric_mode,
+            replay_metric_alpha=replay_metric_alpha,
+            replay_metric_power=replay_metric_power,
+            replay_metric_refresh=replay_metric_refresh,
 
             # TB/viz
             tb_reward_temperature=tb_reward_temperature,
@@ -153,6 +191,12 @@ class DTGFNClassifier:
             viz_every=viz_every,
             viz_dir=viz_dir,
             viz_format=viz_format,
+
+            # throughput/eval
+            amp=amp,
+            eval_on_cpu=eval_on_cpu,
+            metric_sample_size=metric_sample_size,
+            eval_batch_size=eval_batch_size,
         )
 
         # set by fit()

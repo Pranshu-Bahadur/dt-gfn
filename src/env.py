@@ -1,240 +1,279 @@
 # src/env.py
 from __future__ import annotations
-from typing import List, Optional, Tuple
-
-import math
+from typing import List, Optional, Dict, Any
 import numpy as np
 import pandas as pd
 import torch
 from sklearn.preprocessing import LabelEncoder
 
-
-class TabularEnv:
+# ------------------------------------------------------------
+# New: per-feature binner
+# ------------------------------------------------------------
+class FeatureBinner:
     """
-    Environment wrapper that:
-      • fits per-feature binning on train,
-      • treats 0/1 (or ≤2-unique) columns as binary,
-      • exposes per-feature effective bins (for threshold constraints),
-      • provides X_full (binned) and y_full tensors,
-      • supplies helpers used by rollouts/rewards.
-    """
+    Per-feature binning with auto type detection.
 
+    Types:
+      - constant    -> single bin (all zeros)
+      - binary 0/1  -> 2 bins via edges [-0.5, 0.5, 1.5] (threshold t=0 exists)
+      - categorical (low-card) -> label-map to [0..K-1]
+      - continuous  -> quantile edges (optionally LGBM-ish: subsample + min_data_in_bin)
+
+    Produces integer bins in [0 .. n_bins_f-1], with n_bins_f <= max_bins.
+    """
     def __init__(
         self,
-        df_train: pd.DataFrame,
+        features: List[str],
+        *,
+        max_bins: int = 255,
+        strategy: str = "per_feature_auto",  # "per_feature_auto" | "quantile" | "uniform"
+        per_feature_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+        subsample_for_bin: int = 200_000,
+        min_data_in_bin: int = 1,
+        max_unique_for_cat: int = 64,
+    ):
+        self.features = list(features)
+        self.max_bins = int(max_bins)
+        self.strategy = strategy
+        self.per_feature_overrides = per_feature_overrides or {}
+        self.subsample_for_bin = int(subsample_for_bin)
+        self.min_data_in_bin = int(min_data_in_bin)
+        self.max_unique_for_cat = int(max_unique_for_cat)
+
+        self.meta: Dict[str, Dict[str, Any]] = {}   # f -> {"type":..., ...}
+        self.edges: Dict[str, np.ndarray] = {}      # f -> edges (for continuous/binary)
+        self.cat_map: Dict[str, Dict[Any, int]] = {}# f -> cat->idx (for categorical)
+
+    def _infer_type(self, s: pd.Series) -> str:
+        x = s.dropna()
+        if x.nunique(dropna=True) <= 1:
+            return "constant"
+        # Strict binary 0/1?
+        u = pd.unique(x)
+        if set(pd.unique(x)) <= {0, 1}:
+            return "binary"
+        # Int-like or object with low cardinality -> categorical
+        if (np.issubdtype(x.dtype, np.integer) or x.dtype == object) and x.nunique() <= self.max_unique_for_cat:
+            return "categorical"
+        # Else continuous
+        return "continuous"
+
+    def _quantile_edges(self, arr: np.ndarray, n_bins: int) -> np.ndarray:
+        n_bins = max(2, min(n_bins, self.max_bins))
+        qs = np.linspace(0, 1, num=n_bins + 1)
+        # unique edges to avoid zero-width bins
+        edges = np.unique(np.quantile(arr, qs, method="linear"))
+        # ensure at least 2 edges
+        if edges.size < 2:
+            v = arr[0] if arr.size else 0.0
+            edges = np.array([v - 1e-9, v + 1e-9], dtype=float)
+        # widen extremes
+        edges[0] -= 1e-9
+        edges[-1] += 1e-9
+        return edges
+
+    def _merge_small_bins(self, vals: np.ndarray, edges: np.ndarray) -> np.ndarray:
+        """
+        Merge adjacent bins until each has >= min_data_in_bin, greedy.
+        """
+        if self.min_data_in_bin <= 1 or vals.size == 0:
+            return edges
+        while True:
+            idx = np.clip(np.searchsorted(edges, vals, side="right") - 1, 0, len(edges) - 2)
+            counts = np.bincount(idx, minlength=len(edges) - 1)
+            too_small = np.where(counts < self.min_data_in_bin)[0]
+            if too_small.size == 0 or len(edges) <= 3:
+                break
+            i = int(too_small[0])
+            # Merge with the larger neighbor to keep balance
+            left_cnt = counts[i - 1] if i - 1 >= 0 else -1
+            right_cnt = counts[i + 1] if i + 1 < len(counts) else -1
+            if right_cnt >= left_cnt and i + 1 < len(edges) - 1:
+                # merge bin i into i+1 -> drop edges[i+1]
+                edges = np.delete(edges, i + 1)
+            else:
+                # merge bin i into i-1 -> drop edges[i]
+                edges = np.delete(edges, i)
+        return edges
+
+    def fit(self, df: pd.DataFrame):
+        for f in self.features:
+            s = df[f]
+            # clean NaN/inf
+            x = pd.to_numeric(s, errors="coerce").astype(float)
+            med = float(np.nanmedian(x)) if np.isfinite(np.nanmedian(x)) else 0.0
+            x = x.replace([np.inf, -np.inf], np.nan).fillna(med)
+
+            ov = self.per_feature_overrides.get(f, {})
+            kind = ov.get("type")
+            if kind is None:
+                if self.strategy == "quantile":
+                    kind = "continuous"
+                elif self.strategy == "uniform":
+                    kind = "continuous"  # we still use quantile edges for robustness
+                else:
+                    kind = self._infer_type(s)
+
+            meta = {"type": kind}
+            if kind == "constant":
+                v = float(x.iloc[0])
+                edges = np.array([v - 1e-9, v + 1e-9], dtype=float)
+                self.edges[f] = edges
+            elif kind == "binary":
+                # 2 bins with a single threshold t=0
+                self.edges[f] = np.array([-0.5, 0.5, 1.5], dtype=float)
+            elif kind == "categorical":
+                cats = pd.unique(s.fillna("__NA__"))
+                if len(cats) > self.max_unique_for_cat:
+                    # fallback to continuous if too many categories
+                    arr = x.to_numpy()
+                    sample = arr if arr.size <= self.subsample_for_bin else np.random.choice(arr, self.subsample_for_bin, replace=False)
+                    edges = self._quantile_edges(sample, self.max_bins)
+                    edges = self._merge_small_bins(arr, edges)
+                    self.edges[f] = edges
+                    meta["type"] = "continuous"
+                else:
+                    mapping = {c: i for i, c in enumerate(cats)}
+                    self.cat_map[f] = mapping
+            else:
+                # continuous: quantile edges, with LGBM-ish options
+                arr = x.to_numpy()
+                sample = arr if arr.size <= self.subsample_for_bin else np.random.choice(arr, self.subsample_for_bin, replace=False)
+                n_req = int(ov.get("n_bins", self.max_bins))
+                edges = self._quantile_edges(sample, n_req)
+                edges = self._merge_small_bins(arr, edges)
+                # ensure cap by max_bins
+                while (len(edges) - 1) > self.max_bins:
+                    # drop every second interior edge
+                    keep = np.ones(len(edges), dtype=bool)
+                    keep[1:-1:2] = False
+                    edges = edges[keep]
+                self.edges[f] = edges
+
+            self.meta[f] = meta
+
+    def transform(self, df: pd.DataFrame, device: Optional[torch.device] = None) -> torch.Tensor:
+        out = np.zeros((len(df), len(self.features)), dtype=np.int64)
+        for j, f in enumerate(self.features):
+            meta = self.meta[f]
+            if meta["type"] == "categorical":
+                m = self.cat_map[f]
+                s = df[f].fillna("__NA__")
+                out[:, j] = s.map(m).fillna(0).astype(int).to_numpy()
+            else:
+                x = pd.to_numeric(df[f], errors="coerce").astype(float)
+                med = float(np.nanmedian(x)) if np.isfinite(np.nanmedian(x)) else 0.0
+                x = x.replace([np.inf, -np.inf], np.nan).fillna(med)
+                edges = self.edges[f]
+                idx = np.searchsorted(edges, x.to_numpy(), side="right") - 1
+                idx = np.clip(idx, 0, len(edges) - 2)
+                out[:, j] = idx
+        t = torch.from_numpy(out).long()
+        if device is not None:
+            t = t.to(device)
+        return t
+
+    def n_bins_per_feature(self) -> List[int]:
+        nb = []
+        for f in self.features:
+            if self.meta[f]["type"] == "categorical":
+                nb.append(max(1, len(self.cat_map[f])))
+            else:
+                nb.append(max(1, len(self.edges[f]) - 1))
+        return nb
+
+
+# ------------------------------------------------------------
+# TabularEnv using the binner
+# ------------------------------------------------------------
+class TabularEnv:
+    def __init__(
+        self,
+        df: pd.DataFrame,
         feature_cols: List[str],
         target_col: str,
         n_bins: int,
         task: str,
-        binning_strategy: str = "lgbm_quantile",   # "quantile" | "global_uniform" | "lgbm_quantile"
-        device: str = "cpu",
         *,
-        # LGBM-style knobs
-        min_data_in_bin: int = 500,
+        binning_strategy: str = "per_feature_auto",
+        device: str = "cpu",
+        # new optional knobs (forwarded by trainer)
+        per_feature_binning: Optional[Dict[str, Dict[str, Any]]] = None,
         subsample_for_bin: int = 200_000,
-        # only used with global_uniform; quantile modes ignore scaling
-        pre_normalize: Optional[str] = None,  # None | "rank" | "zscore" | "minmax"
+        min_data_in_bin: int = 1,
+        max_unique_for_cat: int = 64,
     ):
-        assert task in ("classification", "regression")
-        self.device = torch.device(device)
-        self.task = task
+        self.df = df
         self.feature_cols = list(feature_cols)
         self.target_col = target_col
-        self.n_bins = int(n_bins)
-        self.binning_strategy = binning_strategy
-        self.min_data_in_bin = int(min_data_in_bin)
-        self.subsample_for_bin = int(subsample_for_bin)
-        self.pre_normalize = pre_normalize
+        self.task = task
+        self.device = torch.device(device)
 
-        # y
-        if task == "classification":
-            self.le = LabelEncoder()
-            y_np = self.le.fit_transform(df_train[target_col].to_numpy())
-            self.n_classes = int(np.max(y_np)) + 1
-            self.y_full = torch.as_tensor(y_np, device=self.device, dtype=torch.long)
+        # Fit label encoder / target
+        if self.task == "classification":
+            le = LabelEncoder()
+            y = le.fit_transform(df[target_col].to_numpy())
+            self.le = le
+            self.n_classes = int(len(le.classes_))
+            self.y_full = torch.from_numpy(y).long().to(self.device)
         else:
+            y = pd.to_numeric(df[target_col], errors="coerce").astype(float)
+            y = y.replace([np.inf, -np.inf], np.nan).fillna(y.median())
             self.le = None
             self.n_classes = None
-            y_np = df_train[target_col].to_numpy(dtype=np.float32)
-            self.y_full = torch.as_tensor(y_np, device=self.device, dtype=torch.float32)
+            self.y_full = torch.from_numpy(y.to_numpy()).float().to(self.device)
 
-        # fit bin edges on train (per feature)
-        Xfit = df_train[self.feature_cols].copy()
-        if self.binning_strategy == "global_uniform" and self.pre_normalize == "rank":
-            # rank-normalize into [0,1] to make uniform bins behave like quantile bins
-            for col in self.feature_cols:
-                s = Xfit[col].to_numpy()
-                mask = ~np.isnan(s)
-                ranks = np.zeros_like(s, dtype=np.float32)
-                if mask.any():
-                    order = np.argsort(s[mask], kind="mergesort")
-                    inv = np.empty_like(order)
-                    inv[order] = np.arange(order.size)
-                    r = inv.astype(np.float32) / max(1, order.size - 1)
-                    ranks[mask] = r
-                Xfit[col] = ranks
+        # Per-feature binner
+        self.binner = FeatureBinner(
+            self.feature_cols,
+            max_bins=n_bins,
+            strategy=binning_strategy if binning_strategy else "per_feature_auto",
+            per_feature_overrides=per_feature_binning,
+            subsample_for_bin=subsample_for_bin,
+            min_data_in_bin=min_data_in_bin,
+            max_unique_for_cat=max_unique_for_cat,
+        )
+        self.binner.fit(df[self.feature_cols])
 
-        self.bin_edges, self.per_feat_bins, self.binary_mask = self._fit_bin_edges(Xfit)
+        # Binned X
+        self.X_full = self.binner.transform(df[self.feature_cols], device=self.device)
 
-        # bin X_train
-        Xb = self._bin_dataframe(df_train[self.feature_cols])
-        self.X_full = torch.as_tensor(Xb, device=self.device, dtype=torch.long)
-
-        # rollout state
-        self.paths: List = []
-        self.open_leaves: int = 1
-        self.done: bool = False
-        self.idxs: torch.Tensor = torch.arange(self.X_full.size(0), device=self.device)
-        self._n_splits: int = 0
-
-    # ------------------------------------------------------------------
-    # Binning
-    # ------------------------------------------------------------------
-    def _compute_lgbm_edges(self, x_full: np.ndarray) -> np.ndarray:
-        """
-        LGBM-ish quantile binning:
-          • at most n_bins bins
-          • guarantee ~min_data_in_bin per bin by inflating quantile step
-          • subsample for speed on large arrays
-        Returns cutpoints (length B-1). May be empty if effectively constant.
-        """
-        x = x_full
-        x = x[np.isfinite(x)]
-        N = x.size
-        if N == 0:
-            return np.asarray([0.0], dtype=np.float32)
-
-        # (optional) subsample to speed quantiles; LightGBM uses ~200k by default
-        if self.subsample_for_bin > 0 and N > self.subsample_for_bin:
-            idx = np.random.default_rng(123).choice(N, size=self.subsample_for_bin, replace=False)
-            xq = x[idx]
-            Nq = xq.size
-        else:
-            xq = x
-            Nq = N
-
-        # step chosen to satisfy both max_bin and min_data_in_bin
-        step_by_maxbin = 1.0 / float(self.n_bins)
-        step_by_mincount = float(self.min_data_in_bin) / float(max(1, Nq))
-        step = max(step_by_maxbin, step_by_mincount)
-        if step >= 1.0:
-            return np.asarray([np.nanmin(xq)], dtype=np.float32)
-
-        qs = np.arange(step, 1.0, step)
-        cuts = np.quantile(xq, qs, method="linear").astype(np.float32)
-
-        # de-duplicate equal cuts (flat regions), cap to <= n_bins-1 edges
-        cuts = np.unique(cuts)
-        if cuts.size > (self.n_bins - 1):
-            # thin evenly
-            take = np.linspace(0, cuts.size - 1, num=self.n_bins - 1, dtype=int)
-            cuts = cuts[take]
-
-        # guard for effectively constant features
-        if cuts.size == 0:
-            cuts = np.asarray([np.nanmin(xq)], dtype=np.float32)
-
-        return cuts
-
-    def _fit_bin_edges(self, Xdf: pd.DataFrame) -> Tuple[List[torch.Tensor], torch.LongTensor, torch.BoolTensor]:
-        edges: List[torch.Tensor] = []
-        eff_bins: List[int] = []
-        binary_mask: List[bool] = []
-
-        Xnp = Xdf.to_numpy(copy=False)
-        D = Xnp.shape[1]
-
-        for j, col in enumerate(Xdf.columns):
-            x = Xnp[:, j]
-
-            # detect binary / 2-unique
-            x_no_nan = x[np.isfinite(x)]
-            uniq = np.unique(x_no_nan)
-            is_binary = uniq.size <= 2
-            # also treat strict 0/1 as binary (robust)
-            try:
-                if set(np.unique(Xdf[col].dropna().astype(float))) <= {0.0, 1.0}:
-                    is_binary = True
-            except Exception:
-                pass
-
-            if is_binary:
-                edges.append(torch.tensor([0.5], dtype=torch.float32))
-                eff_bins.append(2)
-                binary_mask.append(True)
-                continue
-
-            # non-binary continuous
-            if self.binning_strategy == "global_uniform":
-                lo = float(np.nanmin(x_no_nan)) if x_no_nan.size > 0 else 0.0
-                hi = float(np.nanmax(x_no_nan)) if x_no_nan.size > 0 else lo + 1.0
-                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-                    cuts = np.asarray([lo], dtype=np.float32)
-                else:
-                    cuts = np.linspace(lo, hi, num=self.n_bins + 1, endpoint=True)[1:-1].astype(np.float32)
-                    cuts = np.unique(cuts)
-                    if cuts.size == 0:
-                        cuts = np.asarray([lo + 1e-6], dtype=np.float32)
-
-            elif self.binning_strategy == "lgbm_quantile":
-                cuts = self._compute_lgbm_edges(x)
-
-            else:  # "quantile"
-                qs = np.linspace(0.0, 1.0, num=self.n_bins + 1, endpoint=True)
-                qv = np.quantile(x_no_nan, qs, method="linear") if x_no_nan.size > 0 else np.linspace(0.0, 1.0, self.n_bins + 1)
-                cuts = np.unique(qv[1:-1]).astype(np.float32)
-                if cuts.size == 0:
-                    cuts = np.asarray([qv[0]], dtype=np.float32)
-
-            edges.append(torch.from_numpy(cuts))
-            eff_bins.append(int(cuts.size + 1))
-            binary_mask.append(False)
-
-        per_feat_bins = torch.as_tensor(eff_bins, dtype=torch.long)
-        binary_mask_t = torch.as_tensor(binary_mask, dtype=torch.bool)
-        return edges, per_feat_bins, binary_mask_t
-
-    def _bucketize_col(self, x: np.ndarray, cutpoints: torch.Tensor, is_binary: bool) -> np.ndarray:
-        if is_binary:
-            return (x > 0.5).astype(np.int64)
-        cp = cutpoints.cpu().numpy()
-        # treat NaN as the lowest bin (consistent with many tree impls) — optionally adjust
-        out = np.digitize(np.nan_to_num(x, nan=cp[0] if cp.size else 0.0), cp, right=False).astype(np.int64)
-        return out
-
-    def _bin_dataframe(self, df: pd.DataFrame) -> np.ndarray:
-        Xnp = df.to_numpy(copy=False)
-        D = Xnp.shape[1]
-        out = np.empty((Xnp.shape[0], D), dtype=np.int64)
-        for j in range(D):
-            out[:, j] = self._bucketize_col(Xnp[:, j], self.bin_edges[j], bool(self.binary_mask[j]))
-        return out
-
-    # ------------------------------------------------------------------
-    # Public helpers used by Trainer
-    # ------------------------------------------------------------------
-    def _featurise(self, df_new: pd.DataFrame, df_fit: pd.DataFrame, feature_cols: List[str], n_bins: int) -> torch.Tensor:
-        X_new = df_new[self.feature_cols]
-        Xb = self._bin_dataframe(X_new)
-        return torch.as_tensor(Xb, device=self.device, dtype=torch.long)
-
-    def draw_indices(self, batch_size: int) -> torch.Tensor:
-        N = self.X_full.size(0)
-        if batch_size >= N:
-            return torch.randperm(N, device=self.device)
-        return torch.randperm(N, device=self.device)[:batch_size]
-
-    def reset(self, length: int):
-        self.idxs = torch.arange(length, device=self.device)
+        # initial sampler state
+        self.device = torch.device(device)
         self.paths = []
         self.open_leaves = 1
         self.done = False
-        self._n_splits = 0
+        self._N = len(self.y_full)
 
-    def step(self, action):
-        kind, _ = action
-        if kind in ("th", "thr", "threshold"):
-            self._n_splits += 1
+        # Expose these so trainer can read
+        self.n_bins = n_bins  # global cap (tokenizer uses this)
+        self.n_th_per_feature = self.binner.n_bins_per_feature()
+
+        # sample indices used during rollouts/rewards
+        self.idxs = torch.arange(self._N, device=self.device)
+
+    def reset(self, batch_size: int):
+        self.paths = []
+        self.open_leaves = 1
+        self.done = False
+        return self.draw_indices(batch_size)
+
+    def draw_indices(self, batch_size: int) -> torch.Tensor:
+        # robust bootstrap
+        N = self._N
+        if N <= 0:
+            return torch.empty((0,), dtype=torch.long, device=self.device)
+        return torch.randint(0, N, (batch_size,), device=self.device)
+
+    # (trainer expects these)
+    def step(self, tok_tuple):
+        self.paths.append(tok_tuple)
 
     def get_prior(self, beta: float) -> torch.Tensor:
-        return torch.tensor(-beta * float(self._n_splits), device=self.device, dtype=torch.float32)
+        # simple length prior; trainer multiplies by exp(-beta * #splits / N)
+        return torch.tensor(1.0, device=self.device)
+
+    # called by trainer.predict() to bin test with train edges
+    def _featurise(self, df_test: pd.DataFrame, df_train: pd.DataFrame, feature_cols: List[str], n_bins: int) -> torch.Tensor:
+        _ = df_train  # not needed anymore; kept for API compatibility
+        return self.binner.transform(df_test[feature_cols], device=self.device)
