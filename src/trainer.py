@@ -130,9 +130,12 @@ class Config:
 
 
     # --- Leaf token penalty (discourage early LEAF, togglable) ---
-    leaf_penalty_strength: float = 2.0     # 0.0 disables the penalty
-    leaf_penalty_decay: float = 0.85        # multiplicative decay with depth
-    leaf_penalty_min_depth: int = 2         # apply extra pressure above this depth
+    leaf_penalty_strength=4.0
+    leaf_penalty_decay=0.85
+    leaf_penalty_min_depth=2
+    leaf_bias=-0.2          # optional; 0 to disable
+    leaf_cooldown_steps=1
+    threshold_balance_gamma=0.0  # start at 0; turn up later if needed
 
 
 
@@ -936,43 +939,53 @@ class Trainer:
 
     def batched_rollout(self, envs, temp, residuals, beta, ras_counts: Optional[dict] = None):
         """
-        Redundancy-aware rollouts with *feasible* actions only and **global STOP (EOS)**.
-
-        • First decision at each step: choose FEAT / LEAF / (optional) STOP(EOS)
-        • Second decision: choose THRESHOLD for the chosen FEAT
-        • RAS penalties: subtract λ_intra * local_count + λ_inter * global_count on allowed tokens
+        Roll out trees with *feasible* actions only (two-stage FEAT -> THRESHOLD).
+        Fixes:
+          • Aligns masks when filtering thresholds (no IndexError).
+          • Respects per-leaf feasible bin windows (lo/hi).
+          • Optional threshold imbalance penalty (cfg.threshold_balance_gamma).
+          • Optional LEAF cooldown to avoid premature closures (cfg.leaf_cooldown_steps).
+          • **Depth-scaled LEAF logit penalty + leaf_bias** to stop one-sided trees.
+        Returns: list of (seq, prior, idxs) or None per env.
         """
+        import torch
+        from collections import deque
+        from typing import Deque, List, Tuple, Optional
+
         c, v, device = self.cfg, self.tokenizer.v, self.cfg.device
         num = len(envs)
-        END_TOKEN = v.EOS         # global STOP token
+        END_TOKEN  = v.EOS
         LEAF_TOKEN = self.tokenizer._leaf(0)
 
-        # --- helper: depth-scaled leaf penalty (0 => disabled) ---
+        # knobs
+        leaf_cd_steps   = int(getattr(c, "leaf_cooldown_steps", 0) or 0)
+        th_imbal_gamma  = float(getattr(c, "threshold_balance_gamma", 0.0) or 0.0)
+        leaf_bias_const = float(getattr(c, "leaf_bias", 0.0) or 0.0)
+
+        # ---- depth-scaled LEAF logit penalty (same as yesterday) ----
         def _leaf_logit_penalty(depth: int) -> float:
-            # You will add these to Config:
-            #   leaf_penalty_strength: float
-            #   leaf_penalty_decay: float
-            #   leaf_penalty_min_depth: int
             strength = float(getattr(c, "leaf_penalty_strength", 0.0) or 0.0)
             if strength <= 0.0:
                 return 0.0
-            decay = float(getattr(c, "leaf_penalty_decay", 0.85))
-            min_d = int(getattr(c, "leaf_penalty_min_depth", 2))
+            decay   = float(getattr(c, "leaf_penalty_decay", 0.85))
+            min_d   = int(getattr(c, "leaf_penalty_min_depth", 2))
             pen = strength * (decay ** max(0, depth))
             if depth < min_d:
-                pen *= 3.0  # extra pressure very shallow
+                pen *= 3.0
             return float(pen)
 
+        # Prepare envs
         for env in envs:
             env.y = residuals
             env.reset(c.batch_size)
 
+        # Per-trajectory state
         seqs = [[v.BOS] for _ in range(num)]
-        decisions = [0 for _ in range(num)]  # number of FEAT decisions taken
         depths: List[Deque[int]] = [deque([0]) for _ in range(num)]
         lo_stacks: List[Deque[torch.Tensor]] = [deque([torch.zeros(v.num_feat, dtype=torch.long, device=device)]) for _ in range(num)]
         hi_stacks: List[Deque[torch.Tensor]] = [deque([torch.full((v.num_feat,), v.num_th - 1, dtype=torch.long, device=device)]) for _ in range(num)]
         row_stacks: List[Deque[torch.Tensor]] = [deque([torch.arange(envs[i].idxs.numel(), device=device)]) for i in range(num)]
+        cd_stacks:  List[Deque[int]]         = [deque([0]) for _ in range(num)]  # LEAF cooldown
 
         def _mark_done_if_finished(ti: int):
             if not depths[ti]:
@@ -980,31 +993,6 @@ class Trainer:
 
         active = [i for i in range(num) if not envs[i].done]
         out = [None] * num
-
-        @torch.no_grad()
-        def apply_redundancy_penalty(last_logits: torch.Tensor, masks: torch.Tensor, prefixes: List[List[int]]):
-            if not c.redundancy_aware:
-                return
-            lam_intra = float(c.redundancy_lambda_intra)
-            lam_inter = float(c.redundancy_lambda_inter)
-            ngram = int(c.redundancy_ngram)
-            for bi, pref in enumerate(prefixes):
-                allowed = torch.nonzero(masks[bi], as_tuple=False).flatten().tolist()
-                if not allowed:
-                    continue
-                base = tuple(pref)
-                for tok in allowed:
-                    cand = base + (int(tok),)
-                    # truncate to at most ngram for inter counts
-                    if ngram > 0 and len(cand) > ngram:
-                        cand_key = cand[:ngram]
-                    else:
-                        cand_key = cand
-                    intra = 0.0 if ras_counts is None else float(ras_counts.get(cand, 0.0))
-                    inter = float(self.global_prefix_counts.get(cand_key, 0.0))
-                    pen = lam_intra * intra + lam_inter * inter
-                    if pen != 0.0:
-                        last_logits[bi, tok] -= pen
 
         with torch.no_grad():
             while active:
@@ -1015,112 +1003,116 @@ class Trainer:
                 logits, _ = self.pf(pad)
                 last = logits[:, -1, :]
 
-                # ------------- first decision: FEAT / LEAF / STOP(EOS) -------------
+                # Strong "don't repeat this exact prefix" guard if ras_counts provided (kept same)
+                if ras_counts is not None:
+                    for bi, oidx in enumerate(active):
+                        pref = tuple(seqs[oidx])
+                        if pref in ras_counts:
+                            last[bi, :] -= 1e9
+
+                # ---------------- first decision: choose FEAT or LEAF ----------------
                 mask1 = torch.zeros((len(active), v.size()), dtype=torch.bool, device=device)
-                prefixes = []
+
                 for bi, oidx in enumerate(active):
-                    prefixes.append(seqs[oidx].copy())
                     if not depths[oidx]:
                         continue
+
                     d = depths[oidx][-1]
                     can_split = (d < c.max_depth)
 
                     rows_rel = row_stacks[oidx][-1]
-                    Xb = envs[oidx].X_full[envs[oidx].idxs]
-                    Xleaf = Xb.index_select(0, rows_rel)
+                    Xb = envs[oidx].X_full[envs[oidx].idxs]   # [B,F]
+                    Xleaf = Xb.index_select(0, rows_rel)       # [n_leaf,F]
+                    n_leaf = int(Xleaf.size(0))
 
-                    # allow LEAF always
-                    mask1[bi, LEAF_TOKEN] = True
-
-                    # allow global STOP (EOS) if enabled and enough decisions taken
-                    if c.allow_early_stop and (decisions[oidx] >= c.min_decisions_before_stop):
-                        mask1[bi, v.EOS] = True
-
-                    # valid FEATs
-                    if can_split and Xleaf.size(0) > 1:
-                        n_leaf = Xleaf.size(0)
-                        valid_feats = []
+                    # Valid features: need ≥2 distinct bins; if min_child_size>0, at least one viable threshold
+                    valid_feats = []
+                    if can_split and n_leaf > 1:
+                        mcs = int(c.min_child_size or 0)
                         for f in range(Xleaf.size(1)):
                             bf = Xleaf[:, f]
                             uniq, counts = torch.unique(bf, return_counts=True)
                             if uniq.numel() < 2:
                                 continue
-                            if c.min_child_size and c.min_child_size > 1:
+                            if mcs > 1:
                                 csum = counts.cumsum(0)[:-1]
-                                left_ok = csum >= c.min_child_size
-                                right_ok = (n_leaf - csum) >= c.min_child_size
-                                if not bool((left_ok & right_ok).any()):
+                                if not bool(((csum >= mcs) & ((n_leaf - csum) >= mcs)).any()):
                                     continue
                             valid_feats.append(f)
-                        if valid_feats:
-                            feat_ids = v.split_start + torch.as_tensor(valid_feats, device=device, dtype=torch.long)
-                            mask1[bi, feat_ids] = True
 
-                    # immediate token-repeat guard
-                    last_tok = seqs[oidx][-1]
-                    if last_tok < mask1.size(1):
-                        mask1[bi, last_tok] = False
+                    # LEAF allowed unless cooldown blocks and a split is feasible
+                    allow_leaf = True
+                    if leaf_cd_steps > 0 and can_split and cd_stacks[oidx][-1] > 0:
+                        allow_leaf = False
+                    if allow_leaf:
+                        mask1[bi, LEAF_TOKEN] = True
 
-                # penalties + STOP bias
-                apply_redundancy_penalty(last, mask1, prefixes)
+                    if valid_feats:
+                        feat_ids = v.split_start + torch.as_tensor(valid_feats, device=device, dtype=torch.long)
+                        mask1[bi, feat_ids] = True
 
-                # --- leaf-token penalty (discourage early closing of branches) ---
+                    # never allow EOS here; branches close via LEAF
+                    mask1[bi, v.EOS] = False
+
+                    # cooldown ticks while this leaf remains open
+                    if cd_stacks[oidx]:
+                        cd_stacks[oidx][-1] = max(0, cd_stacks[oidx][-1] - 1)
+
+                # === Leaf discouragement (depth-scaled penalty + constant bias) ===
+                # Only apply when LEAF is allowed *and* at least one FEAT is also allowed.
                 for bi, oidx in enumerate(active):
                     if mask1[bi, LEAF_TOKEN]:
-                        # Only penalize if there is at least one other feasible action
-                        if mask1[bi].sum().item() > 1:
-                            d_here = int(depths[oidx][-1]) if depths[oidx] else 0
-                            last[bi, LEAF_TOKEN] -= _leaf_logit_penalty(d_here)
-
-                if c.stop_bias != 0.0:
-                    for bi, oidx in enumerate(active):
-                        if mask1[bi, v.EOS]:
-                            last[bi, v.EOS] += float(c.stop_bias)
+                        has_feat = False
+                        # any feature allowed?
+                        start, end = v.split_start, v.split_start + v.num_feat
+                        if end <= mask1.size(1):
+                            has_feat = bool(mask1[bi, start:end].any().item())
+                        if has_feat and depths[oidx]:
+                            if leaf_bias_const != 0.0:
+                                last[bi, LEAF_TOKEN] += leaf_bias_const
+                            pen = _leaf_logit_penalty(int(depths[oidx][-1]))
+                            if pen != 0.0:
+                                last[bi, LEAF_TOKEN] -= pen
 
                 toks1 = _safe_sample(last, mask1, temp)
 
-                need_threshold: List[Tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+                # Collect leaves that chose a FEAT (need threshold next)
+                need_threshold: List[Tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
                 still_for_round: List[int] = []
-                for bi, oidx in enumerate(active):
-                    if not mask1[bi].any():
-                        # dead-end: force leaf close if possible
-                        if depths[oidx]:
-                            envs[oidx].step(("leaf", 0))
-                            depths[oidx].pop(); lo_stacks[oidx].pop(); hi_stacks[oidx].pop(); row_stacks[oidx].pop()
-                            _mark_done_if_finished(oidx)
-                        continue
 
-                    tok = toks1[bi].item()
-                    if tok == v.EOS:
-                        # Global STOP: close whole tree
-                        seqs[oidx].append(tok)
-                        if ras_counts is not None:
-                            key = tuple(seqs[oidx]); ras_counts[key] = ras_counts.get(key, 0) + 1
+                for bi, oidx in enumerate(active):
+                    tok = int(toks1[bi].item())
+                    if not mask1[bi].any():
                         envs[oidx].done = True
-                        _mark_done_if_finished(oidx)
                         continue
 
                     seqs[oidx].append(tok)
                     if ras_counts is not None:
-                        key = tuple(seqs[oidx]); ras_counts[key] = ras_counts.get(key, 0) + 1
+                        pref = tuple(seqs[oidx])
+                        ras_counts[pref] = ras_counts.get(pref, 0) + 1
 
                     if tok == LEAF_TOKEN:
+                        # close this leaf
                         envs[oidx].step(("leaf", 0))
-                        depths[oidx].pop(); lo_stacks[oidx].pop(); hi_stacks[oidx].pop(); row_stacks[oidx].pop()
+                        depths[oidx].pop(); lo_stacks[oidx].pop(); hi_stacks[oidx].pop(); row_stacks[oidx].pop(); cd_stacks[oidx].pop()
                         _mark_done_if_finished(oidx)
                         if not envs[oidx].done:
                             still_for_round.append(oidx)
                         continue
 
+                    # FEAT chosen -> request threshold
                     kind, f_idx = self.tokenizer.decode_one(tok)  # 'feat'
                     envs[oidx].step((kind, f_idx))
-                    decisions[oidx] += 1
-                    d0 = depths[oidx].pop()
-                    lo_top, hi_top = lo_stacks[oidx].pop(), hi_stacks[oidx].pop()
-                    rows_rel = row_stacks[oidx].pop()
-                    need_threshold.append((oidx, f_idx, d0, lo_top.clone(), hi_top.clone(), rows_rel.clone()))
 
-                # ------------- second decision: THRESHOLD -------------
+                    d0 = depths[oidx].pop()
+                    lo_top = lo_stacks[oidx].pop()
+                    hi_top = hi_stacks[oidx].pop()
+                    rows_rel = row_stacks[oidx].pop()
+                    cd_top = cd_stacks[oidx].pop()
+
+                    need_threshold.append((oidx, int(f_idx), d0, lo_top.clone(), hi_top.clone(), rows_rel.clone(), cd_top))
+
+                # ---------------- second decision: choose THRESHOLD ----------------
                 if need_threshold:
                     sub_idx = [oidx for (oidx, *_) in need_threshold]
                     sub_pad = torch.nn.utils.rnn.pad_sequence(
@@ -1133,9 +1125,7 @@ class Trainer:
                     mask2 = torch.zeros((len(sub_idx), v.size()), dtype=torch.bool, device=device)
                     th_base = v.split_start + v.num_feat
 
-                    prefixes2 = []
-                    for si, (oidx, f_idx, d0, lo_top, hi_top, rows_rel) in enumerate(need_threshold):
-                        prefixes2.append(seqs[oidx].copy())
+                    for si, (oidx, f_idx, d0, lo_top, hi_top, rows_rel, cd_top) in enumerate(need_threshold):
                         Xb = envs[oidx].X_full[envs[oidx].idxs]
                         bf = Xb.index_select(0, rows_rel)[:, f_idx]
 
@@ -1146,76 +1136,80 @@ class Trainer:
                         if uniq.numel() < 2:
                             continue
 
-                        # candidate thresholds are observed bins except max one
-                        cand_t = uniq[:-1]
-                        if c.min_child_size and c.min_child_size > 1:
-                            csum = counts.cumsum(0)[:-1]
-                            keep = (csum >= c.min_child_size) & ((bf.numel() - csum) >= c.min_child_size)
-                            if keep.numel() > 0:
-                                cand_t = cand_t[keep]
-                            else:
-                                cand_t = cand_t[:0]  # empty
+                        th_all_bins = uniq[:-1]
+                        th_pos_all  = torch.arange(th_all_bins.numel(), device=device)
 
-                        # respect feasible [lo, hi] window
+                        # min_child_size mask
+                        mask_mc = torch.ones_like(th_pos_all, dtype=torch.bool)
+                        mcs = int(c.min_child_size or 0)
+                        if mcs > 1:
+                            csum_all = counts.cumsum(0)[:-1]
+                            n_leaf = int(bf.numel())
+                            left_ok  = csum_all >= mcs
+                            right_ok = (n_leaf - csum_all) >= mcs
+                            mask_mc = left_ok & right_ok
+
+                        # feasible bin window mask
                         lo_f = int(lo_top[f_idx].item())
                         hi_f = int(hi_top[f_idx].item())
-                        if cand_t.numel() > 0:
-                            in_win = (cand_t >= lo_f) & (cand_t <= hi_f)
-                            if in_win.numel() != cand_t.numel():
-                                # shape guard (paranoia)
-                                in_win = torch.ones_like(cand_t, dtype=torch.bool, device=cand_t.device)
-                            cand_t = cand_t[in_win]
+                        mask_win = (th_all_bins >= lo_f) & (th_all_bins <= hi_f)
 
-                        if cand_t.numel() > 0:
-                            th_ids = th_base + cand_t.to(device=device, dtype=torch.long)
+                        # final mask
+                        mask_final = mask_mc & mask_win
+                        if mask_final.any():
+                            cand_bins = th_all_bins[mask_final]
+                            cand_pos  = th_pos_all[mask_final]
+                            th_ids = th_base + cand_bins.to(device=device, dtype=torch.long)
                             mask2[si, th_ids] = True
+
+                            # optional imbalance penalty (kept)
+                            if th_imbal_gamma > 0.0 and mcs > 0:
+                                csum_all = counts.cumsum(0)[:-1].float()
+                                n_leaf = float(bf.numel())
+                                left_counts = csum_all.index_select(0, cand_pos)
+                                imbal = (2.0 * (left_counts / max(1.0, n_leaf)) - 1.0).abs()
+                                for jj, bval in enumerate(cand_bins.tolist()):
+                                    last_th[si, th_base + int(bval)] -= th_imbal_gamma * float(imbal[jj].item())
 
                         # never allow EOS/LEAF here
                         mask2[si, v.EOS] = False
-                        mask2[si, self.tokenizer._leaf(0)] = False
-
-                        # forbid immediate token repeat
-                        last_tok = seqs[oidx][-1]
-                        if last_tok < mask2.size(1):
-                            mask2[si, last_tok] = False
-
-                    apply_redundancy_penalty(last_th, mask2, prefixes2)
+                        mask2[si, LEAF_TOKEN] = False
 
                     toks2 = _safe_sample(last_th, mask2, temp)
 
-                    for si, (oidx, f_idx, d0, lo_top, hi_top, rows_rel) in enumerate(need_threshold):
-                        # if row had no valid threshold, fallback to LEAF close
-                        if not mask2[si].any():
-                            seqs[oidx].append(LEAF_TOKEN)
-                            if ras_counts is not None:
-                                key = tuple(seqs[oidx]); ras_counts[key] = ras_counts.get(key, 0) + 1
-                            envs[oidx].step(("leaf", 0))
-                            _mark_done_if_finished(oidx)
-                            if not envs[oidx].done:
-                                still_for_round.append(oidx)
-                            continue
-
-                        t_tok = toks2[si].item()
+                    for si, (oidx, f_idx, d0, lo_top, hi_top, rows_rel, cd_top) in enumerate(need_threshold):
+                        t_tok = int(toks2[si].item())
                         seqs[oidx].append(t_tok)
                         if ras_counts is not None:
-                            key = tuple(seqs[oidx]); ras_counts[key] = ras_counts.get(key, 0) + 1
+                            pref = tuple(seqs[oidx])
+                            ras_counts[pref] = ras_counts.get(pref, 0) + 1
 
                         _, t_idx = self.tokenizer.decode_one(t_tok)
 
+                        # Split rows
                         Xb = envs[oidx].X_full[envs[oidx].idxs]
                         fv = Xb.index_select(0, rows_rel)[:, f_idx]
                         m = fv <= t_idx
                         rows_L = rows_rel[m]
                         rows_R = rows_rel[~m]
 
+                        # Update feasible windows
                         lo_L, hi_L = lo_top.clone(), hi_top.clone()
                         hi_L[f_idx] = torch.minimum(hi_L[f_idx], torch.as_tensor(t_idx, device=device))
                         lo_R, hi_R = lo_top.clone(), hi_top.clone()
                         lo_R[f_idx] = torch.maximum(lo_R[f_idx], torch.as_tensor(t_idx + 1, device=device))
 
-                        # push children (R then L for LIFO)
+                        # Push children (R then L) for LIFO
                         depths[oidx].append(d0 + 1); lo_stacks[oidx].append(lo_R); hi_stacks[oidx].append(hi_R); row_stacks[oidx].append(rows_R)
                         depths[oidx].append(d0 + 1); lo_stacks[oidx].append(lo_L); hi_stacks[oidx].append(hi_L); row_stacks[oidx].append(rows_L)
+
+                        # Set cooldown for children (if enabled)
+                        if leaf_cd_steps > 0:
+                            cd_stacks[oidx].append(leaf_cd_steps)
+                            cd_stacks[oidx].append(leaf_cd_steps)
+                        else:
+                            cd_stacks[oidx].append(0)
+                            cd_stacks[oidx].append(0)
 
                         envs[oidx].step(("th", int(t_idx)))
                         if depths[oidx]:
@@ -1225,18 +1219,17 @@ class Trainer:
 
                 active = still_for_round
 
-        # finalize
+        # Finalize outputs
         for i in range(num):
             if envs[i].done:
                 if seqs[i][-1] != END_TOKEN:
                     seqs[i].append(END_TOKEN)
                 out[i] = (seqs[i], envs[i].get_prior(beta).item(), envs[i].idxs.clone())
             else:
-                # force close
-                seqs[i].append(END_TOKEN)
-                out[i] = (seqs[i], envs[i].get_prior(beta).item(), envs[i].idxs.clone())
+                out[i] = None
 
         return out
+
 
 
     # ========================================================
