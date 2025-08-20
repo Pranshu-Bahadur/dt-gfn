@@ -28,6 +28,7 @@ from src.utils import (
     deltaE_split_gain_sse,
     calculate_bayesian_reward,
     calculate_bayesian_reward_regression,
+    _build_tree_by_data
 )
 
 # ============================================================
@@ -126,6 +127,13 @@ class Config:
     # TB loss stabilization
     tb_reward_temperature: float = 10.0
     tb_reward_standardize: bool = True
+
+
+    # --- Leaf token penalty (discourage early LEAF, togglable) ---
+    leaf_penalty_strength: float = 2.0     # 0.0 disables the penalty
+    leaf_penalty_decay: float = 0.85        # multiplicative decay with depth
+    leaf_penalty_min_depth: int = 2         # apply extra pressure above this depth
+
 
 
 # ============================================================
@@ -241,6 +249,139 @@ class Trainer:
             self._fit_boost_gfn(env_template, y_true, X_binned, opt_list, sch_list)
 
         return self
+
+    
+    def _visualize_best_tree_live(
+        self,
+        env_template,
+        *,
+        save_dir: str = "runs/trees",
+        step: int | None = None,
+        format: str = "png",
+    ):
+        """
+        Visualize the best-known tree by rebuilding it *on data*:
+          • uses utils._build_tree_by_data to replay tokens with LIFO expansion
+          • only accepts splits with non-empty children
+          • labels leaves with train stats (class probs or mean±std)
+
+        Falls back to a simple token decoder if _build_tree_by_data isn't available.
+        """
+        import os
+        try:
+            import graphviz
+        except Exception:
+            return None
+
+        # choose a sequence to render
+        seq = self._best_tree_seq or (self.ensemble[0] if self.ensemble else None)
+        if not seq:
+            return None
+
+        Xb = env_template.X_full
+        y  = env_template.y_full
+        device = Xb.device
+
+        # ---- try to rebuild on data ----
+        tree = None
+        try:
+            from src.utils import _build_tree_by_data  # type: ignore
+            import torch
+
+            tok_tensor = torch.tensor(seq, device=device, dtype=torch.long)
+            idxs_map  = torch.arange(Xb.size(0), device=device, dtype=torch.long)  # identity map
+            root, _ = _build_tree_by_data(tok_tensor, self.tokenizer, Xb, idxs_map)
+
+            # utils._Node is a dict-like; normalize accessors
+            def is_split(n): return n.get("type") == "split"
+            def feat(n):     return int(n["f"])
+            def thr(n):      return int(n["t"])
+            def left(n):     return n["L"]
+            def right(n):    return n["R"]
+            def leaf_indices(n): return n.get("idxs", None)
+
+            tree = (root, is_split, feat, thr, left, right, leaf_indices)
+        except Exception:
+            # ---- fallback: decode tokens without data checks ----
+            try:
+                from src.utils import decode_tree_from_seq  # simple structure decoder
+                def _wrap_simple(root_dict):
+                    def is_split(n): return n.get("kind") == "split"
+                    def feat(n):     return int(n["feat"])
+                    def thr(n):      return int(n["thr"])
+                    def left(n):     return n["left"]
+                    def right(n):    return n["right"]
+                    def leaf_indices(n): return None  # no indices available
+                    return (root_dict, is_split, feat, thr, left, right, leaf_indices)
+                tree = _wrap_simple(decode_tree_from_seq(seq, self.tokenizer))
+            except Exception:
+                return None
+
+        root, is_split, feat, thr, left, right, leaf_indices = tree
+
+        # ---- leaf labeling helpers ----
+        is_cls = (self.cfg.task == "classification")
+        n_classes = int(self.cfg.n_classes) if is_cls and self.cfg.n_classes is not None else None
+        if is_cls:
+            if getattr(self, "classes_", None) is not None:
+                class_names = [str(c) for c in self.classes_.tolist()]
+            else:
+                class_names = [f"C{i}" for i in range(n_classes or 0)]
+
+        def leaf_label(indices_tensor) -> str:
+            import torch
+            if indices_tensor is None:  # fallback path: no per-leaf indices
+                return "Leaf"
+            idxs_local = indices_tensor
+            n = int(idxs_local.numel())
+            if is_cls:
+                if n == 0:
+                    return "Leaf • n=0"
+                counts = torch.bincount(y.index_select(0, idxs_local), minlength=n_classes)
+                total = int(counts.sum().item())
+                maj = int(torch.argmax(counts).item()) if total > 0 else 0
+                probs = (counts.float() / max(1, total)).cpu().numpy()
+                prob_str = ", ".join([f"{class_names[i]}:{probs[i]:.2f}" for i in range(len(probs))])
+                return f"Leaf • n={n}\nmajority={class_names[maj]}\n{prob_str}"
+            else:
+                if n == 0:
+                    return "Leaf • n=0\nmean=0.0"
+                vals = y.index_select(0, idxs_local).float()
+                mu = float(vals.mean().item())
+                sd = float(vals.std(unbiased=False).item())
+                return f"Leaf • n={n}\nmean={mu:.4f} ± {sd:.4f}"
+
+        # ---- Graphviz render ----
+        dot = graphviz.Digraph(comment="Best Decision Tree")
+        dot.attr("node", shape="box", style="rounded")
+        nid = 0
+        feat_names = self.cfg.feature_cols
+
+        def walk(node) -> str:
+            nonlocal nid
+            if not is_split(node):
+                lid = str(nid); nid += 1
+                dot.node(lid, leaf_label(leaf_indices(node)), style="rounded,filled", fillcolor="lightblue")
+                return lid
+
+            f = feat(node); t = thr(node)
+            fname = feat_names[f] if 0 <= f < len(feat_names) else f"X[{f}]"
+            myid = str(nid); nid += 1
+            dot.node(myid, f"{fname} ≤ bin {t}")
+
+            lid = walk(left(node))
+            rid = walk(right(node))
+            dot.edge(myid, lid, label="True")
+            dot.edge(myid, rid, label="False")
+            return myid
+
+        walk(root)
+
+        os.makedirs(save_dir, exist_ok=True)
+        fname = f"best_tree_step_{step}" if step is not None else "best_tree"
+        dot.render(os.path.join(save_dir, fname), format=format, cleanup=True)
+        return dot
+
 
     # ========================================================
     # Reward helpers
@@ -593,6 +734,13 @@ class Trainer:
                     log_str += f" | BestTreeAcc: {self._best_tree_acc:.4f}"
 
             tqdm.write(log_str)
+            # Auto-visualize every N updates
+            viz_every = int(getattr(self.cfg, "viz_every", 0) or 0)
+            if viz_every and (upd % viz_every == 0):
+                out_dir = getattr(self.cfg, "viz_dir", "runs/trees")
+                fmt = getattr(self.cfg, "viz_format", "png")
+                self._visualize_best_tree_live(env_template, save_dir=out_dir, step=upd, format=fmt)
+
             all_tuples_last = all_tuples
 
             # Optional: live viz hook (user's own visualize function can use _best_tree_seq)
@@ -671,6 +819,13 @@ class Trainer:
                     tqdm.write(f"Update {upd}/{c.updates} | TB: {avg_tb_loss:.4f} | FL: {avg_fl_loss:.4f} | Corr: {corr:+.4f}")
                 else:
                     tqdm.write(f"Update {upd}/{c.updates} | TB: {avg_tb_loss:.4f} | FL: {avg_fl_loss:.4f} | Corr: nan")
+            self.ensemble = [seq for seq, _ in candidates if seq]
+            viz_every = int(getattr(self.cfg, "viz_every", 0) or 0)
+            if viz_every and (upd % viz_every == 0):
+                out_dir = getattr(self.cfg, "viz_dir", "runs/trees")
+                fmt = getattr(self.cfg, "viz_format", "png")
+                self._visualize_best_tree_live(env_template, save_dir=out_dir, step=upd, format=fmt)
+
 
     # ========================================================
     # Rollouts (redundancy-aware + global STOP + enforce unique)
@@ -792,6 +947,22 @@ class Trainer:
         END_TOKEN = v.EOS         # global STOP token
         LEAF_TOKEN = self.tokenizer._leaf(0)
 
+        # --- helper: depth-scaled leaf penalty (0 => disabled) ---
+        def _leaf_logit_penalty(depth: int) -> float:
+            # You will add these to Config:
+            #   leaf_penalty_strength: float
+            #   leaf_penalty_decay: float
+            #   leaf_penalty_min_depth: int
+            strength = float(getattr(c, "leaf_penalty_strength", 0.0) or 0.0)
+            if strength <= 0.0:
+                return 0.0
+            decay = float(getattr(c, "leaf_penalty_decay", 0.85))
+            min_d = int(getattr(c, "leaf_penalty_min_depth", 2))
+            pen = strength * (decay ** max(0, depth))
+            if depth < min_d:
+                pen *= 3.0  # extra pressure very shallow
+            return float(pen)
+
         for env in envs:
             env.y = residuals
             env.reset(c.batch_size)
@@ -892,6 +1063,15 @@ class Trainer:
 
                 # penalties + STOP bias
                 apply_redundancy_penalty(last, mask1, prefixes)
+
+                # --- leaf-token penalty (discourage early closing of branches) ---
+                for bi, oidx in enumerate(active):
+                    if mask1[bi, LEAF_TOKEN]:
+                        # Only penalize if there is at least one other feasible action
+                        if mask1[bi].sum().item() > 1:
+                            d_here = int(depths[oidx][-1]) if depths[oidx] else 0
+                            last[bi, LEAF_TOKEN] -= _leaf_logit_penalty(d_here)
+
                 if c.stop_bias != 0.0:
                     for bi, oidx in enumerate(active):
                         if mask1[bi, v.EOS]:
@@ -1057,6 +1237,7 @@ class Trainer:
                 out[i] = (seqs[i], envs[i].get_prior(beta).item(), envs[i].idxs.clone())
 
         return out
+
 
     # ========================================================
     # Predict
