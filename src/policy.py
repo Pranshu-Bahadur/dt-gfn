@@ -70,7 +70,7 @@ class PolicyPaperMLP(PolicyBase):
         # Shared MLP applied time-step-wise on LSTM outputs
         layers = [nn.Linear(lstm_hidden, mlp_width), nn.ReLU()]
         for _ in range(max(0, mlp_layers - 1)):
-            layers += [nn.Linear(mlp_width, mlp_width), nn.ReLU()]
+            layers += [nn.Linear(mlp_width, mlp_width), nn.LeakyReLU()]
         self.shared_mlp = nn.Sequential(*layers)
 
         # Heads

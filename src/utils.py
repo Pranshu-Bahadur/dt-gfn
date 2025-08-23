@@ -280,9 +280,9 @@ def calculate_bayesian_reward(tokens: torch.Tensor,
         L, n_dec = L0, 0
 
     N = max(1, int(y.numel()))
-    logR = (L - L0) / N - float(beta) * (n_dec / N)
-    logR = torch.clamp(logR, min=-50.0, max=50.0).to(torch.float32)
-    return torch.exp(logR).clamp_min(1e-9).unsqueeze(0)
+    logR = (L - L0) - float(beta) * (n_dec)
+    #logR = torch.clamp(logR, min=-50.0, max=50.0).to(torch.float32)
+    return logR.unsqueeze(0)
 
 @torch.no_grad()
 def calculate_bayesian_reward_regression(tokens: torch.Tensor,
@@ -312,9 +312,9 @@ def calculate_bayesian_reward_regression(tokens: torch.Tensor,
         L, n_dec = L0, 0
 
     N = max(1, int(y.numel()))
-    logR = (L - L0) / N - float(beta) * (n_dec / N)
-    logR = torch.clamp(logR, min=-50.0, max=50.0).to(torch.float32)
-    return torch.exp(logR).clamp_min(1e-9).unsqueeze(0)
+    logR = (L - L0) / N - float(beta) * (n_dec) / N
+    #logR = torch.clamp(logR, min=-50.0, max=50.0).to(torch.float32)
+    return logR.unsqueeze(0)
 
 # ============================================================
 # Per-step gains

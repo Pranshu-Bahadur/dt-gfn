@@ -28,7 +28,8 @@ from src.utils import (
     deltaE_split_gain_sse,
     calculate_bayesian_reward,
     calculate_bayesian_reward_regression,
-    _build_tree_by_data
+    _build_tree_by_data,
+    uniform_backward_log_prob,  # uniform PB when requested
 )
 
 # ============================================================
@@ -58,18 +59,18 @@ class Config:
     boosting_lr: float = 0.1
 
     # ---------- Redundancy & STOP (toggles + knobs) ----------
-    redundancy_aware: bool = True             # enable redundancy-aware selection/penalties
-    redundancy_lambda_intra: float = 1.0      # penalty per local (intra-batch) prefix hit
-    redundancy_lambda_inter: float = 0.25     # penalty per global (inter-trajectory) prefix hit
-    redundancy_decay: float = 0.995           # exponential decay for global counts
-    redundancy_ngram: int = 8                 # max prefix length tracked (1..N)
-    enforce_unique_rollouts: bool = True      # keep sampling until we have rollouts *unique* trees
-    unique_rollouts_max_rounds_factor: int = 50  # safety cap = rollouts * factor attempts
+    redundancy_aware: bool = True
+    redundancy_lambda_intra: float = 1.0      # (reserved)
+    redundancy_lambda_inter: float = 0.25
+    redundancy_decay: float = 0.995
+    redundancy_ngram: int = 8
+    enforce_unique_rollouts: bool = True
+    unique_rollouts_max_rounds_factor: int = 50
 
-    dedup_sequences: bool = True              # hard dedup across *all* time (usually False)
-    allow_early_stop: bool = False            # EOS may be chosen mid-build to stop *entire tree*
-    min_decisions_before_stop: int = 1        # require at least this many FEAT decisions before STOP
-    stop_bias: float = 0.0                    # +ve encourages STOP; -ve discourages
+    dedup_sequences: bool = True
+    allow_early_stop: bool = False
+    min_decisions_before_stop: int = 1
+    stop_bias: float = 0.0
 
     # Replay sampling (optional extras)
     replay_novelty_bonus: float = 0.10
@@ -84,8 +85,11 @@ class Config:
     mlp_width: int = 256
     lr: float = 1e-4
 
-    # Backward policy choice (kept simple)
-    backward_policy: str = "uniform"          # "uniform" | "network" (network not used here)
+    # Backward policy choice
+    backward_policy: str = "uniform"          # "uniform" | "network" | "none"
+
+    # TB/FL update path
+    policy_update_mode: str = "single"       # "batched" | "single"
 
     # Priors & annealing
     beta: Optional[float] = None
@@ -115,7 +119,7 @@ class Config:
     # Inference-time weighting reward (RF & Boost)
     infer_reward_function: Optional[str] = None  # None->use training; "none"->equal weights
 
-    # Predictor mode hint for policy-generated trees
+    # Policy predictor mode
     policy_predictor_mode: str = "dirichlet_sample"  # "dirichlet_sample" | "dirichlet" | "mean"
 
     # Best-tree viz tracker
@@ -128,15 +132,15 @@ class Config:
     tb_reward_temperature: float = 10.0
     tb_reward_standardize: bool = True
 
+    # --- Leaf token penalty (discourage early LEAF) ---
+    leaf_penalty_strength: float = 4.0
+    leaf_penalty_decay: float = 0.85
+    leaf_penalty_min_depth: int = 2
+    leaf_bias: float = 0.0
+    leaf_cooldown_steps: int = 1
 
-    # --- Leaf token penalty (discourage early LEAF, togglable) ---
-    leaf_penalty_strength=4.0
-    leaf_penalty_decay=0.85
-    leaf_penalty_min_depth=2
-    leaf_bias=-0.2          # optional; 0 to disable
-    leaf_cooldown_steps=1
-    threshold_balance_gamma=0.0  # start at 0; turn up later if needed
-
+    # Threshold balance penalty (optional)
+    threshold_balance_gamma: float = 0.0
 
 
 # ============================================================
@@ -150,8 +154,8 @@ class Trainer:
         self.boosting_ensemble: List = []
         self.y_mean: float = 0.0
 
-        self.pf = None
-        self.pb = None
+        self.pf = None         # forward policy
+        self.pb = None         # backward policy (optional)
         self.log_z: Optional[torch.Tensor] = None
         self.replay_buffer: Optional[ReplayBuffer] = None
         self.le: Optional[LabelEncoder] = None
@@ -162,7 +166,7 @@ class Trainer:
         self._best_tree_seq: Optional[List[int]] = None
         self._best_tree_acc: float = 0.0
 
-        # ---- Global redundancy tracking (inter-trajectory) ----
+        # Global redundancy tracking (inter-trajectory)
         self.global_prefix_counts: Dict[Tuple[int, ...], float] = defaultdict(float)
 
         # Lightweight novelty memory (full sequences)
@@ -173,6 +177,9 @@ class Trainer:
         self._metric_y = None
         self._metric_target_full = None
         self._train_metric_cache: Dict[Tuple[int, ...], Tuple[float, int]] = {}
+
+        self._pb_replay_scores: Dict[Tuple[int, ...], float] = {}  # cache: seq tuple -> PB score
+
 
     # -------------------------
     # Fit
@@ -210,34 +217,57 @@ class Trainer:
             mt = y_true
         self._metric_target_full = mt.cpu() if c.eval_on_cpu else mt
 
-        # policy nets
+        # forward policy
         self.pf = torch.jit.script(
             PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device)
         )
-        self.pb = None  # uniform backward by default
 
-        self.log_z = torch.nn.Parameter(torch.tensor(1.0, device=c.device))
+        # backward policy (optional)
+        if c.backward_policy == "network":
+            self.pb = torch.jit.script(
+                PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device)
+            )
+        else:
+            self.pb = None
+
+        # logZ
+        self.log_z = torch.nn.Parameter(torch.tensor(0.0, device=c.device))
 
         # optimizers / schedulers
         optim_pfs = torch.optim.AdamW(self.pf.parameters(), lr=c.lr)
         sched_pfs = SequentialLR(
             optim_pfs,
             [LambdaLR(optim_pfs, lambda u: min(1.0, u / max(1, 10))),
-             CosineAnnealingLR(optim_pfs, T_max=max(1, c.updates - 10))],
+            CosineAnnealingLR(optim_pfs, T_max=max(1, c.updates - 10))],
             milestones=[10],
         )
+
         opt_list = [optim_pfs]
         sch_list = [sched_pfs]
 
+        # global logZ optimizer (unchanged)
         optim_z = torch.optim.Adam([self.log_z], lr=c.lr / 10)
         sched_z = SequentialLR(
             optim_z,
             [LambdaLR(optim_z, lambda u: min(1.0, u / max(1, 10))),
-             CosineAnnealingLR(optim_z, T_max=max(1, c.updates - 10))],
+            CosineAnnealingLR(optim_z, T_max=max(1, c.updates - 10))],
             milestones=[10],
         )
         opt_list.append(optim_z)
         sch_list.append(sched_z)
+
+        # --- NEW: PB optimizer if we train a network backward policy ---
+        if self.pb is not None:
+            optim_pbs = torch.optim.AdamW(self.pb.parameters(), lr=c.lr)
+            sched_pbs = SequentialLR(
+                optim_pbs,
+                [LambdaLR(optim_pbs, lambda u: min(1.0, u / max(1, 10))),
+                CosineAnnealingLR(optim_pbs, T_max=max(1, c.updates - 10))],
+                milestones=[10],
+            )
+            opt_list.append(optim_pbs)
+            sch_list.append(sched_pbs)
+
 
         # replay
         self.replay_buffer = ReplayBuffer(capacity=100000)
@@ -253,7 +283,9 @@ class Trainer:
 
         return self
 
-    
+    # ========================================================
+    # Visualize (unchanged)
+    # ========================================================
     def _visualize_best_tree_live(
         self,
         env_template,
@@ -262,21 +294,12 @@ class Trainer:
         step: int | None = None,
         format: str = "png",
     ):
-        """
-        Visualize the best-known tree by rebuilding it *on data*:
-          • uses utils._build_tree_by_data to replay tokens with LIFO expansion
-          • only accepts splits with non-empty children
-          • labels leaves with train stats (class probs or mean±std)
-
-        Falls back to a simple token decoder if _build_tree_by_data isn't available.
-        """
         import os
         try:
             import graphviz
         except Exception:
             return None
 
-        # choose a sequence to render
         seq = self._best_tree_seq or (self.ensemble[0] if self.ensemble else None)
         if not seq:
             return None
@@ -285,17 +308,12 @@ class Trainer:
         y  = env_template.y_full
         device = Xb.device
 
-        # ---- try to rebuild on data ----
         tree = None
         try:
-            from src.utils import _build_tree_by_data  # type: ignore
-            import torch
-
             tok_tensor = torch.tensor(seq, device=device, dtype=torch.long)
-            idxs_map  = torch.arange(Xb.size(0), device=device, dtype=torch.long)  # identity map
+            idxs_map  = torch.arange(Xb.size(0), device=device, dtype=torch.long)
             root, _ = _build_tree_by_data(tok_tensor, self.tokenizer, Xb, idxs_map)
 
-            # utils._Node is a dict-like; normalize accessors
             def is_split(n): return n.get("type") == "split"
             def feat(n):     return int(n["f"])
             def thr(n):      return int(n["t"])
@@ -305,16 +323,15 @@ class Trainer:
 
             tree = (root, is_split, feat, thr, left, right, leaf_indices)
         except Exception:
-            # ---- fallback: decode tokens without data checks ----
             try:
-                from src.utils import decode_tree_from_seq  # simple structure decoder
+                from src.utils import decode_tree_from_seq
                 def _wrap_simple(root_dict):
                     def is_split(n): return n.get("kind") == "split"
                     def feat(n):     return int(n["feat"])
                     def thr(n):      return int(n["thr"])
                     def left(n):     return n["left"]
                     def right(n):    return n["right"]
-                    def leaf_indices(n): return None  # no indices available
+                    def leaf_indices(n): return None
                     return (root_dict, is_split, feat, thr, left, right, leaf_indices)
                 tree = _wrap_simple(decode_tree_from_seq(seq, self.tokenizer))
             except Exception:
@@ -322,7 +339,6 @@ class Trainer:
 
         root, is_split, feat, thr, left, right, leaf_indices = tree
 
-        # ---- leaf labeling helpers ----
         is_cls = (self.cfg.task == "classification")
         n_classes = int(self.cfg.n_classes) if is_cls and self.cfg.n_classes is not None else None
         if is_cls:
@@ -333,7 +349,7 @@ class Trainer:
 
         def leaf_label(indices_tensor) -> str:
             import torch
-            if indices_tensor is None:  # fallback path: no per-leaf indices
+            if indices_tensor is None:
                 return "Leaf"
             idxs_local = indices_tensor
             n = int(idxs_local.numel())
@@ -354,7 +370,6 @@ class Trainer:
                 sd = float(vals.std(unbiased=False).item())
                 return f"Leaf • n={n}\nmean={mu:.4f} ± {sd:.4f}"
 
-        # ---- Graphviz render ----
         dot = graphviz.Digraph(comment="Best Decision Tree")
         dot.attr("node", shape="box", style="rounded")
         nid = 0
@@ -379,19 +394,16 @@ class Trainer:
             return myid
 
         walk(root)
-
         os.makedirs(save_dir, exist_ok=True)
         fname = f"best_tree_step_{step}" if step is not None else "best_tree"
         dot.render(os.path.join(save_dir, fname), format=format, cleanup=True)
         return dot
-
 
     # ========================================================
     # Reward helpers
     # ========================================================
     def _per_tree_reward(self, tok: torch.Tensor, reward_env: TabularEnv) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         c = self.cfg
-        # residual-matrix training (multi-class boosting)
         is_residual_matrix = (
             hasattr(reward_env, "y") and isinstance(reward_env.y, torch.Tensor) and reward_env.y.dim() == 2
             and not torch.allclose(reward_env.y.sum(1), torch.ones_like(reward_env.y.sum(1)), atol=1e-3, rtol=0.0)
@@ -430,7 +442,6 @@ class Trainer:
         if mode == "gini":
             dR = deltaE_split_gain_classification(tok, self.tokenizer, reward_env)
             return float(torch.clamp(dR.sum(), min=1e-9).item())
-        # default to training reward function
         return self._weight_for_tree(seq, reward_env, self.cfg.reward_function)
 
     @torch.no_grad()
@@ -498,7 +509,7 @@ class Trainer:
             self.global_prefix_counts[pref] += 1.0
 
     # ========================================================
-    # Train-metric helper (optional, for metric-weighted replay)
+    # Train-metric helper (unchanged)
     # ========================================================
     @torch.no_grad()
     def _train_metric_for_seq(self, seq: List[int]) -> float:
@@ -540,7 +551,54 @@ class Trainer:
             return 0.5 * (corr + 1.0)
 
     # ========================================================
-    # Batched policy update (one step)
+    # Backward network helper
+    # ========================================================
+    @torch.no_grad()
+    def _network_backward_log_prob(self, seq: torch.Tensor) -> torch.Tensor:
+        """
+        Compute per-step backward log-probabilities with a learnable PB network.
+
+        Given padded batch `seq` (B×T), for each row b with length L_b, we want:
+          log p_b( remove last token at step t | state s_t ) for t=1..L_b-1.
+
+        Implementation:
+          1) Reverse each sequence up to its actual length (keep PAD at the end).
+          2) Run PB.forward on the reversed batch and use `log_prob` (teacher forcing).
+          3) Flip the (B×(T-1)) result back along time so it aligns with forward steps.
+
+        Returns: (B×(T-1)) float tensor; zeros where next token is PAD.
+        """
+        assert self.pb is not None, "PB network not initialized"
+        v = self.tokenizer.v
+        pad_id = v.PAD
+        device = seq.device
+        B, T = seq.shape
+
+        lengths = (seq != pad_id).sum(dim=1)  # includes BOS..EOS (no PAD)
+        rev_rows = []
+        for b in range(B):
+            L = int(lengths[b].item())
+            sb = seq[b, :L]
+            rb = torch.flip(sb, dims=[0])  # reverse up to length
+            if L < T:
+                pad_tail = torch.full((T - L,), pad_id, dtype=seq.dtype, device=device)
+                rb = torch.cat([rb, pad_tail], dim=0)
+            rev_rows.append(rb)
+        rev_seq = torch.stack(rev_rows, dim=0)  # (B, T)
+
+        # teacher-forced next-token log-prob on reversed sequence
+        rev_logp = self.pb.log_prob(rev_seq)  # (B, T-1); zeros where next PAD
+
+        # map back: for each b, reverse the valid part (L_b-1) along time
+        out = torch.zeros_like(rev_logp)
+        for b in range(B):
+            L = int(lengths[b].item())
+            if L >= 2:
+                out[b, :L-1] = torch.flip(rev_logp[b, :L-1], dims=[0])
+        return out
+
+    # ========================================================
+    # Policy update (batched & single)
     # ========================================================
     def _update_policy(
         self,
@@ -549,6 +607,12 @@ class Trainer:
         optimizers: List,
         ensemble_reward_override: Optional[torch.Tensor] = None,
     ) -> Tuple[float, float]:
+        """
+        Batched policy update. Uses teacher-forced log-probs, and one of:
+          • uniform backward (analytic),
+          • network backward (learned),
+          • none (zeros).
+        """
         if not all_tuples_with_targets:
             return 0.0, 0.0
 
@@ -565,17 +629,21 @@ class Trainer:
             opt.zero_grad(set_to_none=True)
 
         with autocast(enabled=c.amp):
-            log_pf = self.pf.log_prob(padded)
+            log_pf = self.pf.log_prob(padded)  # (B, T-1)
 
-            # backward policy: uniform surrogate
-            log_pb = torch.zeros_like(log_pf)
+            # backward policy
+            if c.backward_policy == "network" and self.pb is not None:
+                log_pb = self._network_backward_log_prob_train(padded)  # requires grad -> trains PB
+            elif c.backward_policy == "uniform":
+                log_pb = uniform_backward_log_prob(padded, self.tokenizer, c.max_depth)
+            else:  # "none"
+                log_pb = torch.zeros_like(log_pf)
 
             logF = self.pf.log_F(padded)
 
             if ensemble_reward_override is not None:
                 R = ensemble_reward_override.expand(len(seqs)).to(device)
-                log_r = torch.log(R.clamp_min(1e-9))
-                log_r = log_r / max(temp, 1e-9)
+                log_r = torch.log(R.clamp_min(1e-9)) / max(temp, 1e-9)
                 if standardize:
                     log_r = (log_r - log_r.mean()) / (log_r.std() + 1e-6)
                 l_tb = tb_loss(log_pf, log_pb, self.log_z, log_r, priors_tensor)
@@ -595,8 +663,7 @@ class Trainer:
                         dR_list.append(dR.squeeze(0))
 
                 R = torch.stack(R_list, dim=0)
-                log_r = torch.log(R.clamp_min(1e-9))
-                log_r = log_r / max(temp, 1e-9)
+                log_r = torch.log(R.clamp_min(1e-9)) / max(temp, 1e-9)
                 if standardize:
                     log_r = (log_r - log_r.mean()) / (log_r.std() + 1e-6)
 
@@ -639,6 +706,100 @@ class Trainer:
         fl_loss_acc = float(fl_val.item()) if fl_val is not None else 0.0
         return tb_loss_acc, fl_loss_acc
 
+    def _update_policy_single(
+        self,
+        all_tuples_with_targets: List,
+        env_template: TabularEnv,
+        optimizers: List,
+        ensemble_reward_override: Optional[torch.Tensor] = None,
+    ) -> Tuple[float, float]:
+        """
+        Non-batched policy update: compute TB/FL per-sample and average.
+        Useful to rule out batching/masking artifacts.
+        """
+        if not all_tuples_with_targets:
+            return 0.0, 0.0
+
+        c, v, device = self.cfg, self.tokenizer.v, self.cfg.device
+        temp = float(getattr(c, "tb_reward_temperature", 10.0))
+        standardize = bool(getattr(c, "tb_reward_standardize", True))
+
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
+
+        tb_vals, fl_vals = [], []
+        losses = []
+        with autocast(enabled=c.amp):
+            if ensemble_reward_override is not None:
+                R_scalar = ensemble_reward_override.to(device)
+
+            for (seq, prior, target) in all_tuples_with_targets:
+                t = torch.tensor(seq, device=device, dtype=torch.long).unsqueeze(0)
+                prior_t = torch.as_tensor([prior], device=device, dtype=torch.float32)
+
+                log_pf_i = self.pf.log_prob(t)
+              
+                if c.backward_policy == "network" and self.pb is not None:
+                    log_pb_i = self._network_backward_log_prob_train(t)  # requires grad -> trains PB
+                elif c.backward_policy == "uniform":
+                    log_pb_i = uniform_backward_log_prob(t, self.tokenizer, c.max_depth)
+                else:  # "none"
+                    log_pb_i = torch.zeros_like(log_pf_i)
+
+
+                logF_i = self.pf.log_F(t)
+
+                if ensemble_reward_override is not None:
+                    log_r = torch.log(R_scalar.clamp_min(1e-9)) / max(temp, 1e-9)
+                    if standardize:
+                        log_r = log_r - log_r.detach()
+                    ltb = tb_loss(log_pf_i, log_pb_i, self.log_z, log_r, prior_t)
+                    losses.append(ltb)
+                    tb_vals.append(ltb.detach())
+                else:
+                    reward_env = copy.copy(env_template)
+                    reward_env.y = target
+                    reward_env.reset(len(target))
+                    R_t, dR = self._per_tree_reward(t, reward_env)
+                    log_r = torch.log(R_t.clamp_min(1e-9)) / max(temp, 1e-9)
+                    if standardize:
+                        log_r = log_r - log_r.detach()
+                    ltb = tb_loss(log_pf_i, log_pb_i, self.log_z, log_r, prior_t)
+
+                    if self.cfg.reward_function == "bayesian" or dR is None:
+                        losses.append(ltb)
+                        tb_vals.append(ltb.detach())
+                    else:
+                        gains = torch.relu(dR.squeeze(0))
+                        if gains.numel() == 0:
+                            lfl = torch.zeros_like(ltb)
+                        else:
+                            Tm1 = log_pf_i.size(1)
+                            if gains.numel() < Tm1:
+                                pad = torch.zeros((Tm1 - gains.numel(),), device=device)
+                                shaped = torch.cat([gains, pad], dim=0).unsqueeze(0)
+                            else:
+                                shaped = gains[:Tm1].unsqueeze(0)
+                            lfl = fl_loss(logF_i, log_pf_i, log_pb_i, shaped)
+                        losses.append(ltb + lfl)
+                        tb_vals.append(ltb.detach())
+                        fl_vals.append(lfl.detach())
+
+            loss = torch.stack(losses).mean()
+
+        self.scaler.scale(loss).backward()
+        for opt in optimizers:
+            torch.nn.utils.clip_grad_norm_(opt.param_groups[0]["params"], 1.0)
+            self.scaler.step(opt)
+        self.scaler.update()
+
+        self.replay_buffer.mark_policy_update()
+        self._decay_global_prefix_counts()
+
+        tb_loss_acc = float(torch.stack(tb_vals).mean().item() if tb_vals else 0.0)
+        fl_loss_acc = float(torch.stack(fl_vals).mean().item() if fl_vals else 0.0)
+        return tb_loss_acc, fl_loss_acc
+
     # ========================================================
     # RF training (policy + gen)
     # ========================================================
@@ -679,9 +840,15 @@ class Trainer:
                 ensemble_R_override = R_scalar
 
             all_tuples_with_targets = [(seq, prior, y_target_for_reward) for seq, prior in all_tuples]
-            avg_tb_loss, avg_fl_loss = self._update_policy(
-                all_tuples_with_targets, env_template, optimizers, ensemble_reward_override=ensemble_R_override
-            )
+
+            if c.policy_update_mode == "single":
+                avg_tb_loss, avg_fl_loss = self._update_policy_single(
+                    all_tuples_with_targets, env_template, optimizers, ensemble_reward_override=ensemble_R_override
+                )
+            else:
+                avg_tb_loss, avg_fl_loss = self._update_policy(
+                    all_tuples_with_targets, env_template, optimizers, ensemble_reward_override=ensemble_R_override
+                )
             for sch in schedulers:
                 sch.step()
 
@@ -737,7 +904,6 @@ class Trainer:
                     log_str += f" | BestTreeAcc: {self._best_tree_acc:.4f}"
 
             tqdm.write(log_str)
-            # Auto-visualize every N updates
             viz_every = int(getattr(self.cfg, "viz_every", 0) or 0)
             if viz_every and (upd % viz_every == 0):
                 out_dir = getattr(self.cfg, "viz_dir", "runs/trees")
@@ -746,13 +912,11 @@ class Trainer:
 
             all_tuples_last = all_tuples
 
-            # Optional: live viz hook (user's own visualize function can use _best_tree_seq)
-
         self.ensemble = [seq for seq, _ in all_tuples_last if seq] if all_tuples_last else []
         tqdm.write(f"--- RF finished. Final forest size: {len(self.ensemble)} ---")
 
     # ========================================================
-    # Boosting training (core unchanged structurally)
+    # Boosting (unchanged structurally)
     # ========================================================
     def _fit_boost_gfn(self, env_template, y_true, X_binned, optimizers, schedulers):
         c = self.cfg
@@ -807,9 +971,14 @@ class Trainer:
                 R_scalar = self._ensemble_reward_mse([], X_binned, y_true, base_pred=base_pred)
                 ensemble_R_override = R_scalar
 
-            avg_tb_loss, avg_fl_loss = self._update_policy(
-                tuples, env_template, optimizers, ensemble_reward_override=ensemble_R_override
-            )
+            if c.policy_update_mode == "single":
+                avg_tb_loss, avg_fl_loss = self._update_policy_single(
+                    tuples, env_template, optimizers, ensemble_reward_override=ensemble_R_override
+                )
+            else:
+                avg_tb_loss, avg_fl_loss = self._update_policy(
+                    tuples, env_template, optimizers, ensemble_reward_override=ensemble_R_override
+                )
             for sch in schedulers:
                 sch.step()
 
@@ -821,7 +990,7 @@ class Trainer:
                     corr = torch.corrcoef(torch.stack([base_pred.squeeze(), y_true.squeeze()]))[0, 1].item()
                     tqdm.write(f"Update {upd}/{c.updates} | TB: {avg_tb_loss:.4f} | FL: {avg_fl_loss:.4f} | Corr: {corr:+.4f}")
                 else:
-                    tqdm.write(f"Update {upd}/{c.updates} | TB: {avg_tb_loss:.4f} | FL: {avg_fl_loss:.4f} | Corr: nan")
+                    tqdm.write(f"Update {upd}/{c.updates} | TB: {avg_tb_loss:.4f} | FL: {avg_tb_loss:.4f} | Corr: nan")
             self.ensemble = [seq for seq, _ in candidates if seq]
             viz_every = int(getattr(self.cfg, "viz_every", 0) or 0)
             if viz_every and (upd % viz_every == 0):
@@ -829,16 +998,10 @@ class Trainer:
                 fmt = getattr(self.cfg, "viz_format", "png")
                 self._visualize_best_tree_live(env_template, save_dir=out_dir, step=upd, format=fmt)
 
-
     # ========================================================
-    # Rollouts (redundancy-aware + global STOP + enforce unique)
+    # Rollouts (LEAF → expand? → feature → threshold)
     # ========================================================
     def _collect_rollouts(self, env_template, temp, residuals, beta):
-        """
-        Returns a list of (seq, prior) trees.
-        If enforce_unique_rollouts=True, guarantees exactly cfg.rollouts *unique* sequences
-        (up to a safety cap). Otherwise, returns exactly cfg.rollouts sequences (duplicates allowed).
-        """
         c = self.cfg
         forward_tuples: List[Tuple[List[int], float]] = []
 
@@ -848,18 +1011,15 @@ class Trainer:
 
         pbar = tqdm(total=target, desc="Rollouts (unique)" if c.enforce_unique_rollouts else "Rollouts", leave=False)
 
-        # per-update local unique memory
         seen_this_round: Set[Tuple[int, ...]] = set()
 
-        while (len(forward_tuples) < target if not c.enforce_unique_rollouts else len(seen_this_round) < target) and (attempts < max_rounds):
+        while (len(seen_this_round) if c.enforce_unique_rollouts else len(forward_tuples)) < target and (attempts < max_rounds):
             attempts += 1
             remaining = (target - (len(seen_this_round) if c.enforce_unique_rollouts else len(forward_tuples)))
             batch = min(c.num_parallel, remaining)
 
-            # per-batch intra-trajectory RAS counts
             ras_counts: Optional[dict] = {} if c.redundancy_aware else None
 
-            # Prepare envs
             envs = [copy.copy(env_template) for _ in range(batch)]
             idx_batches = [env_template.draw_indices(c.batch_size) for _ in range(batch)]
             for env, idxs in zip(envs, idx_batches):
@@ -877,23 +1037,17 @@ class Trainer:
                     continue
                 seq, prior, idxs = res
                 key = tuple(seq)
-
                 if c.enforce_unique_rollouts:
                     if key in seen_this_round:
                         continue
                     seen_this_round.add(key)
-                    new_count += 1
-                else:
-                    new_count += 1
+                forward_tuples.append((seq, prior))
+                new_count += 1
 
-                # optional global dedup memory
                 if c.dedup_sequences:
                     self._seen_sequences.add(key)
-
-                # register inter-trajectory prefix stats
                 self._register_sequence_prefixes(seq)
 
-                # add to buffer with a reward score
                 reward_env = copy.copy(env_template)
                 reward_env.idxs = idxs.to(c.device)
                 reward_env.y_full = env_template.y_full
@@ -901,14 +1055,12 @@ class Trainer:
                 reward_env.y = residuals
                 r = self._weight_for_tree(seq, reward_env, mode=c.reward_function)
                 self.replay_buffer.add(r, seq, prior, idxs.cpu())
-                forward_tuples.append((seq, prior))
 
             if new_count > 0:
                 pbar.update(new_count)
 
         pbar.close()
 
-        # If enforcing uniqueness, filter duplicates in the return list
         if c.enforce_unique_rollouts:
             uniq = []
             seen = set()
@@ -918,7 +1070,6 @@ class Trainer:
                     continue
                 seen.add(t)
                 uniq.append((s, p))
-            # keep exactly target
             forward_tuples = uniq[:target]
         else:
             forward_tuples = forward_tuples[:target]
@@ -927,42 +1078,146 @@ class Trainer:
 
     def sample_replay(self, k: int) -> List[Tuple[List[int], float]]:
         """
-        Minimal top-k by reward replay (uniform backward).
-        You can expand this to include redundancy-aware sampling if desired.
+        Top-k from replay by backward policy *score*.
+        - If backward_policy=="network" and PB exists: rank by sum_t log p_B(s_{t-1}|s_t).
+        - Else: fallback to reward top-k (first element in replay entries).
+        Never trains PB here (eval+no_grad only). Caches PB scores and only
+        evaluates new sequences.
+        Returns: List[(seq, prior)]
         """
         buf = self.replay_buffer
-        if not buf or not buf.data:
+        if not buf or not getattr(buf, "data", None):
             return []
+
         entries = list(buf.data)
-        k = min(k, len(entries))
-        return [(entries[i][1], entries[i][2]) for i in range(k)]
+
+        # --- Extract (key, seq, prior) robustly from entries ---
+        triples: List[Tuple[Tuple[int, ...], List[int], float]] = []
+        for e in entries:
+            # Common layout from `add(r, seq, prior, idxs)`; tolerate extras.
+            if isinstance(e, (list, tuple)) and len(e) >= 3:
+                seq = e[1]
+                prior = float(e[2])
+            elif isinstance(e, dict):
+                seq = e.get("seq", None)
+                prior = float(e.get("prior", 0.0))
+            else:
+                continue
+            if not isinstance(seq, (list, tuple)) or len(seq) == 0:
+                continue
+            key = tuple(int(x) for x in seq)
+            triples.append((key, list(seq), prior))
+
+        if not triples:
+            return []
+
+        v = self.tokenizer.v
+        device = self.cfg.device
+
+        # --- If PB network is active, score by PB in eval/no_grad and cache ---
+        if self.cfg.backward_policy == "network" and (self.pb is not None):
+            # figure out which sequences are new to the cache
+            to_eval = [(key, seq) for (key, seq, _prior) in triples if key not in self._pb_replay_scores]
+            if to_eval:
+                seq_tensors = [torch.tensor(seq, device=device, dtype=torch.long) for _, seq in to_eval]
+                padded = torch.nn.utils.rnn.pad_sequence(seq_tensors, batch_first=True, padding_value=v.PAD)
+
+                # eval-only, no grads
+                was_training = self.pb.training
+                self.pb.eval()
+                with torch.no_grad():
+                    # reuse the same routine used during training (OK for eval)
+                    log_pb = self._network_backward_log_prob_train(padded)  # (B, T-1)
+                    scores = log_pb.sum(dim=1)  # scalar per seq
+                if was_training:
+                    self.pb.train()
+
+                for i, (key, _seq) in enumerate(to_eval):
+                    self._pb_replay_scores[key] = float(scores[i].item())
+
+            # gather cached scores
+            scored = [ (self._pb_replay_scores.get(key, float("-inf")), seq, prior)
+                      for (key, seq, prior) in triples ]
+            scored.sort(key=lambda x: x[0], reverse=True)
+
+            out: List[Tuple[List[int], float]] = []
+            for _score, seq, prior in scored[: max(0, k)]:
+                out.append((seq, prior))
+            return out
+
+        # --- Fallback: reward top-k (assumes buf stores reward at index 0) ---
+        try:
+            entries_sorted = sorted(entries, key=lambda e: float(e[0]), reverse=True)
+        except Exception:
+            entries_sorted = entries  # if not sortable, just take in-order
+
+        out: List[Tuple[List[int], float]] = []
+        for e in entries_sorted:
+            if isinstance(e, (list, tuple)) and len(e) >= 3:
+                seq, prior = e[1], float(e[2])
+            elif isinstance(e, dict):
+                seq, prior = e.get("seq", None), float(e.get("prior", 0.0))
+            else:
+                continue
+            if not isinstance(seq, (list, tuple)) or len(seq) == 0:
+                continue
+            out.append((list(seq), prior))
+            if len(out) >= k:
+                break
+        return out
+
+    def _network_backward_log_prob_train(self, padded: torch.Tensor) -> torch.Tensor:
+        """
+        Compute log p_B(s_{t-1}|s_t) for *forward* steps using a backward network by
+        teacher-forcing on the reversed non-PAD sequence and flipping back.
+        Returns: (B, T-1) with zeros where next token is PAD.
+        """
+        assert self.pb is not None, "PB network not initialized"
+        v = self.tokenizer.v
+        device = padded.device
+        B, T = padded.shape
+        out = torch.zeros((B, T - 1), device=device, dtype=torch.float32)
+
+        for b in range(B):
+            row = padded[b]
+            L = int((row != v.PAD).sum().item())   # length incl. BOS..EOS
+            if L < 2:
+                continue
+
+            s = row[:L]               # [L]
+            # reversed teacher forcing: predict rev[1:] from rev[:-1]
+            rev_in  = s[:-1].flip(0).unsqueeze(0)   # (1, L-1)
+            rev_tgt = s[1: ].flip(0).unsqueeze(0)   # (1, L-1)
+
+            logits, _ = self.pb(rev_in)             # (1, L-1, V)
+            logp = torch.log_softmax(logits, dim=-1)
+            gathered = logp.gather(-1, rev_tgt.unsqueeze(-1)).squeeze(-1)  # (1, L-1)
+
+            # map back to forward order
+            gathered_fwd = gathered.flip(1).squeeze(0)  # (L-1,)
+            out[b, :L-1] = gathered_fwd
+
+        mask = (padded[:, 1:] != v.PAD).to(out.dtype)
+        return out * mask
+
+
+
+
 
     def batched_rollout(self, envs, temp, residuals, beta, ras_counts: Optional[dict] = None):
         """
-        Roll out trees with *feasible* actions only (two-stage FEAT -> THRESHOLD).
-        Fixes:
-          • Aligns masks when filtering thresholds (no IndexError).
-          • Respects per-leaf feasible bin windows (lo/hi).
-          • Optional threshold imbalance penalty (cfg.threshold_balance_gamma).
-          • Optional LEAF cooldown to avoid premature closures (cfg.leaf_cooldown_steps).
-          • **Depth-scaled LEAF logit penalty + leaf_bias** to stop one-sided trees.
-        Returns: list of (seq, prior, idxs) or None per env.
+        Roll out trees with feasible actions only, making decisions as:
+            leaf -> choose whether to expand -> (if expand) sample feature -> sample threshold.
         """
-        import torch
-        from collections import deque
-        from typing import Deque, List, Tuple, Optional
-
         c, v, device = self.cfg, self.tokenizer.v, self.cfg.device
         num = len(envs)
         END_TOKEN  = v.EOS
         LEAF_TOKEN = self.tokenizer._leaf(0)
 
-        # knobs
         leaf_cd_steps   = int(getattr(c, "leaf_cooldown_steps", 0) or 0)
         th_imbal_gamma  = float(getattr(c, "threshold_balance_gamma", 0.0) or 0.0)
         leaf_bias_const = float(getattr(c, "leaf_bias", 0.0) or 0.0)
 
-        # ---- depth-scaled LEAF logit penalty (same as yesterday) ----
         def _leaf_logit_penalty(depth: int) -> float:
             strength = float(getattr(c, "leaf_penalty_strength", 0.0) or 0.0)
             if strength <= 0.0:
@@ -974,12 +1229,10 @@ class Trainer:
                 pen *= 3.0
             return float(pen)
 
-        # Prepare envs
         for env in envs:
             env.y = residuals
             env.reset(c.batch_size)
 
-        # Per-trajectory state
         seqs = [[v.BOS] for _ in range(num)]
         depths: List[Deque[int]] = [deque([0]) for _ in range(num)]
         lo_stacks: List[Deque[torch.Tensor]] = [deque([torch.zeros(v.num_feat, dtype=torch.long, device=device)]) for _ in range(num)]
@@ -1001,31 +1254,31 @@ class Trainer:
                     batch_first=True, padding_value=v.PAD
                 )
                 logits, _ = self.pf(pad)
-                last = logits[:, -1, :]
+                last = logits[:, -1, :]  # (B_active, V)
 
-                # Strong "don't repeat this exact prefix" guard if ras_counts provided (kept same)
                 if ras_counts is not None:
                     for bi, oidx in enumerate(active):
                         pref = tuple(seqs[oidx])
                         if pref in ras_counts:
                             last[bi, :] -= 1e9
 
-                # ---------------- first decision: choose FEAT or LEAF ----------------
-                mask1 = torch.zeros((len(active), v.size()), dtype=torch.bool, device=device)
+                expand_decisions: List[Tuple[bool, Optional[int]]] = []
+                valid_feat_lists: List[List[int]] = []
+                still_for_round: List[int] = []
 
                 for bi, oidx in enumerate(active):
                     if not depths[oidx]:
+                        expand_decisions.append((False, None))
                         continue
 
                     d = depths[oidx][-1]
                     can_split = (d < c.max_depth)
 
                     rows_rel = row_stacks[oidx][-1]
-                    Xb = envs[oidx].X_full[envs[oidx].idxs]   # [B,F]
-                    Xleaf = Xb.index_select(0, rows_rel)       # [n_leaf,F]
+                    Xb = envs[oidx].X_full[envs[oidx].idxs]
+                    Xleaf = Xb.index_select(0, rows_rel)
                     n_leaf = int(Xleaf.size(0))
 
-                    # Valid features: need ≥2 distinct bins; if min_child_size>0, at least one viable threshold
                     valid_feats = []
                     if can_split and n_leaf > 1:
                         mcs = int(c.min_child_size or 0)
@@ -1040,79 +1293,94 @@ class Trainer:
                                     continue
                             valid_feats.append(f)
 
-                    # LEAF allowed unless cooldown blocks and a split is feasible
-                    allow_leaf = True
+                    valid_feat_lists.append(valid_feats)
+
+                    leaf_allowed = True
                     if leaf_cd_steps > 0 and can_split and cd_stacks[oidx][-1] > 0:
-                        allow_leaf = False
-                    if allow_leaf:
-                        mask1[bi, LEAF_TOKEN] = True
+                        leaf_allowed = False
+
+                    if not valid_feats and leaf_allowed:
+                        choose_expand = False
+                        expand_decisions.append((choose_expand, None))
+                        if cd_stacks[oidx]:
+                            cd_stacks[oidx][-1] = max(0, cd_stacks[oidx][-1] - 1)
+                        continue
+
+                    if not valid_feats and not leaf_allowed:
+                        leaf_allowed = True
 
                     if valid_feats:
                         feat_ids = v.split_start + torch.as_tensor(valid_feats, device=device, dtype=torch.long)
-                        mask1[bi, feat_ids] = True
+                        feat_logits = last[bi, feat_ids]
+                        if temp > 1e-9:
+                            feat_logits = feat_logits / temp
+                        logit_close = last[bi, LEAF_TOKEN]
+                        if temp > 1e-9:
+                            logit_close = logit_close / temp
+                        if leaf_allowed:
+                            if leaf_bias_const != 0.0:
+                                logit_close = logit_close + leaf_bias_const
+                            pen = _leaf_logit_penalty(d)
+                            if pen != 0.0:
+                                logit_close = logit_close - pen
+                        logit_expand = torch.logsumexp(feat_logits, dim=0)
+                        two = torch.stack([logit_close, logit_expand], dim=0)
+                        probs_two = torch.softmax(two, dim=0)
+                        choose_expand = (torch.multinomial(probs_two.unsqueeze(0), 1).item() == 1)
+                    else:
+                        choose_expand = False
 
-                    # never allow EOS here; branches close via LEAF
-                    mask1[bi, v.EOS] = False
+                    if choose_expand:
+                        feat_ids = v.split_start + torch.as_tensor(valid_feats, device=device, dtype=torch.long)
+                        feat_logits = last[bi, feat_ids]
+                        if temp > 1e-9:
+                            feat_logits = feat_logits / temp
+                        probs_feat = torch.softmax(feat_logits, dim=0)
+                        choice_idx = int(torch.multinomial(probs_feat.unsqueeze(0), 1).item())
+                        chosen_feat = valid_feats[choice_idx]
+                        expand_decisions.append((True, chosen_feat))
+                    else:
+                        expand_decisions.append((False, None))
 
-                    # cooldown ticks while this leaf remains open
                     if cd_stacks[oidx]:
                         cd_stacks[oidx][-1] = max(0, cd_stacks[oidx][-1] - 1)
 
-                # === Leaf discouragement (depth-scaled penalty + constant bias) ===
-                # Only apply when LEAF is allowed *and* at least one FEAT is also allowed.
-                for bi, oidx in enumerate(active):
-                    if mask1[bi, LEAF_TOKEN]:
-                        has_feat = False
-                        # any feature allowed?
-                        start, end = v.split_start, v.split_start + v.num_feat
-                        if end <= mask1.size(1):
-                            has_feat = bool(mask1[bi, start:end].any().item())
-                        if has_feat and depths[oidx]:
-                            if leaf_bias_const != 0.0:
-                                last[bi, LEAF_TOKEN] += leaf_bias_const
-                            pen = _leaf_logit_penalty(int(depths[oidx][-1]))
-                            if pen != 0.0:
-                                last[bi, LEAF_TOKEN] -= pen
-
-                toks1 = _safe_sample(last, mask1, temp)
-
-                # Collect leaves that chose a FEAT (need threshold next)
                 need_threshold: List[Tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
-                still_for_round: List[int] = []
-
                 for bi, oidx in enumerate(active):
-                    tok = int(toks1[bi].item())
-                    if not mask1[bi].any():
+                    will_expand, chosen_feat = expand_decisions[bi]
+
+                    if not depths[oidx]:
                         envs[oidx].done = True
                         continue
 
-                    seqs[oidx].append(tok)
-                    if ras_counts is not None:
-                        pref = tuple(seqs[oidx])
-                        ras_counts[pref] = ras_counts.get(pref, 0) + 1
+                    if not will_expand:
+                        seqs[oidx].append(LEAF_TOKEN)
+                        if ras_counts is not None:
+                            ras_counts[tuple(seqs[oidx])] = ras_counts.get(tuple(seqs[oidx]), 0) + 1
 
-                    if tok == LEAF_TOKEN:
-                        # close this leaf
                         envs[oidx].step(("leaf", 0))
                         depths[oidx].pop(); lo_stacks[oidx].pop(); hi_stacks[oidx].pop(); row_stacks[oidx].pop(); cd_stacks[oidx].pop()
-                        _mark_done_if_finished(oidx)
-                        if not envs[oidx].done:
+                        if not depths[oidx]:
+                            envs[oidx].done = True
+                        else:
                             still_for_round.append(oidx)
                         continue
 
-                    # FEAT chosen -> request threshold
-                    kind, f_idx = self.tokenizer.decode_one(tok)  # 'feat'
-                    envs[oidx].step((kind, f_idx))
+                    f_idx = int(chosen_feat)
+                    feat_tok = int(v.split_start + f_idx)
+                    seqs[oidx].append(feat_tok)
+                    if ras_counts is not None:
+                        ras_counts[tuple(seqs[oidx])] = ras_counts.get(tuple(seqs[oidx]), 0) + 1
+
+                    envs[oidx].step(("feat", f_idx))
 
                     d0 = depths[oidx].pop()
                     lo_top = lo_stacks[oidx].pop()
                     hi_top = hi_stacks[oidx].pop()
                     rows_rel = row_stacks[oidx].pop()
                     cd_top = cd_stacks[oidx].pop()
+                    need_threshold.append((oidx, f_idx, d0, lo_top.clone(), hi_top.clone(), rows_rel.clone(), cd_top))
 
-                    need_threshold.append((oidx, int(f_idx), d0, lo_top.clone(), hi_top.clone(), rows_rel.clone(), cd_top))
-
-                # ---------------- second decision: choose THRESHOLD ----------------
                 if need_threshold:
                     sub_idx = [oidx for (oidx, *_) in need_threshold]
                     sub_pad = torch.nn.utils.rnn.pad_sequence(
@@ -1122,26 +1390,30 @@ class Trainer:
                     sub_logits, _ = self.pf(sub_pad)
                     last_th = sub_logits[:, -1, :]
 
-                    mask2 = torch.zeros((len(sub_idx), v.size()), dtype=torch.bool, device=device)
                     th_base = v.split_start + v.num_feat
-
                     for si, (oidx, f_idx, d0, lo_top, hi_top, rows_rel, cd_top) in enumerate(need_threshold):
                         Xb = envs[oidx].X_full[envs[oidx].idxs]
                         bf = Xb.index_select(0, rows_rel)[:, f_idx]
 
                         if bf.numel() == 0:
+                            envs[oidx].done = True
                             continue
 
                         uniq, counts = torch.unique(bf, sorted=True, return_counts=True)
                         if uniq.numel() < 2:
+                            depths[oidx].append(d0)
+                            lo_stacks[oidx].append(lo_top)
+                            hi_stacks[oidx].append(hi_top)
+                            row_stacks[oidx].append(rows_rel)
+                            cd_stacks[oidx].append(max(0, cd_top - 1))
+                            still_for_round.append(oidx)
                             continue
 
                         th_all_bins = uniq[:-1]
                         th_pos_all  = torch.arange(th_all_bins.numel(), device=device)
 
-                        # min_child_size mask
-                        mask_mc = torch.ones_like(th_pos_all, dtype=torch.bool)
                         mcs = int(c.min_child_size or 0)
+                        mask_mc = torch.ones_like(th_pos_all, dtype=torch.bool)
                         if mcs > 1:
                             csum_all = counts.cumsum(0)[:-1]
                             n_leaf = int(bf.numel())
@@ -1149,61 +1421,56 @@ class Trainer:
                             right_ok = (n_leaf - csum_all) >= mcs
                             mask_mc = left_ok & right_ok
 
-                        # feasible bin window mask
                         lo_f = int(lo_top[f_idx].item())
                         hi_f = int(hi_top[f_idx].item())
                         mask_win = (th_all_bins >= lo_f) & (th_all_bins <= hi_f)
 
-                        # final mask
                         mask_final = mask_mc & mask_win
-                        if mask_final.any():
-                            cand_bins = th_all_bins[mask_final]
-                            cand_pos  = th_pos_all[mask_final]
-                            th_ids = th_base + cand_bins.to(device=device, dtype=torch.long)
-                            mask2[si, th_ids] = True
+                        if not mask_final.any():
+                            depths[oidx].append(d0)
+                            lo_stacks[oidx].append(lo_top)
+                            hi_stacks[oidx].append(hi_top)
+                            row_stacks[oidx].append(rows_rel)
+                            cd_stacks[oidx].append(max(0, cd_top - 1))
+                            still_for_round.append(oidx)
+                            continue
 
-                            # optional imbalance penalty (kept)
-                            if th_imbal_gamma > 0.0 and mcs > 0:
-                                csum_all = counts.cumsum(0)[:-1].float()
-                                n_leaf = float(bf.numel())
-                                left_counts = csum_all.index_select(0, cand_pos)
-                                imbal = (2.0 * (left_counts / max(1.0, n_leaf)) - 1.0).abs()
-                                for jj, bval in enumerate(cand_bins.tolist()):
-                                    last_th[si, th_base + int(bval)] -= th_imbal_gamma * float(imbal[jj].item())
+                        cand_bins = th_all_bins[mask_final]
+                        cand_pos  = th_pos_all[mask_final]
+                        th_ids = th_base + cand_bins.to(device=device, dtype=torch.long)
 
-                        # never allow EOS/LEAF here
-                        mask2[si, v.EOS] = False
-                        mask2[si, LEAF_TOKEN] = False
+                        if th_imbal_gamma > 0.0 and mcs > 0:
+                            csum_all = counts.cumsum(0)[:-1].float()
+                            n_leaf = float(bf.numel())
+                            left_counts = csum_all.index_select(0, cand_pos)
+                            imbal = (2.0 * (left_counts / max(1.0, n_leaf)) - 1.0).abs()
+                            for jj, bval in enumerate(cand_bins.tolist()):
+                                last_th[si, th_base + int(bval)] -= th_imbal_gamma * float(imbal[jj].item())
 
-                    toks2 = _safe_sample(last_th, mask2, temp)
-
-                    for si, (oidx, f_idx, d0, lo_top, hi_top, rows_rel, cd_top) in enumerate(need_threshold):
-                        t_tok = int(toks2[si].item())
+                        logits_th = last_th[si, th_ids]
+                        if temp > 1e-9:
+                            logits_th = logits_th / temp
+                        probs_th = torch.softmax(logits_th, dim=0)
+                        choice_idx = int(torch.multinomial(probs_th.unsqueeze(0), 1).item())
+                        t_bin = int(cand_bins[choice_idx].item())
+                        t_tok = int(th_base + t_bin)
                         seqs[oidx].append(t_tok)
                         if ras_counts is not None:
-                            pref = tuple(seqs[oidx])
-                            ras_counts[pref] = ras_counts.get(pref, 0) + 1
+                            ras_counts[tuple(seqs[oidx])] = ras_counts.get(tuple(seqs[oidx]), 0) + 1
 
-                        _, t_idx = self.tokenizer.decode_one(t_tok)
-
-                        # Split rows
-                        Xb = envs[oidx].X_full[envs[oidx].idxs]
                         fv = Xb.index_select(0, rows_rel)[:, f_idx]
-                        m = fv <= t_idx
+                        m = fv <= t_bin
                         rows_L = rows_rel[m]
                         rows_R = rows_rel[~m]
 
-                        # Update feasible windows
                         lo_L, hi_L = lo_top.clone(), hi_top.clone()
-                        hi_L[f_idx] = torch.minimum(hi_L[f_idx], torch.as_tensor(t_idx, device=device))
+                        hi_L[f_idx] = torch.minimum(hi_L[f_idx], torch.as_tensor(t_bin, device=device))
                         lo_R, hi_R = lo_top.clone(), hi_top.clone()
-                        lo_R[f_idx] = torch.maximum(lo_R[f_idx], torch.as_tensor(t_idx + 1, device=device))
+                        lo_R[f_idx] = torch.maximum(lo_R[f_idx], torch.as_tensor(t_bin + 1, device=device))
 
-                        # Push children (R then L) for LIFO
                         depths[oidx].append(d0 + 1); lo_stacks[oidx].append(lo_R); hi_stacks[oidx].append(hi_R); row_stacks[oidx].append(rows_R)
                         depths[oidx].append(d0 + 1); lo_stacks[oidx].append(lo_L); hi_stacks[oidx].append(hi_L); row_stacks[oidx].append(rows_L)
 
-                        # Set cooldown for children (if enabled)
                         if leaf_cd_steps > 0:
                             cd_stacks[oidx].append(leaf_cd_steps)
                             cd_stacks[oidx].append(leaf_cd_steps)
@@ -1211,7 +1478,7 @@ class Trainer:
                             cd_stacks[oidx].append(0)
                             cd_stacks[oidx].append(0)
 
-                        envs[oidx].step(("th", int(t_idx)))
+                        envs[oidx].step(("th", int(t_bin)))
                         if depths[oidx]:
                             still_for_round.append(oidx)
                         else:
@@ -1219,7 +1486,6 @@ class Trainer:
 
                 active = still_for_round
 
-        # Finalize outputs
         for i in range(num):
             if envs[i].done:
                 if seqs[i][-1] != END_TOKEN:
@@ -1230,12 +1496,9 @@ class Trainer:
 
         return out
 
-
-
     # ========================================================
     # Predict
     # ========================================================
-
     @torch.no_grad()
     def _bin_test_like_train(
         self,
@@ -1243,26 +1506,18 @@ class Trainer:
         df_test: pd.DataFrame,
         df_train: pd.DataFrame,
     ) -> torch.Tensor:
-        """
-        Convert df_test to binned tensor using the binning fitted on df_train
-        inside env_template. Tries new env.py APIs first, then falls back.
-
-        Expected return: torch.LongTensor [N_test, F] on env_template.device.
-        """
-        # New-style APIs (preferred)
         if hasattr(env_template, "transform_df"):
-            X_te = env_template.transform_df(df_test)  # -> torch.LongTensor
+            X_te = env_template.transform_df(df_test)
             return X_te.to(env_template.device)
 
         if hasattr(env_template, "transform"):
-            X_te = env_template.transform(df_test)  # name sometimes differs
+            X_te = env_template.transform(df_test)
             return X_te.to(env_template.device)
 
         if hasattr(env_template, "featurise"):
-            X_te = env_template.featurise(df_test)  # sometimes spelled without '_'
+            X_te = env_template.featurise(df_test)
             return X_te.to(env_template.device)
 
-        # Legacy fallback (old env.py)
         if hasattr(env_template, "_featurise"):
             X_te = env_template._featurise(
                 df_test, df_train, self.cfg.feature_cols, self.cfg.n_bins
@@ -1270,13 +1525,9 @@ class Trainer:
             return X_te.to(env_template.device)
 
         raise RuntimeError(
-            "TabularEnv does not expose a known transform/featurise method. "
-            "Please update env.py to provide transform_df/transform/featurise."
+            "TabularEnv does not expose a known transform/featurise method."
         )
 
-        # ========================================================
-    # Predict
-    # ========================================================
     def predict(
         self,
         df_test: pd.DataFrame,
@@ -1291,7 +1542,6 @@ class Trainer:
         c = self.cfg
         algo_rf = c.random_forest if algorithm is None else (algorithm == "rf")
 
-        # --- New TabularEnv signature: keyword-only args ---
         env_template = TabularEnv(
             df_train,
             feature_cols=c.feature_cols,
@@ -1300,26 +1550,21 @@ class Trainer:
             task=c.task,
             binning_strategy=c.binning_strategy,
             device=c.device,
-            # pass-through (present in new env.py)
             min_data_in_bin=getattr(c, "min_data_in_bin", None),
             subsample_for_bin=getattr(c, "subsample_for_bin", None),
             per_feature_binning=getattr(c, "per_feature_binning", None),
         )
 
-        # --- Transform test set using the training bins (new API first, legacy fallback) ---
         if hasattr(env_template, "transform"):
             X_te = env_template.transform(df_test)
         elif hasattr(env_template, "_featurise"):
-            # prefer new-style _featurise(df, is_train=False) if available
             try:
-                X_te = env_template._featurise(df_test, is_train=False)  # type: ignore[arg-type]
+                X_te = env_template._featurise(df_test, is_train=False)  # type: ignore
             except TypeError:
-                # legacy path: _featurise(df_test, df_train, feature_cols, n_bins)
-                X_te = env_template._featurise(df_test, df_train, c.feature_cols, c.n_bins)  # type: ignore[misc]
+                X_te = env_template._featurise(df_test, df_train, c.feature_cols, c.n_bins)  # type: ignore
         else:
             raise RuntimeError("TabularEnv has no transform/_featurise method for test data.")
 
-        # training tensors from env
         X_tr, y_tr = env_template.X_full.clone(), env_template.y_full.clone()
 
         if algo_rf:
@@ -1333,7 +1578,6 @@ class Trainer:
                 policy_predictor_mode=policy_predictor_mode, infer_reward=infer_reward
             )
         return preds.cpu().numpy()
-
 
     def _predict_in_batches(self, pred_fn, X, bs: int, device: str):
         out = []
