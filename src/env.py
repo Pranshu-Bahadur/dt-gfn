@@ -123,7 +123,7 @@ class TabularEnv:
                     edges.append(torch.from_numpy(cuts.astype(np.float32)))
                     eff_bins.append(int(cuts.size + 1))
                     binary_mask.append(False)
-            else:
+        else:
                 # quantile binning
                 qs = np.linspace(0.0, 1.0, num=self.n_bins + 1, endpoint=True)
                 qv = np.quantile(x, qs, method="linear") if x.size > 0 else np.linspace(0.0, 1.0, self.n_bins + 1)

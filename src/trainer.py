@@ -337,9 +337,9 @@ class Trainer:
                 )
                 log_pb = self.pb.log_prob(flipped)
             elif c.backward_policy == "uniform":
-                # simple surrogate: cancels in TB up to a constant → use zeros
-                # (you can swap to uniform_backward_log_prob(padded, self.tokenizer, c.max_depth) if desired)
-                log_pb = torch.zeros_like(log_pf)
+                # uniform-backward surrogate: subtract branching factor per step
+                # (variance reduction without changing target over canonical trees)
+                log_pb = uniform_backward_log_prob(padded, self.tokenizer, c.max_depth)
             else:
                 log_pb = torch.zeros_like(log_pf)
 
