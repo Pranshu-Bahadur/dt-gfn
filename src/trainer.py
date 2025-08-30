@@ -63,6 +63,7 @@ class Config:
     mlp_layers: int = 3
     mlp_width: int = 256
     lr: float = 1e-4
+    policy_type: str = "mlp"                      # "mlp" | "transformer"
 
     # Backward policy choice
     backward_policy: str = "uniform"               # "uniform" | "network"
@@ -162,7 +163,11 @@ class Trainer:
         X_binned = env_template.X_full.clone()
 
         # policy nets
-        self.pf = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device)
+        if c.policy_type == "transformer":
+            from src.policy import PolicyTransformer
+            self.pf = PolicyTransformer(v.size(), d_model=c.lstm_hidden, n_layers=c.mlp_layers, n_heads=2, d_ff=c.mlp_width * 4, pad_id=v.PAD).to(c.device)
+        else:
+            self.pf = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device)
         # Optional compile for speed (PyTorch 2.x); fall back if not available
         try:
             import torch
@@ -172,7 +177,11 @@ class Trainer:
             pass
         self.pf = torch.jit.script(self.pf)
         if c.backward_policy == "network":
-            self.pb = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device)
+            if c.policy_type == "transformer":
+                from src.policy import PolicyTransformer
+                self.pb = PolicyTransformer(v.size(), d_model=c.lstm_hidden, n_layers=c.mlp_layers, n_heads=2, d_ff=c.mlp_width * 4, pad_id=v.PAD).to(c.device)
+            else:
+                self.pb = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device)
             try:
                 import torch
                 if hasattr(torch, "compile"):
