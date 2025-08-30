@@ -161,13 +161,24 @@ class Trainer:
         X_binned = env_template.X_full.clone()
 
         # policy nets
-        self.pf = torch.jit.script(
-            PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device)
-        )
+        self.pf = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device)
+        # Optional compile for speed (PyTorch 2.x); fall back if not available
+        try:
+            import torch
+            if hasattr(torch, "compile"):
+                self.pf = torch.compile(self.pf)
+        except Exception:
+            pass
+        self.pf = torch.jit.script(self.pf)
         if c.backward_policy == "network":
-            self.pb = torch.jit.script(
-                PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device)
-            )
+            self.pb = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device)
+            try:
+                import torch
+                if hasattr(torch, "compile"):
+                    self.pb = torch.compile(self.pb)
+            except Exception:
+                pass
+            self.pb = torch.jit.script(self.pb)
         else:
             self.pb = None
 
