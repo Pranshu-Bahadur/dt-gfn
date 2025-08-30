@@ -388,7 +388,7 @@ def get_tree_predictor(
     min_child_size: int = 20,
     min_gain: float = 0.0,
     predictor_mode: str = "dirichlet",  # "dirichlet" | "mean" (classification only)
-) -> Callable[[torch.Tensor], torch.Tensor]:
+):
     """
     Rebuild the tree by replaying tokens on TRAIN data with stronger split checks:
       • accept split only if both children have >= min_child_size
