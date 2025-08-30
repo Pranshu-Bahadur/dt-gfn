@@ -596,6 +596,21 @@ class ReplayBuffer:
     def sample(self, k: int) -> list:
         return random.sample(self.data, min(k, len(self.data)))
 
+    def sample_tempered(self, k: int, tau: float = 1.0) -> list:
+        if not self.data:
+            return []
+        k = min(k, len(self.data))
+        if tau <= 0:
+            # nearly argmax → fall back to top-k by reward
+            entries = sorted(self.data, key=lambda e: e[0], reverse=True)
+            return entries[:k]
+        import numpy as np
+        rewards = np.array([max(e[0], 1e-9) for e in self.data], dtype=np.float64)
+        w = np.exp(rewards / float(tau))
+        w = w / w.sum()
+        idx = np.random.choice(len(self.data), size=k, replace=False, p=w)
+        return [self.data[i] for i in idx]
+
     def mark_policy_update(self):
         self.step += 1
 

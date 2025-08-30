@@ -91,6 +91,7 @@ class Config:
     # Stabilizers
     reward_baseline_momentum: float = 0.95         # EMA of logR for centering
     grad_clip: float = 1.0                         # global grad-norm clip
+    replay_tau: float = 1.0                        # replay sampling temperature (1=softmax, 0=top-k)
 
     # training reward scope
     training_reward_scope: str = "per_tree"        # "per_tree" | "ensemble"
@@ -684,11 +685,10 @@ class Trainer:
         if not buf or not buf.data:
             return []
 
-        # If using uniform backward, just return top-k by reward (no pb weighting refresh).
+        # If using uniform/zero backward, sample tempered by reward for diversity
         if self.cfg.backward_policy != "network":
-            entries = list(buf.data)
-            k = min(k, len(entries))
-            return [(entries[i][1], entries[i][2]) for i in range(k)]
+            entries = buf.sample_tempered(k, tau=self.cfg.replay_tau)
+            return [(e[1], e[2]) for e in entries]
 
         # Otherwise: refresh backward weights via learned pb on reversed sequences.
         stale = [i for i, e in enumerate(buf.data) if e[4] is None or buf.step - e[5] >= REFRESH_INTERVAL]
