@@ -747,6 +747,8 @@ class Trainer:
             env.reset(c.batch_size)
 
         seqs = [[v.BOS] for _ in range(num)]
+        # Cache per-env binned features once; idxs are fixed per rollout
+        Xb_cache = [envs[i].X_full[envs[i].idxs] for i in range(num)]
         depths: List[Deque[int]] = [deque([0]) for _ in range(num)]
         lo_stacks: List[Deque[torch.Tensor]] = [deque([torch.zeros(v.num_feat, dtype=torch.long, device=device)]) for _ in range(num)]
         hi_stacks: List[Deque[torch.Tensor]] = [deque([torch.full((v.num_feat,), v.num_th - 1, dtype=torch.long, device=device)]) for _ in range(num)]
@@ -784,8 +786,7 @@ class Trainer:
                     can_split = (d < c.max_depth)
 
                     rows_rel = row_stacks[oidx][-1]
-                    Xb = envs[oidx].X_full[envs[oidx].idxs]  # [B, F]
-                    Xleaf = Xb.index_select(0, rows_rel)     # [n_leaf, F]
+                    Xleaf = Xb_cache[oidx].index_select(0, rows_rel)     # [n_leaf, F]
 
                     valid_feats = []
                     if can_split and Xleaf.size(0) > 1:
@@ -857,8 +858,7 @@ class Trainer:
                     th_base = v.split_start + v.num_feat
 
                     for si, (oidx, f_idx, d0, lo_top, hi_top, rows_rel) in enumerate(need_threshold):
-                        Xb = envs[oidx].X_full[envs[oidx].idxs]
-                        bf = Xb.index_select(0, rows_rel)[:, f_idx]
+                        bf = Xb_cache[oidx].index_select(0, rows_rel)[:, f_idx]
 
                         if bf.numel() == 0:
                             continue
@@ -899,8 +899,7 @@ class Trainer:
                         _, t_idx = self.tokenizer.decode_one(t_tok)
 
                         # split rows by chosen t
-                        Xb = envs[oidx].X_full[envs[oidx].idxs]
-                        fv = Xb.index_select(0, rows_rel)[:, f_idx]
+                        fv = Xb_cache[oidx].index_select(0, rows_rel)[:, f_idx]
                         m = fv <= t_idx
                         rows_L = rows_rel[m]
                         rows_R = rows_rel[~m]
