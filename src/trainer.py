@@ -88,6 +88,10 @@ class Config:
     min_child_size: int = 20                       # predictor split guard
     min_gain: float = 0.0                          # min impurity reduction
 
+    # Stabilizers
+    reward_baseline_momentum: float = 0.95         # EMA of logR for centering
+    grad_clip: float = 1.0                         # global grad-norm clip
+
     # training reward scope
     training_reward_scope: str = "per_tree"        # "per_tree" | "ensemble"
     ensemble_reward_metric: str = "mse"            # (regression-only for now)
@@ -121,6 +125,9 @@ class Trainer:
         self.le: Optional[LabelEncoder] = None
         self.classes_: Optional[np.ndarray] = None
         self.scaler = GradScaler(enabled=cfg.amp)
+
+        # EMA baseline for TB reward centering (log-space)
+        self._logR_ema = torch.tensor(0.0, device=cfg.device)
 
         # best-single-tree tracker
         self._best_tree_seq: Optional[List[int]] = None
@@ -347,7 +354,14 @@ class Trainer:
 
             if ensemble_reward_override is not None:
                 R = ensemble_reward_override.expand(len(seqs)).to(device)
-                l_tb = tb_loss(log_pf, log_pb, self.log_z, R, priors_tensor)
+                # reward centering (log-space EMA)
+                logR_batch = torch.log(R + 1e-9)
+                self._logR_ema = (
+                    self.cfg.reward_baseline_momentum * self._logR_ema
+                    + (1 - self.cfg.reward_baseline_momentum) * logR_batch.mean().detach()
+                )
+                R_centered = torch.exp(logR_batch - self._logR_ema)
+                l_tb = tb_loss(log_pf, log_pb, self.log_z, R_centered, priors_tensor)
                 loss = l_tb
                 tb_val, fl_val = l_tb, None
             else:
@@ -366,9 +380,18 @@ class Trainer:
                 R = torch.stack(R_list, dim=0)
 
                 if self.cfg.reward_function == 'bayesian':
-                    l_tb = tb_loss(log_pf, log_pb, self.log_z, R, priors_tensor)
+                    # reward centering (log-space EMA)
+                    logR_batch = torch.log(R + 1e-9)
+                    self._logR_ema = (
+                        self.cfg.reward_baseline_momentum * self._logR_ema
+                        + (1 - self.cfg.reward_baseline_momentum) * logR_batch.mean().detach()
+                    )
+                    R_centered = torch.exp(logR_batch - self._logR_ema)
+                    l_tb = tb_loss(log_pf, log_pb, self.log_z, R_centered, priors_tensor)
                     loss = l_tb
                     tb_val, fl_val = l_tb, None
+
+            # (no extra entropy regularization — GFlowNets already encourage entropy via objective)
                 else:
                     logR = torch.log(R + 1e-9)
                     if dR_list:
@@ -386,14 +409,40 @@ class Trainer:
                     elif dR_shaped.size(1) > Tm1:
                         dR_shaped = dR_shaped[:, :Tm1]
 
-                    l_tb = tb_loss(log_pf, log_pb, self.log_z, R, priors_tensor)
+                    # center logR for TB part only
+                    logR_batch = torch.log(R + 1e-9)
+                    self._logR_ema = (
+                        self.cfg.reward_baseline_momentum * self._logR_ema
+                        + (1 - self.cfg.reward_baseline_momentum) * logR_batch.mean().detach()
+                    )
+                    R_centered = torch.exp(logR_batch - self._logR_ema)
+                    l_tb = tb_loss(log_pf, log_pb, self.log_z, R_centered, priors_tensor)
                     l_fl = fl_loss(logF, log_pf, log_pb, dR_shaped)
                     loss = l_tb + l_fl
                     tb_val, fl_val = l_tb, l_fl
 
         self.scaler.scale(loss).backward()
+        # Unscale then clip (policy, optional backward, and logZ)
         for opt in optimizers:
-            torch.nn.utils.clip_grad_norm_(opt.param_groups[0]['params'], 1.0)
+            try:
+                self.scaler.unscale_(opt)
+            except Exception:
+                pass
+        if self.cfg.grad_clip and self.cfg.grad_clip > 0:
+            try:
+                torch.nn.utils.clip_grad_norm_(self.pf.parameters(), self.cfg.grad_clip)
+            except Exception:
+                pass
+            if self.pb is not None:
+                try:
+                    torch.nn.utils.clip_grad_norm_(self.pb.parameters(), self.cfg.grad_clip)
+                except Exception:
+                    pass
+            try:
+                torch.nn.utils.clip_grad_norm_([self.log_z], self.cfg.grad_clip)
+            except Exception:
+                pass
+        for opt in optimizers:
             self.scaler.step(opt)
         self.scaler.update()
 
