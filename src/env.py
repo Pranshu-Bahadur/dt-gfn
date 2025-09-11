@@ -17,6 +17,12 @@ class TabularEnv:
       • exposes per-feature effective bins (for threshold constraints),
       • provides X_full (binned) and y_full tensors,
       • supplies small helpers used by rollouts/rewards (draw_indices/reset/step/prior).
+
+    Binning strategies:
+      - "quantile"       : exact quantiles via np.nanquantile, deduped cutpoints
+      - "global_uniform" : uniform grid between min-max
+      - "lgbm_like"      : quantile-like on unique values with frequency weights (LightGBM-ish),
+                           collapses duplicate/tied cutpoints, never forces bins beyond support.
     """
 
     def __init__(
@@ -26,10 +32,11 @@ class TabularEnv:
         target_col: str,
         n_bins: int,
         task: str,
-        binning_strategy: str = "quantile",   # "quantile" | "global_uniform"
+        binning_strategy: str = "quantile",   # "quantile" | "global_uniform" | "lgbm_like"
         device: str = "cpu",
     ):
         assert task in ("classification", "regression")
+        assert binning_strategy in ("quantile", "global_uniform", "lgbm_like")
         self.device = torch.device(device)
         self.task = task
         self.feature_cols = list(feature_cols)
@@ -66,11 +73,27 @@ class TabularEnv:
     # ------------------------------------------------------------------
     # Binning
     # ------------------------------------------------------------------
-    def _fit_bin_edges(self, Xdf: pd.DataFrame) -> Tuple[List[torch.Tensor], torch.LongTensor, torch.BoolTensor]:
+
+    @staticmethod
+    def _two_unique_midpoint(u: np.ndarray) -> float:
+        """Midpoint between two sorted unique values."""
+        a, b = float(u[0]), float(u[1])
+        return (a + b) * 0.5
+
+    def _fit_bin_edges(
+        self, Xdf: pd.DataFrame
+    ) -> Tuple[List[torch.Tensor], torch.LongTensor, torch.BoolTensor]:
         """
-        Build per-feature bin edges. For binary/2-unique columns, fix to 2 bins with edge 0.5.
-        For continuous, use quantiles or global uniform. Return:
-          - bin_edges: list of 1D tensors of cutpoints (length = bins-1 for that feature)
+        Build per-feature bin edges.
+
+        Rules:
+          • Constant → 0 cutpoints, eff_bins=1
+          • Two-unique (binary) → 1 cutpoint at the midpoint of the two observed values
+            (if values are exactly {0,1}, midpoint is 0.5)
+          • Continuous → strategy-dependent cutpoints (may be fewer than n_bins-1 after de-dup)
+
+        Return:
+          - bin_edges: list of 1D tensors of cutpoints (length = eff_bins-1 for that feature)
           - per_feat_bins: LongTensor of effective bins per feature
           - binary_mask: BoolTensor marking features treated as binary
         """
@@ -79,58 +102,79 @@ class TabularEnv:
         binary_mask: List[bool] = []
 
         Xnp = Xdf.to_numpy(copy=False)
-        N, D = Xnp.shape
+        _, D = Xnp.shape
+
+        max_bins = max(1, int(self.n_bins))
 
         for j, col in enumerate(Xdf.columns):
-            x = Xnp[:, j]
-            x = x[~np.isnan(x)]
-            uniq = np.unique(x)
+            # Prepare floating copy (handles ints as well); drop NaN for edge fitting
+            x = pd.to_numeric(Xdf[col], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+            x_nn = x[~np.isnan(x)]
+            # Unique support
+            uniq = np.unique(x_nn)
 
-            # binary / two-unique detection
-            is_binary = False
-            if uniq.size <= 2:
-                # common 0/1, but also handles any two distinct values cleanly
-                is_binary = True
-            # also treat strict 0/1 as binary even if typed oddly
-            if set(np.unique(Xdf[col].dropna().astype(float))) <= {0.0, 1.0}:
-                is_binary = True
+            # --- constant ---
+            if uniq.size <= 1:
+                edges.append(torch.tensor([], dtype=torch.float32))
+                eff_bins.append(1)
+                binary_mask.append(False)
+                continue
 
-            if is_binary:
-                # two bins, single cut at 0.5 (works for {0,1} or {a,b} after normalization)
-                cut = torch.tensor([0.5], dtype=torch.float32)
-                edges.append(cut)
+            # --- binary / two unique ---
+            if uniq.size == 2:
+                cut = self._two_unique_midpoint(uniq)
+                edges.append(torch.tensor([cut], dtype=torch.float32))
                 eff_bins.append(2)
                 binary_mask.append(True)
                 continue
 
-            # non-binary continuous
+            # --- continuous: build cutpoints per strategy ---
             if self.binning_strategy == "global_uniform":
-                lo = float(np.nanmin(x)) if x.size > 0 else 0.0
-                hi = float(np.nanmax(x)) if x.size > 0 else lo + 1.0
+                lo, hi = float(np.nanmin(x_nn)), float(np.nanmax(x_nn))
                 if not np.isfinite(lo) or not np.isfinite(hi):
                     lo, hi = 0.0, 1.0
                 if hi <= lo:
-                    # nearly constant
-                    edges.append(torch.tensor([lo], dtype=torch.float32))
-                    eff_bins.append(1)
-                    binary_mask.append(False)
+                    # should have been caught by constant branch, but guard anyway
+                    cuts = np.array([], dtype=np.float32)
                 else:
-                    # build n_bins uniform bins
-                    cuts = np.linspace(lo, hi, num=self.n_bins + 1, endpoint=True)[1:-1]
-                    cuts = np.unique(cuts)
-                    if cuts.size == 0:
-                        cuts = np.array([lo + 1e-6], dtype=np.float32)
-                    edges.append(torch.from_numpy(cuts.astype(np.float32)))
-                    eff_bins.append(int(cuts.size + 1))
-                    binary_mask.append(False)
-        else:
-                # quantile binning
-                qs = np.linspace(0.0, 1.0, num=self.n_bins + 1, endpoint=True)
-                qv = np.quantile(x, qs, method="linear") if x.size > 0 else np.linspace(0.0, 1.0, self.n_bins + 1)
-                cuts = np.unique(qv[1:-1])  # remove endpoints
-                if cuts.size == 0:
-                    # fallback: treat as constant with one bin
-                    cuts = np.array([qv[0]], dtype=np.float32)
+                    # n_bins → n_bins-1 interior cuts
+                    cuts = np.linspace(lo, hi, num=max_bins + 1, endpoint=True)[1:-1].astype(np.float64)
+                    cuts = np.unique(cuts)  # dedup in case max_bins==1
+                edges.append(torch.from_numpy(cuts.astype(np.float32)))
+                eff_bins.append(int(cuts.size + 1))
+                binary_mask.append(False)
+
+            elif self.binning_strategy == "quantile":
+                # quantile positions (exclude 0 and 1)
+                qs = np.linspace(0.0, 1.0, num=max_bins + 1, endpoint=True)[1:-1]
+                if qs.size == 0:
+                    cuts = np.array([], dtype=np.float64)
+                else:
+                    # use nan-aware quantiles; dedup to avoid repeated cutpoints on ties
+                    qv = np.nanquantile(x_nn, qs, method="linear").astype(np.float64)
+                    cuts = np.unique(qv)
+                    # drop extremes equal to min/max to avoid empty end-bins
+                    cuts = cuts[(cuts > uniq[0]) & (cuts < uniq[-1])]
+                edges.append(torch.from_numpy(cuts.astype(np.float32)))
+                eff_bins.append(int(cuts.size + 1))
+                binary_mask.append(False)
+
+            else:  # "lgbm_like"
+                # LightGBM-ish: choose cut values so that each bin has ~equal counts,
+                # but operate on unique values with frequency weights, then dedup.
+                vals, cnts = np.unique(x_nn, return_counts=True)
+                N = float(cnts.sum())
+                if vals.size <= 1:
+                    cuts = np.array([], dtype=np.float64)
+                else:
+                    cdf = np.cumsum(cnts) / N
+                    targets = np.linspace(0.0, 1.0, num=max_bins + 1, endpoint=True)[1:-1]
+                    # map each target quantile to the first unique where cdf >= target
+                    idx = np.searchsorted(cdf, targets, side="left")
+                    idx = np.clip(idx, 0, vals.size - 1)
+                    cuts = np.unique(vals[idx].astype(np.float64))
+                    # keep interior only (avoid min/max as cuts)
+                    cuts = cuts[(cuts > vals[0]) & (cuts < vals[-1])]
                 edges.append(torch.from_numpy(cuts.astype(np.float32)))
                 eff_bins.append(int(cuts.size + 1))
                 binary_mask.append(False)
@@ -141,25 +185,35 @@ class TabularEnv:
 
     def _bucketize_col(self, x: np.ndarray, cutpoints: torch.Tensor, is_binary: bool) -> np.ndarray:
         """
-        x: 1D numpy array
+        x: 1D numpy array (may contain NaN; NaNs will be treated as their own extreme bin via digitize behavior)
         cutpoints: 1D torch tensor of cut thresholds (length B-1)
         return: int64 bin ids in [0..B-1]
         """
+        cp = cutpoints.detach().cpu().numpy()
+        x = pd.to_numeric(pd.Series(x), errors="coerce").to_numpy(dtype=np.float64, copy=False)
+
         if is_binary:
-            # Fast path: anything > 0.5 goes to bin 1
-            out = (x > 0.5).astype(np.int64)
+            # Use the learned binary threshold (midpoint of the two observed values)
+            thr = cp[0] if cp.size == 1 else 0.5  # fallback, though cp.size should be 1 here
+            out = (x > thr).astype(np.int64)
+            # Put NaNs in bin 0 to be safe (could also choose own bin; keep it simple)
+            out[np.isnan(x)] = 0
             return out
 
-        cp = cutpoints.cpu().numpy()
-        # np.digitize assigns 0..len(cp) by comparing against cp (strict > when right=False)
-        # We want bins 0..B-1
+        if cp.size == 0:
+            out = np.zeros_like(x, dtype=np.int64)
+            out[np.isnan(x)] = 0
+            return out
+
+        # np.digitize: returns 0..len(cp) using <= when right=False
         out = np.digitize(x, cp, right=False).astype(np.int64)
+        out[np.isnan(x)] = 0
         return out
 
     def _bin_dataframe(self, df: pd.DataFrame) -> np.ndarray:
         Xnp = df.to_numpy(copy=False)
         D = Xnp.shape[1]
-        out = np.empty_like(Xnp, dtype=np.int64)
+        out = np.empty((Xnp.shape[0], D), dtype=np.int64)
         for j in range(D):
             out[:, j] = self._bucketize_col(Xnp[:, j], self.bin_edges[j], bool(self.binary_mask[j]))
         return out
@@ -167,7 +221,9 @@ class TabularEnv:
     # ------------------------------------------------------------------
     # Public helpers used by Trainer
     # ------------------------------------------------------------------
-    def _featurise(self, df_new: pd.DataFrame, df_fit: pd.DataFrame, feature_cols: List[str], n_bins: int) -> torch.Tensor:
+    def _featurise(
+        self, df_new: pd.DataFrame, df_fit: pd.DataFrame, feature_cols: List[str], n_bins: int
+    ) -> torch.Tensor:
         """
         Featurise a new dataframe with the *fitted* bin edges.
         """

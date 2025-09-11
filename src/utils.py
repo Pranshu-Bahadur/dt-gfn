@@ -207,42 +207,62 @@ def _nig_log_evidence(y64: torch.Tensor,
             - a_n * torch.log(b_n)
             + 0.5 * (torch.log(kappa0) - torch.log(kappa_n))
             - 0.5 * n * math.log(2.0 * math.pi))
+USE_PRIOR   = False
+MINI_BATCH  = False
+BATCH_SIZE  = 512
+ALPHA_VALUE = 0.1
+SIGMA = 1.0
+PHI = 1.0
+
 
 @torch.no_grad()
-def calculate_bayesian_reward(tokens: torch.Tensor,
-                              tok: "Tokenizer",
-                              env: "TabularEnv",
-                              beta: float) -> torch.Tensor:
-    """
-    Classification reward (Dirichlet–Multinomial evidence + structure prior).
-      log R = [Σ_leaves log P(y_leaf | α) - log P(y_root | α)] / N  -  β * n_splits / N
-    """
-    root, n_dec = _build_tree_by_data(tokens, tok, env.X_full, env.idxs)
-    leaves = _collect_leaf_indices(root, env.X_full.device)
-    y = env.y_full[env.idxs].to(torch.long)
-    if y.numel() == 0:
-        return torch.tensor([1e-9], device=env.device)
+def calc_bayes_reward_leafonly_log(tokens, tok, env, *_):
+    N_total = int(env.X_full.size(0))
+    if MINI_BATCH:
+        bsz = min(BATCH_SIZE, N_total)
+        idxs = torch.randperm(N_total, device=env.device)[:bsz]
+    else:
+        idxs = torch.arange(N_total, device=env.device)
+    Xb = env.X_full[idxs]
+    y  = env.y_full[idxs].to(torch.long)
+    scale = float(N_total / max(1, len(idxs)))
+
+    root, n_dec = _build_tree_by_data(tokens, tok, Xb, torch.arange(len(idxs), device=env.device))
+    leaves = _collect_leaf_indices(root, Xb.device)
 
     K = int(getattr(env, "n_classes", int(y.max().item()) + 1))
-    alpha = torch.full((K,), 0.1, dtype=torch.float64, device=env.device)
+    alpha = torch.full((K,), float(ALPHA_VALUE), dtype=torch.float64, device=env.device)
 
-    root_counts = torch.bincount(y, minlength=K).to(torch.float64)
-    L0 = _dm_log_evidence_from_counts(root_counts, alpha)
-
-    L = torch.zeros((), dtype=torch.float64, device=env.device)
-    any_leaf = False
+    log_lik = torch.zeros((), dtype=torch.float64, device=env.device)
     for idx in leaves:
         if idx.numel() == 0:
             continue
-        any_leaf = True
-        leaf_counts = torch.bincount(y[idx], minlength=K).to(torch.float64)
-        L = L + _dm_log_evidence_from_counts(leaf_counts, alpha)
-    if not any_leaf:
-        L, n_dec = L0, 0
+        cnt = torch.bincount(y[idx], minlength=K).to(torch.float64)
+        log_lik += _dm_log_evidence_from_counts(cnt, alpha)
 
-    N = max(1, int(y.numel()))
-    logR = (L - L0) / N - float(beta) * (n_dec / N)
-    logR = torch.clamp(logR, min=-50.0, max=50.0).to(torch.float32)
+    if USE_PRIOR:
+        log_prior = torch.zeros((), dtype=torch.float64, device=env.device)
+        q = [(root, 0)]
+        while q:
+            node, depth = q.pop()
+            p = float(SIGMA) * (1.0 + float(depth)) ** (-float(PHI))
+            p = min(max(p, 1e-6), 1 - 1e-6)
+            if node.get('type') == 'split':
+                log_prior += torch.log(torch.tensor(p, dtype=torch.float64, device=env.device))
+                q.append((node['L'], depth + 1)); q.append((node['R'], depth + 1))
+            else:
+                log_prior += torch.log(torch.tensor(1.0 - p, dtype=torch.float64, device=env.device))
+    else:
+        coeff = (torch.log(torch.tensor(4.0, dtype=torch.float64, device=env.device))
+                 + torch.log(torch.tensor(float(env.X_full.size(1)), dtype=torch.float64, device=env.device)))
+        log_prior = -coeff * int(n_dec)
+
+    logR = scale * (log_lik + log_prior)
+    return logR.unsqueeze(0).to(torch.float32)
+
+@torch.no_grad()
+def calculate_bayesian_reward(tokens, tok, env, *_):
+    logR = calc_bayes_reward_leafonly_log(tokens, tok, env).squeeze(0)
     return torch.exp(logR).clamp_min(1e-9).unsqueeze(0)
 
 @torch.no_grad()
