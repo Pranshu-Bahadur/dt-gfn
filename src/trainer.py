@@ -339,7 +339,7 @@ class Trainer:
         if mode == "bayesian":
             R = calculate_bayesian_reward(tok, self.tokenizer, reward_env, self.cfg.beta) if task == "classification" \
                 else calculate_bayesian_reward_regression(tok, self.tokenizer, reward_env, self.cfg.beta)
-            return float(R.item())
+            return float(torch.exp(R, dtype=R.dtype).item())
         if mode in ("variance", "sse"):
             dR = deltaE_split_gain_sse(tok, self.tokenizer, reward_env)
             return float(torch.clamp(dR.sum(), min=1e-9).item())
