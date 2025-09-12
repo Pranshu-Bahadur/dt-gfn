@@ -186,7 +186,7 @@ class PolicyTransformer(PolicyBase):
         n_heads: int = 2,
         d_ff: int = 256 * 4,
         dropout: float = 0.1,
-        max_len: int = 1024,
+        max_len: int = 384,
         pad_id: int = 0,
     ):
         super().__init__()
@@ -259,6 +259,254 @@ class PolicyTransformer(PolicyBase):
             nonpad = (seq != self.pad_id).to(torch.int32)
             lengths = nonpad.sum(dim=1)
             eos_step = lengths - 2
+            eos_mask = torch.ones((B, T - 1), dtype=torch.bool, device=seq.device)
+            if B > 0:
+                ar = torch.arange(B, device=seq.device)
+                valid = (eos_step >= 0) & (eos_step < (T - 1))
+                if bool(valid.any()):
+                    eos_mask[ar[valid], eos_step[valid]] = False
+
+        mask = pad_mask & eos_mask
+        return gathered * mask.to(gathered.dtype)
+
+    @torch.jit.export
+    def log_F(self, seq: torch.Tensor) -> torch.Tensor:
+        _, flow = self.forward(seq)
+        return flow
+        
+
+# -------------------------------
+# Recurrent Retention Policy (RetNet-style)
+# -------------------------------
+from dataclasses import dataclass
+
+@dataclass
+class RetentionConfig:
+    d_model: int = 256
+    n_layers: int = 2
+    n_heads: int = 4          # d_model must be divisible by n_heads
+    d_ff: int = 1024
+    dropout: float = 0.1
+    max_len: int = 1024
+    pad_id: int = 0
+    learnable_gamma: bool = True  # per-head decay is learnable (0..1)
+    gamma_init_power: float = -5.0  # gamma_h = 1 - 2^(gamma_init_power - h)
+
+class _MultiHeadRecurrentRetention(nn.Module):
+    """
+    Multi-head recurrent retention core.
+
+    For each time step t:
+      S_h <- gamma_h * S_h + k_{t,h} ⊗ v_{t,h}         (state per head h: dh×dh)
+      y_{t,h} = q_{t,h} @ S_h
+    Concatenate heads -> (B, T, D).
+
+    Notes:
+      • We mask PADs by zeroing q,k,v at those positions and skipping their contribution.
+      • Complexity per step per head is O(dh^2). With d_model=256, n_heads=4 → dh=64 (fine).
+    """
+    def __init__(self, d_model: int, n_heads: int, dropout: float,
+                 learnable_gamma: bool, gamma_init_power: float):
+        super().__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+
+        D, H, dh = d_model, n_heads, d_model // n_heads
+        # projections (no bias; bias can be added if desired)
+        self.q_proj = nn.Linear(D, D, bias=False)
+        self.k_proj = nn.Linear(D, D, bias=False)
+        self.v_proj = nn.Linear(D, D, bias=False)
+
+        # per-head decay gamma ∈ (0,1); use sigmoid parameterization
+        # init schedule similar to TF example: gamma_h = 1 - 2^(-5 - h)
+        init = []
+        for h in range(H):
+            g = 1.0 - (2.0 ** (gamma_init_power - float(h)))
+            g = max(1e-4, min(1.0 - 1e-4, g))
+            # inverse-sigmoid
+            init.append(-torch.log(torch.tensor(1.0 / g - 1.0)))
+        self._gamma_param = nn.Parameter(torch.stack(init)) if learnable_gamma else None
+        self.register_buffer("_gamma_fixed", torch.stack(init).sigmoid() if not learnable_gamma else torch.zeros(H))
+
+        self.dropout = nn.Dropout(dropout)
+        self.gn = nn.GroupNorm(num_groups=n_heads, num_channels=D, affine=True)
+        self.wo = nn.Linear(D, D, bias=False)
+        self.wg = nn.Sequential(nn.Linear(D, D, bias=False), nn.SiLU())
+
+        self.ln = nn.LayerNorm(D)
+
+    def _gammas(self) -> torch.Tensor:
+        if self._gamma_param is not None:
+            g = torch.sigmoid(self._gamma_param)  # (H,)
+        else:
+            g = self._gamma_fixed
+        # keep a tiny safety margin
+        eps = 1e-4
+        return eps + (1.0 - 2*eps) * g  # (H,)
+
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, T, D)
+        key_padding_mask: (B, T) True at PAD positions
+        returns: (B, T, D)
+        """
+        B, T, D = x.shape
+        H, dh = self.n_heads, self.d_head
+        device = x.device
+
+        Q = self.q_proj(x).view(B, T, H, dh)  # (B,T,H,dh)
+        K = self.k_proj(x).view(B, T, H, dh)
+        V = self.v_proj(x).view(B, T, H, dh)
+
+        # state S per head: (B,H,dh,dh)
+        S = x.new_zeros(B, H, dh, dh)
+        gam = self._gammas().to(device).view(1, H, 1, 1)  # (1,H,1,1)
+
+        Y = x.new_zeros(B, T, H, dh)
+        # iterate over time (TorchScript-friendly; no Python lists)
+        for t in range(T):
+            nonpad = (~key_padding_mask[:, t]).float().view(B, 1, 1)  # (B,1,1)
+            q_t = Q[:, t] * nonpad        # (B,H,dh)
+            k_t = K[:, t] * nonpad
+            v_t = V[:, t] * nonpad
+
+            # outer product per head
+            # (B,H,dh,dh) += (B,H,dh) ⊗ (B,H,dh)
+            S = gam * S + torch.einsum('bhd,bhe->bhde', k_t, v_t)
+
+            # y_t = q_t @ S
+            Y[:, t] = torch.einsum('bhd,bhde->bhe', q_t, S)
+
+        # concat heads, group-norm, gated output, residual
+        Y = Y.reshape(B, T, D)
+        Y_flat = Y.reshape(B*T, D)
+        Y_norm = self.gn(Y_flat).reshape(B, T, D)
+        out = self.wo(self.wg(x) * Y_norm)
+        out = self.dropout(out)
+        return self.ln(x + out)
+
+class _RetentionFFN(nn.Module):
+    def __init__(self, d_model: int, d_ff: int, dropout: float):
+        super().__init__()
+        self.ln = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.ff(self.ln(x))
+        return x + h
+
+class _RetentionBlock(nn.Module):
+    def __init__(self, cfg: RetentionConfig):
+        super().__init__()
+        self.core = _MultiHeadRecurrentRetention(
+            d_model=cfg.d_model,
+            n_heads=cfg.n_heads,
+            dropout=cfg.dropout,
+            learnable_gamma=cfg.learnable_gamma,
+            gamma_init_power=cfg.gamma_init_power,
+        )
+        self.ffn = _RetentionFFN(cfg.d_model, cfg.d_ff, cfg.dropout)
+
+    def forward(self, x: torch.Tensor, kpm: torch.Tensor) -> torch.Tensor:
+        x = self.core(x, kpm)
+        x = self.ffn(x)
+        return x
+
+class PolicyRetention(PolicyBase):
+    """
+    Recurrent Retention Policy Network (RetNet-style), drop-in for DT-GFN.
+
+    Token + positional embeddings → L×[RetentionBlock] → heads:
+      – next-token logits  (B × T × V)
+      – flow estimate      (B × T)
+    """
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 256,
+        n_layers: int = 2,
+        n_heads: int = 4,
+        d_ff: int = 1024,
+        dropout: float = 0.1,
+        max_len: int = 1024,
+        pad_id: int = 0,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.pad_id = int(pad_id)
+        self.max_len = max_len
+
+        self.tok_emb = nn.Embedding(vocab_size, d_model, padding_idx=pad_id)
+        self.pos_emb = nn.Embedding(max_len, d_model)
+
+        cfg = RetentionConfig(
+            d_model=d_model,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            d_ff=d_ff,
+            dropout=dropout,
+            max_len=max_len,
+            pad_id=pad_id,
+        )
+        self.layers = nn.ModuleList([_RetentionBlock(cfg) for _ in range(n_layers)])
+
+        self.head_tok  = nn.Linear(d_model, vocab_size)
+        self.head_flow = nn.Linear(d_model, 1)
+
+    def _positional(self, T: int, device: torch.device) -> torch.Tensor:
+        T = min(T, self.max_len)
+        pos = torch.arange(T, device=device)
+        return self.pos_emb(pos).unsqueeze(0)  # (1,T,D)
+
+    def forward(self, seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        seq : (B,T) int64 token IDs
+        Returns:
+          logits : (B,T,V)
+          flow   : (B,T)
+        """
+        B, T = seq.size(0), seq.size(1)
+        x = self.tok_emb(seq) + self._positional(T, seq.device)  # (B,T,D)
+        kpm = (seq == self.pad_id)                                # (B,T) True where PAD
+
+        for blk in self.layers:
+            x = blk(x, kpm)
+
+        logits = self.head_tok(x)                 # (B,T,V)
+        flow   = self.head_flow(x).squeeze(-1)    # (B,T)
+        return logits, flow
+
+    @torch.jit.export
+    def log_prob(self, seq: torch.Tensor) -> torch.Tensor:
+        """
+        Teacher-forced log-probs for next tokens (B, T-1),
+        masked at PAD, with the single EOS-prediction step removed.
+        """
+        B, T = seq.size(0), seq.size(1)
+        if T < 2:
+            return torch.empty(B, 0, device=seq.device, dtype=torch.float32)
+
+        logits, _ = self.forward(seq[:, :-1])         # (B, T-1, V)
+        logp = torch.log_softmax(logits, dim=-1)      # (B, T-1, V)
+        next_ids = seq[:, 1:]                         # (B, T-1)
+        gathered = logp.gather(-1, next_ids.unsqueeze(-1)).squeeze(-1)
+
+        # PAD mask on the *next* token
+        pad_mask = (next_ids != self.pad_id)
+
+        # Remove the EOS-prediction step (sampler appends EOS deterministically)
+        with torch.no_grad():
+            nonpad = (seq != self.pad_id).to(torch.int32)
+            lengths = nonpad.sum(dim=1)               # includes BOS & EOS
+            eos_step = lengths - 2                    # index in [0..T-2]
             eos_mask = torch.ones((B, T - 1), dtype=torch.bool, device=seq.device)
             if B > 0:
                 ar = torch.arange(B, device=seq.device)

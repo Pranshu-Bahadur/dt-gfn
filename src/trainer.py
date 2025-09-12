@@ -17,7 +17,7 @@ from sklearn.preprocessing import LabelEncoder
 
 from src.tokenizer import Tokenizer, Vocab
 from src.env import TabularEnv
-from src.policy import PolicyPaperMLP # includes prefix-decay readout variant
+from src.policy import PolicyPaperMLP, PolicyRetention # includes prefix-decay readout variant
 from src.utils import (
     ReplayBuffer,
     tb_loss,
@@ -91,9 +91,9 @@ class Config:
     redundancy_aware: bool = True
 
     # Policy network
-    lstm_hidden: int = 1024
-    mlp_layers: int = 12
-    mlp_width: int = 1024
+    lstm_hidden: int = 256
+    mlp_layers: int = 3
+    mlp_width: int = 256
     lr: float = 1e-4
     policy_type: str = "mlp"                      # "mlp" | "transformer"
 
@@ -224,7 +224,9 @@ class Trainer:
                 d_ff=c.mlp_width * 4, pad_id=v.PAD
             ).to(c.device)
         else:
-            self.pf = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device)
+            self.pf = PolicyRetention(v.size(), d_model=c.lstm_hidden, n_layers=c.mlp_layers,
+                              n_heads=4, d_ff=c.mlp_width * 4, dropout=0.1,
+                              max_len=384, pad_id=v.PAD).to(c.device)#PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device)
         try:
             if hasattr(torch, "compile"):
                 self.pf = torch.compile(self.pf)  # type: ignore
@@ -285,7 +287,7 @@ class Trainer:
         opt_list.append(optim_z)
         sch_list.append(sched_z)
 
-        self.replay_buffer = ReplayBuffer(capacity=200)
+        self.replay_buffer = ReplayBuffer(capacity=200_000)
 
         if c.beta is None:
             c.beta = math.log(4) + math.log(len(c.feature_cols))
@@ -738,57 +740,82 @@ class Trainer:
         return forward_tuples
 
     def sample_replay(self, k: int, REFRESH_INTERVAL: int = 5) -> List[Tuple[List[int], float]]:
+        """
+        Sample k entries from replay, proportional to reward (tempered).
+        If backward_policy == "network", weight = reward * exp(log_pb(prefix)).
+        Falls back to uniform if all weights are zero. Samples WITHOUT replacement.
+        """
         buf = self.replay_buffer
         if not buf or not buf.data:
             return []
 
-        if self.cfg.backward_policy != "network":
-            entries = buf.sample_tempered(k, tau=self.cfg.replay_tau)
-            return [(e[1], e[2]) for e in entries]
+        # ----------------------------
+        # (A) refresh backward weights
+        # ----------------------------
+        if self.cfg.backward_policy == "network":
+            stale = [i for i, e in enumerate(buf.data) if e[4] is None or buf.step - e[5] >= REFRESH_INTERVAL]
+            if stale:
+                stale_seqs = [buf.data[i][1] for i in stale]
+                with torch.no_grad():
+                    flipped = [torch.tensor(s, device=self.cfg.device).flip(0) for s in stale_seqs]
+                    padded = torch.nn.utils.rnn.pad_sequence(
+                        flipped, batch_first=True, padding_value=self.tokenizer.v.PAD
+                    )
+                    logp = self.pb.log_prob(padded)  # type: ignore[union-attr]
+                    mask = (padded != self.tokenizer.v.PAD).float()
+                    T = min(mask.size(1), logp.size(1))
+                    w = (logp[:, :T] * mask[:, :T]).sum(1).exp()  # backward weight
+                    for i, wi in zip(stale, w):
+                        r, t, p, idxs, _, _ = buf.data[i]
+                        buf.data[i] = (r, t, p, idxs, float(wi.item()), buf.step)
 
-        stale = [i for i, e in enumerate(buf.data) if e[4] is None or buf.step - e[5] >= REFRESH_INTERVAL]
-        if stale:
-            stale_seqs = [buf.data[i][1] for i in stale]
-            with torch.no_grad():
-                flipped = [torch.tensor(s, device=self.cfg.device).flip(0) for s in stale_seqs]
-                padded = torch.nn.utils.rnn.pad_sequence(flipped, batch_first=True, padding_value=self.tokenizer.v.PAD)
-                logp = self.pb.log_prob(padded)  # type: ignore[union-attr]
-                mask = (padded != self.tokenizer.v.PAD).float()
-                T = min(mask.size(1), logp.size(1))
-                w = (logp[:, :T] * mask[:, :T]).sum(1).exp()
-                for i, wi in zip(stale, w):
-                    r, t, p, idxs, _, _ = buf.data[i]
-                    buf.data[i] = (r, t, p, idxs, float(wi.item()), buf.step)
-
+        # ----------------------------
+        # (B) build sampling weights
+        # ----------------------------
         entries = list(buf.data)
-        valid = [i for i, e in enumerate(entries) if e[4] is not None]
-        if not valid:
+        v_idxs = []
+        wts = []
+        for i, e in enumerate(entries):
+            r, seq, prior, idxs, pb_w, _ = e  # r already stored at add(): self._weight_for_tree(...)
+            if self.cfg.backward_policy == "network":
+                if pb_w is None:
+                    continue
+                w = float(max(r, 0.0)) * float(max(pb_w, 0.0))
+            else:
+                w = float(max(r, 0.0))
+            v_idxs.append(i)
+            wts.append(w)
+
+        if not v_idxs:
             return []
 
-        weights = np.array(
-            [max(entries[i][0], 1e-9) * float(entries[i][4]) for i in valid],
-            dtype=np.float32
-        )
+        wts = np.asarray(wts, dtype=np.float64)
+        k = min(k, len(v_idxs))
 
-        k = min(k, len(valid))
-        pos = np.flatnonzero(weights > 0)
-
-        if pos.size == 0:
-            chosen_valid_idx = np.random.choice(len(valid), size=k, replace=False)
-            idxs = [valid[j] for j in chosen_valid_idx]
-        elif pos.size < k:
-            prob_pos = weights[pos] / weights[pos].sum()
-            first = np.random.choice(pos, size=pos.size, replace=False, p=prob_pos)
-            remaining_pool = np.setdiff1d(np.arange(len(valid)), first, assume_unique=False)
-            fill = np.random.choice(remaining_pool, size=k - pos.size, replace=False)
-            chosen_local = np.concatenate([first, fill])
-            idxs = [valid[j] for j in chosen_local]
+        # temperature / top-k logic
+        tau = float(self.cfg.replay_tau if hasattr(self.cfg, "replay_tau") else 1.0)
+        if tau <= 1e-8:
+            # pure top-k by weight
+            order = np.argsort(-wts)
+            chosen = order[:k]
         else:
-            prob = weights[pos] / weights[pos].sum()
-            chosen_local = np.random.choice(pos, size=k, replace=False, p=prob)
-            idxs = [valid[j] for j in chosen_local]
+            # tempered probabilities
+            # p_i ∝ w_i^(1/tau); if all zero → uniform
+            if np.all(wts <= 0):
+                p = np.full_like(wts, 1.0 / len(wts), dtype=np.float64)
+            else:
+                p = np.power(np.maximum(wts, 0.0), 1.0 / tau)
+                s = p.sum()
+                if s <= 0:
+                    p = np.full_like(p, 1.0 / len(p))
+                else:
+                    p = p / s
+            # sample without replacement
+            chosen = np.random.choice(len(v_idxs), size=k, replace=False, p=p)
 
+        idxs = [v_idxs[j] for j in chosen]
         return [(entries[i][1], entries[i][2]) for i in idxs]
+
 
     # ========================================================
     # Canonical batched rollout (EOS-safe, per-feature bin limits)
