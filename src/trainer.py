@@ -17,7 +17,7 @@ from sklearn.preprocessing import LabelEncoder
 
 from src.tokenizer import Tokenizer, Vocab
 from src.env import TabularEnv
-from src.policy import PolicyPaperMLP  # includes prefix-decay readout variant
+from src.policy import PolicyPaperMLP # includes prefix-decay readout variant
 from src.utils import (
     ReplayBuffer,
     tb_loss,
@@ -44,7 +44,10 @@ def tb_loss_logR(
     if log_pb.dim() == 1: log_pb = log_pb.unsqueeze(0)
     lp = log_pf.sum(-1)
     lb = log_pb.sum(-1)
+    
     diff = (log_z.squeeze() + lp - lb - logR.squeeze())
+    print(log_z.squeeze().mean(), lp.mean(), lb.mean(), logR.squeeze().mean())
+    print(diff.mean())
     return (diff * diff).mean()
 
 
@@ -108,7 +111,7 @@ class Config:
     policy_inference_trees: int = 500
 
     # Memory/throughput
-    amp: bool = True
+    amp: bool = False
     eval_on_cpu: bool = False
     metric_sample_size: int = 20000                # (unused; we eval on full data)
     eval_batch_size: int = 16384
@@ -137,7 +140,7 @@ class Config:
     show_best_tree_acc: bool = False
 
     # === New schedule knobs for anneals ===
-    subtb_enabled: bool = True
+    subtb_enabled: bool = False
 
     # temperature anneal
     temp_start: float = 1.0
@@ -222,7 +225,6 @@ class Trainer:
             ).to(c.device)
         else:
             self.pf = PolicyPaperMLP(v.size(), c.lstm_hidden, c.mlp_layers, c.mlp_width).to(c.device)
-
         try:
             if hasattr(torch, "compile"):
                 self.pf = torch.compile(self.pf)  # type: ignore
@@ -248,7 +250,7 @@ class Trainer:
         else:
             self.pb = None  # "uniform" or "zero" handled downstream
 
-        self.log_z = torch.nn.Parameter(torch.tensor(1.0, device=c.device))
+        self.log_z = torch.nn.Parameter(torch.tensor(0.0, device=c.device))
 
         # optimizers / schedulers
         optim_pfs = torch.optim.AdamW(self.pf.parameters(), lr=c.lr)
@@ -431,29 +433,21 @@ class Trainer:
                     tok_i = padded[i:i+1, :t.numel()]
                     # use calculate_bayesian_reward and take log (can be overridden to logR upstream)
                     R_i = calculate_bayesian_reward(tok_i, self.tokenizer, env_template, c.beta)
-                    logR_i = torch.log(R_i.clamp_min(1e-9))
+                    logR_i = R_i
                     logR_list.append(logR_i.squeeze())
                 logR_batch = torch.stack(logR_list, dim=0)  # [B]
 
                 # per-batch centering (in log-space)
                 logR_centered = logR_batch - logR_batch.mean().detach()
 
-                # optional std-shrink (only if variance is large)
-                if c.logr_target_std is not None and c.logr_target_std > 0:
-                    std = logR_batch.std().detach()
-                    scale = torch.clamp(std / float(c.logr_target_std), min=1.0)
-                    logR_centered = logR_centered / scale
+                # scale to match model magnitude (≈ |lp|); optional but helpful
+                target_scale = log_pf.abs().mean().detach().clamp_min(1.0)    # ~100–300 typically
+                # normalize by std then stretch to target_scale/τ
+                std = logR_centered.std().detach().clamp_min(1e-6)
+                tau_now = _lin_anneal(c.tau_train_start, c.tau_train_end, getattr(self, "_cur_update", 1),
+                                      max(1, getattr(self, "_total_updates", 1)), c.tau_begin_frac, c.tau_end_frac)
+                logR_scaled = logR_centered#(logR_centered / std) * (target_scale / max(1e-6, float(tau_now)))
 
-                # optional clamp
-                if c.logr_clamp is not None and c.logr_clamp > 0:
-                    logR_centered = logR_centered.clamp(-float(c.logr_clamp), float(c.logr_clamp))
-
-                # τ anneal
-                tau_now = _lin_anneal(c.tau_train_start, c.tau_train_end,
-                                      getattr(self, "_cur_update", 1),
-                                      max(1, getattr(self, "_total_updates", 1)),
-                                      c.tau_begin_frac, c.tau_end_frac)
-                logR_scaled = logR_centered / max(1e-6, float(tau_now))
 
                 # TB objective (SubTB or regular)
                 if c.subtb_enabled:
@@ -468,7 +462,7 @@ class Trainer:
                     loss = (diff * diff).mean()
                     tb_val, fl_val = loss, None
                 else:
-                    loss = tb_loss_logR(log_pf, log_pb, self.log_z, logR_scaled, priors_tensor)
+                    loss = tb_loss_logR(log_pf, log_pb, self.log_z, logR_batch.mean(), priors_tensor)
                     tb_val, fl_val = loss, None
 
         # ====== Legacy / non-bayesian path (unchanged core logic) ======
@@ -799,6 +793,11 @@ class Trainer:
     # ========================================================
     # Canonical batched rollout (EOS-safe, per-feature bin limits)
     # ========================================================
+
+
+
+
+    
     def batched_rollout(self, envs, temp, residuals, beta, ras_counts: Optional[dict] = None):
         """
         Parallel rollouts with ONLY contradiction guards + per-feature bin limits.

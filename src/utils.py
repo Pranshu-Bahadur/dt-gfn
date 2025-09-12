@@ -263,7 +263,7 @@ def calc_bayes_reward_leafonly_log(tokens, tok, env, *_):
 @torch.no_grad()
 def calculate_bayesian_reward(tokens, tok, env, *_):
     logR = calc_bayes_reward_leafonly_log(tokens, tok, env).squeeze(0)
-    return torch.exp(logR).clamp_min(1e-9).unsqueeze(0)
+    return logR.unsqueeze(0)
 
 @torch.no_grad()
 def calculate_bayesian_reward_regression(tokens: torch.Tensor,
