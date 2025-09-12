@@ -91,9 +91,9 @@ class Config:
     redundancy_aware: bool = True
 
     # Policy network
-    lstm_hidden: int = 256
-    mlp_layers: int = 3
-    mlp_width: int = 256
+    lstm_hidden: int = 1024
+    mlp_layers: int = 12
+    mlp_width: int = 1024
     lr: float = 1e-4
     policy_type: str = "mlp"                      # "mlp" | "transformer"
 
@@ -118,7 +118,7 @@ class Config:
 
     # NEW knobs
     rollout_temperature: float = 0.0               # base sampling temp for rollouts
-    min_child_size: int = 20                       # predictor split guard
+    min_child_size: int = 1                       # predictor split guard
     min_gain: float = 0.0                          # min impurity reduction
 
     # Stabilizers (EMA used only in non-bayesian path)
@@ -236,7 +236,7 @@ class Trainer:
             if c.policy_type == "transformer":
                 from src.policy import PolicyTransformer
                 self.pb = PolicyTransformer(
-                    v.size(), d_model=c.lstm_hidden, n_layers=c.mlp_layers, n_heads=2,
+                    v.size(), d_model=c.lstm_hidden, n_layers=c.mlp_layers, n_heads=4,
                     d_ff=c.mlp_width * 4, pad_id=v.PAD
                 ).to(c.device)
             else:
@@ -275,7 +275,7 @@ class Trainer:
             opt_list.append(optim_pbs)
             sch_list.append(sched_pbs)
 
-        optim_z = torch.optim.Adam([self.log_z], lr=c.lr / 10)
+        optim_z = torch.optim.Adam([self.log_z], lr=c.lr/0.1)
         sched_z = SequentialLR(
             optim_z,
             [LambdaLR(optim_z, lambda u: min(1.0, u / max(1, 10))),
@@ -339,7 +339,7 @@ class Trainer:
         if mode == "bayesian":
             R = calculate_bayesian_reward(tok, self.tokenizer, reward_env, self.cfg.beta) if task == "classification" \
                 else calculate_bayesian_reward_regression(tok, self.tokenizer, reward_env, self.cfg.beta)
-            return float(torch.exp(R).item())
+            return float(torch.exp(R).item())**2
         if mode in ("variance", "sse"):
             dR = deltaE_split_gain_sse(tok, self.tokenizer, reward_env)
             return float(torch.clamp(dR.sum(), min=1e-9).item())

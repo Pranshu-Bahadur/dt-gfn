@@ -405,7 +405,7 @@ def get_tree_predictor(
     y_target: torch.Tensor,
     tok: "Tokenizer",
     *,
-    min_child_size: int = 20,
+    min_child_size: int = 1,
     min_gain: float = 0.0,
     predictor_mode: str = "dirichlet",  # "dirichlet" | "mean" (classification only)
 ):
