@@ -81,6 +81,7 @@ class Config:
     n_bins: int = 255
     binning_strategy: str = "global_uniform"
     device: str = "cuda"
+    F = 12
 
     # training mode
     random_forest: bool = True                     # RF if True, Boosting if False
@@ -199,9 +200,6 @@ class Trainer:
     def fit(self, df_train: pd.DataFrame) -> "Trainer":
         c = self.cfg
 
-        v = Vocab(len(c.feature_cols), c.n_bins, 1)
-        self.tokenizer = Tokenizer(v)
-
         env_template = TabularEnv(
             df_train,
             feature_cols=c.feature_cols,
@@ -211,6 +209,10 @@ class Trainer:
             binning_strategy=c.binning_strategy,
             device=c.device,
         )
+
+        v = Vocab(env_template.F, c.n_bins, 1)
+        print(env_template.F)
+        self.tokenizer = Tokenizer(v)
         if c.task == "classification":
             self.le, c.n_classes = env_template.le, env_template.n_classes
             self.classes_ = np.asarray(self.le.classes_)
