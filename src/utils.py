@@ -398,21 +398,19 @@ def deltaE_split_gain_sse(tokens: torch.Tensor, tok: "Tokenizer", env: "TabularE
 # ============================================================
 # Predictor (Dirichlet sampling / posterior mean for probs)
 # ============================================================
-
 def get_tree_predictor(
     traj: List[int],
     X_binned: torch.Tensor,
     y_target: torch.Tensor,
     tok: "Tokenizer",
     *,
-    min_child_size: int = 1,
-    min_gain: float = 0.0,
+    min_child_size: int = 1,   # ignored
+    min_gain: float = 0.0,     # ignored
     predictor_mode: str = "dirichlet",  # "dirichlet" | "mean" (classification only)
 ):
     """
-    Rebuild the tree by replaying tokens on TRAIN data with stronger split checks:
-      • accept split only if both children have >= min_child_size
-      • and (optionally) gain >= min_gain
+    Rebuild the tree by replaying tokens on TRAIN data.
+    No split-size or gain guards are applied.
 
     Leaf values:
       • classification (y_target one-hot probs):
@@ -446,43 +444,6 @@ def get_tree_predictor(
     else:
         is_clf_probs = False
         K = None
-
-    # impurity helpers
-    def node_sse(idxs: torch.Tensor) -> torch.Tensor:
-        if idxs.numel() <= 1:
-            return torch.tensor(0.0, device=device)
-        Y = y_target[idxs]
-        if Y.ndim == 1:
-            mu = Y.mean()
-            return ((Y - mu) ** 2).sum()
-        else:
-            mu = Y.mean(dim=0, keepdim=True)
-            return ((Y - mu) ** 2).sum()
-
-    def node_gini(idxs: torch.Tensor) -> torch.Tensor:
-        if not is_clf_probs or idxs.numel() == 0:
-            return torch.tensor(0.0, device=device)
-        counts = y_target[idxs].sum(0)  # [K]
-        n = counts.sum().clamp_min(1.0)
-        p = counts / n
-        return 1.0 - (p * p).sum()
-
-    def split_gain(parent_idx: torch.Tensor, L_idx: torch.Tensor, R_idx: torch.Tensor) -> float:
-        nP = float(parent_idx.numel())
-        if nP <= 1:
-            return 0.0
-        if is_clf_probs:
-            gP = node_gini(parent_idx)
-            gL = node_gini(L_idx)
-            gR = node_gini(R_idx)
-            nL = float(L_idx.numel()); nR = float(R_idx.numel())
-            gain = gP * nP - (gL * nL + gR * nR)
-        else:
-            sP = node_sse(parent_idx)
-            sL = node_sse(L_idx)
-            sR = node_sse(R_idx)
-            gain = float((sP - (sL + sR)).item())
-        return float(gain)
 
     # build by data with LIFO expansion
     class Node(dict): pass
@@ -519,16 +480,7 @@ def get_tree_predictor(
             L_idx = idxs[m]
             R_idx = idxs[~m]
 
-            # guards
-            if (L_idx.numel() < min_child_size) or (R_idx.numel() < min_child_size):
-                pending = None
-                continue
-            if min_gain > 0.0:
-                g = split_gain(idxs, L_idx, R_idx)
-                if g < min_gain:
-                    pending = None
-                    continue
-
+            # accept split unconditionally (no size/gain guards)
             node.clear()
             node.update(type='split', f=f, t=t)
             L = Node(type='leaf', idxs=L_idx)
@@ -595,6 +547,7 @@ def get_tree_predictor(
                     out[idxs] = n['val']
             return out
     return predict
+
 # ============================================================
 # Replay Buffer
 # ============================================================

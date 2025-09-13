@@ -46,9 +46,13 @@ def tb_loss_logR(
     lb = log_pb.sum(-1)
     
     diff = (log_z.squeeze() + lp - lb - logR.squeeze())
-    print(log_z.squeeze().mean(), lp.mean(), lb.mean(), logR.squeeze().mean())
-    print(diff.mean())
-    return (diff * diff).mean()
+    #print(log_z.squeeze().mean(), lp.mean(), lb.mean(), logR.squeeze().mean())
+    #print(diff.mean())
+    #print(diff.size())
+    #print(diff)
+    diff = (diff.pow(2))#.mean()
+    #print(diff)
+    return diff
 
 
 def _lin_anneal(start: float, end: float, step: int, total: int, begin_frac: float, end_frac: float) -> float:
@@ -267,7 +271,7 @@ class Trainer:
         sch_list = [sched_pfs]
 
         if self.pb is not None:
-            optim_pbs = torch.optim.AdamW(self.pb.parameters(), lr=c.lr)
+            optim_pbs = torch.optim.SGD(self.pb.parameters(), lr=c.lr) #AdamW
             sched_pbs = SequentialLR(
                 optim_pbs,
                 [LambdaLR(optim_pbs, lambda u: min(1.0, u / max(1, 10))),
@@ -464,7 +468,7 @@ class Trainer:
                     loss = (diff * diff).mean()
                     tb_val, fl_val = loss, None
                 else:
-                    loss = tb_loss_logR(log_pf, log_pb, self.log_z, logR_batch.mean(), priors_tensor)
+                    loss = tb_loss_logR(log_pf, log_pb, self.log_z, logR_batch, priors_tensor)
                     tb_val, fl_val = loss, None
 
         # ====== Legacy / non-bayesian path (unchanged core logic) ======
@@ -549,7 +553,30 @@ class Trainer:
                         tb_val, fl_val = l_tb, l_fl
 
         # ----- Backprop + clip -----
-        self.scaler.scale(loss).backward()
+        # loss: shape [N]
+        loss = loss.reshape(-1)
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
+
+        for i, li in enumerate(loss.unbind()):
+            self.scaler.scale(li).backward(retain_graph=(i + 1 < loss.numel()))
+
+        # unscale, clip, step
+        for opt in optimizers:
+            try: self.scaler.unscale_(opt)
+            except Exception: pass
+        try: torch.nn.utils.clip_grad_norm_(self.pf.parameters(), self.cfg.grad_clip)
+        except Exception: pass
+        if self.pb is not None:
+            try: torch.nn.utils.clip_grad_norm_(self.pb.parameters(), self.cfg.grad_clip)
+            except Exception: pass
+        try: torch.nn.utils.clip_grad_norm_([self.log_z], self.cfg.grad_clip)
+        except Exception: pass
+        for opt in optimizers:
+            self.scaler.step(opt)
+        self.scaler.update()
+
+        """
         for opt in optimizers:
             try:
                 self.scaler.unscale_(opt)
@@ -572,10 +599,11 @@ class Trainer:
         for opt in optimizers:
             self.scaler.step(opt)
         self.scaler.update()
+        """
 
         self.replay_buffer.mark_policy_update()
 
-        tb_loss_acc = float(tb_val.item())
+        tb_loss_acc = float(tb_val.mean().item())
         fl_loss_acc = float(fl_val.item()) if fl_val is not None else 0.0
         return tb_loss_acc, fl_loss_acc
 
